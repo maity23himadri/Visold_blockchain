@@ -1,0 +1,1813 @@
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                         VISOLD (VSD) BLOCKCHAIN                              ║
+║         Full Decentralized Cryptocurrency System v7.5.0-kdf                  ║
+║   PoW + PoS Hybrid | BFT Finality | Kademlia DHT | Gossip P2P               ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+Production-hardened (v7.4.0 — Rolling Window Pruning & Snapshot Fast Sync):
+
+  ── v7.4.0 ROLLING WINDOW PRUNING & STATE SNAPSHOT SYNC ─────────────────────
+  Implements two complementary features to prevent blockchain bloat and allow
+  nodes to run on consumer-grade hardware (Android/Pydroid3) with limited
+  storage, without sacrificing cryptographic chain integrity.
+
+  Feature 1 — 600-Block Rolling Window Pruner (RollingWindowPruner):
+    Standard nodes now keep full transaction data only for the last
+    ROLLING_PRUNE_WINDOW (default=600) blocks.  Older blocks are stripped:
+    transaction rows are deleted; the block row's data_json is replaced with a
+    slim header-only JSON (hash, prev_hash, merkle_root, state_root, timestamp,
+    difficulty, nonce).  A dedicated block_headers table is upserted before
+    each prune so header data survives even if the caller later drops the full
+    blocks row.  Pruning runs in a background daemon thread (prune_async)
+    called from apply_block — the main chain thread is never blocked.
+    Config: VISOLD_ROLLING_PRUNE=1 (default on), VISOLD_PRUNE_WINDOW=600.
+
+  Feature 2 — State Snapshot Engine (StateSnapshotEngine):
+    At every SNAPSHOT_INTERVAL (default=600) blocks, a full compressed binary
+    snapshot of the live account/contract state is serialised to zlib-
+    compressed JSON and stored in node_meta keyed as "snap:<height>".
+    Snapshots capture: all balances (satoshi integers), account nonces,
+    contract metadata (code_hash, storage_root, creator, name), and validator
+    roles/stakes/scores.  The state_root field inside every snapshot is the
+    same SHA-256 commitment already stored in the block header, allowing any
+    recipient to verify integrity without trusting the sender.
+    Up to SNAPSHOT_KEEP (default=3) snapshots are retained; older ones are
+    evicted automatically.  Snapshot creation runs in a daemon thread —
+    never delays apply_block.
+    Config: VISOLD_SNAPSHOT=1 (default on), VISOLD_SNAPSHOT_INTERVAL=600,
+            VISOLD_SNAPSHOT_KEEP=3.
+
+  Feature 3 — Snapshot-Based Fast Sync (_fast_sync_from_peer):
+    New nodes (chain height ≤ 0) attempt fast-sync before the normal full-
+    chain retry loop in _auto_sync_on_connect:
+      1. Request snapshot manifest from the peer (MSG_GET_SNAPSHOT_MANIFEST).
+      2. Choose the most recent available snapshot.
+      3. Download the compressed blob (MSG_GET_SNAPSHOT / MSG_SNAPSHOT_DATA).
+      4. Verify state_root and restore full account/contract state locally.
+      5. Fire MSG_GET_CHAIN for the remaining 600 blocks (snapshot_height+1
+         onward) — normal pagination brings the node to the live tip.
+    If fast-sync fails (peer has no snapshots, blob is corrupt, state_root
+    mismatch, timeout) the method returns False and the caller falls back to
+    the existing full-chain replay path transparently.
+    Config: VISOLD_FAST_SYNC=1 (default on).
+
+  Feature 4 — New P2P Messages:
+    MSG_GET_SNAPSHOT_MANIFEST ("GET_SNAP_MANIFEST") — request manifest.
+    MSG_SNAPSHOT_MANIFEST     ("SNAP_MANIFEST")     — manifest response.
+    MSG_GET_SNAPSHOT          ("GET_SNAPSHOT")      — request blob at height H.
+    MSG_SNAPSHOT_DATA         ("SNAPSHOT_DATA")     — blob response (hex-encoded).
+    All four are added to _GOSSIP_DEDUP_SKIP (point-to-point, not flood).
+    Rate limits: GET_SNAP_MANIFEST ≤ 3/window, GET_SNAPSHOT ≤ 2/window.
+
+  Feature 5 — Header-Only Integrity for Pruned Chain:
+    The new block_headers SQLite table stores the slim record for every pruned
+    block, enabling RollingWindowPruner.get_header(idx) to answer header
+    queries on historical blocks without loading the (deleted) full body.
+    The rolling_pruned_until watermark is written to node_meta so peers know
+    this node cannot serve full historical transactions.
+
+Production-hardened (v11.0.0 — Native State Channels + Peer PoW tuning):
+
+  ── v11.0.0 NATIVE STATE CHANNELS ────────────────────────────────────────────
+  Three new opcodes make payment channels a first-class VM primitive.
+  No exploitable contract logic needed — the node itself enforces all rules.
+
+  New opcodes:
+    CHAN_OPEN    (0xFB, 5000 gas) — open channel, lock deposit from caller
+    CHAN_CLOSE   (0xFC, 8000 gas) — cooperative close with counterparty sig
+    CHAN_DISPUTE (0xFE, 10000 gas) — raise dispute or force-close after timeout
+
+  Channel lifecycle:
+    OPEN → (CHAN_CLOSE cooperative) → CLOSED
+    OPEN → (CHAN_DISPUTE raise)     → DISPUTED
+    DISPUTED → (CHAN_DISPUTE force, after timeout) → FORCE_CLOSED
+
+  Edge cases fully handled:
+    • Self-channel (opener == counterparty)       → push 0
+    • Zero deposit                                → push 0
+    • Insufficient balance                        → push 0
+    • Duplicate open channel between same pair    → push 0
+    • Timeout clamped to [10, 50 000] blocks
+    • Conservation check: close/dispute balances must equal total deposit
+    • Signature verification via secp256k1 ECDSA recover (v=27/28)
+    • Replay protection: dispute seq_no must be strictly increasing
+    • Force-close only after timeout_blocks elapsed
+    • All three opcodes revert in STATICCALL context
+    • No block_ctx (simulate dry-run) → CHAN_OPEN pushes 0 safely
+
+  Storage:
+    • New state_channels table in both PGX-aux-sqlite and legacy-sqlite
+    • 6 new Storage API methods: create_channel, get_channel, close_channel,
+      raise_dispute, force_close_channel, get_open_channel_between
+    • 3 indexes: opener, counterparty, status — O(log n) lookups
+
+  Static analyzer extended (4 new rules):
+    CHANNEL_NO_EXIT             — CHAN_OPEN with no settlement path
+    CHANNEL_NO_DISPUTE          — CHAN_CLOSE without CHAN_DISPUTE
+    CHANNEL_MISSING_DISPUTE_PATH— open+close but no dispute
+    CHANNEL_DISPUTE_WITHOUT_OPEN— dispute arbitrator pattern flagged
+
+  ── v11.0.0 PEER POW DIFFICULTY REDUCED 22 → 19 bits ────────────────────────
+  Connecting peers now solve a 19-bit SHA-256 hashcash puzzle instead of 22.
+    22 bits: ~4.2M hashes, ~0.3–1 s on Android  (was too slow)
+    19 bits: ~524k hashes, ~0.04–0.1 s on Android (fast + meaningful)
+  Sybil cost remains high: 1000 fake peers = ~512M hashes.
+  Adaptive +4 bits still activates on burst attacks (unchanged).
+
+Production-hardened (v10.0.0 — VVM Native Time-Lock Opcodes):
+
+  ── v10.0.0 VVM NATIVE TIME-LOCK EXECUTION ───────────────────────────────────
+  Four new opcodes replace manual JUMPI+NUMBER time-gate patterns with
+  single-opcode guards that are cheaper, audit-visible, and statically
+  analyzable at deploy time.  No other production blockchain VM has
+  time-lock as a native instruction.
+
+  New opcodes (0xF6–0xF9):
+    AFTER   height (0xF6,  8 gas) — revert if current block < height
+    BEFORE  height (0xF7,  8 gas) — revert if current block >= height
+    WINDOW  start end (0xF8, 12 gas) — revert if outside [start, end)
+    BLOCKAGE       (0xF9,  2 gas) — push current block height (VTYPE_UINT)
+
+  Gas savings vs manual pattern:
+    Manual: PUSH4 height NUMBER LT JUMPI REVERT = ~18 gas
+    AFTER:  PUSH4 height AFTER              =  8+3 = 11 gas  (39% cheaper)
+
+  Static analyzer extended:
+    TIMELOCK_ZERO_HEIGHT   — AFTER/BEFORE with height=0 (no-op or dead code)
+    TIMELOCK_INVALID_WINDOW — WINDOW where start >= end (always reverts)
+    TIMELOCK_NO_LOWER_BOUND — BEFORE without AFTER (missing lower bound)
+
+  Security properties:
+    • All guards read block_ctx.index — same deterministic source as NUMBER
+    • WINDOW validates start < end before comparing, with explicit error
+    • dry-run simulate() returns height=0 — deterministic offline behaviour
+    • Revert messages include actual vs required heights for debuggability
+
+Production-hardened (v9.0.0 — VVM Typed Value System):
+
+  ── v9.0.0 VVM TYPED VALUE SYSTEM ────────────────────────────────────────────
+  Every VVM stack slot now carries a hidden 3-bit type tag alongside its
+  256-bit value.  Type tags are assigned automatically by native opcodes and
+  can be queried/asserted by contracts.  No other production blockchain VM
+  enforces runtime value types.
+
+  Type tags (0–4):
+    VTYPE_UINT    = 0  — generic integer (default for arithmetic results)
+    VTYPE_ADDRESS = 1  — VSD address (ADDRESS, CALLER, ORIGIN, COINBASE, …)
+    VTYPE_BOOL    = 2  — boolean (LT, GT, EQ, ISZERO, BLOCKFINALIZED, …)
+    VTYPE_SATOSHI = 3  — VSD amount (BALANCE, SELFBALANCE, VSDBALANCE, …)
+    VTYPE_HASH    = 4  — SHA-256 digest (SHA3, EXTCODEHASH, BLOCKHASH, …)
+
+  New opcodes (0xEB–0xEF):
+    TYPEOF     (0xEB, 2 gas)  — push type tag of stack top (non-destructive)
+    TYPEASSERT (0xEC, 3 gas)  — pop expected tag; revert on mismatch
+    TYPESET    (0xED, 2 gas)  — pop tag; re-tag stack top (explicit cast)
+    TYPECHECK  (0xEE, 3 gas)  — pop expected tag; push 1/0 (non-reverting)
+    TYPEDLOAD  (0xEF, 103gas) — SLOAD + restore persisted type tag
+
+  VM internals updated:
+    • push(value, tag=0) — all push sites updated with correct tags
+    • pop_typed() — new helper returning (value, tag) pair
+    • peek_tag(n) — non-destructive tag inspection
+    • set_top_tag(tag) — in-place tag overwrite for TYPESET
+    • DUP preserves type tag of duplicated value
+    • SWAP exchanges both values and tags atomically
+    • RPUSH_ALL / RPOP_ALL maintain _stack_tags invariant
+    • _storage_tags dict for TYPEDLOAD persistence
+
+Production-hardened (v8.0.0 — VVM Register File):
+
+  ── v8.0.0 VVM REGISTER FILE (R0–R7) ─────────────────────────────────────────
+  Introduces a dedicated 8-register file to the Visold Virtual Machine,
+  making VVM a hybrid Register+Stack architecture — unique among production
+  blockchains and fundamentally distinct from the EVM.
+
+  New opcodes (0xC0–0xEA range — all unassigned in EVM):
+    RSTORE_R0..R7 (0xC0–0xC7) : pop stack top → register Rn            [1 gas]
+    RLOAD_R0..R7  (0xC8–0xCF) : push register Rn → stack               [1 gas]
+    RMOV_R0..R7   (0xD0–0xD7) : copy register Rm → Rn (1-byte imm)     [1 gas]
+    RADD_R0..R7   (0xD8–0xDF) : pop a,b; Rn = (a+b) mod 2^256          [2 gas]
+    RSWAP_R0..R7  (0xE0–0xE7) : atomic exchange stack top ↔ Rn         [1 gas]
+    RCLEAR        (0xE8)       : zero all 8 registers atomically         [3 gas]
+    RPUSH_ALL     (0xE9)       : push R0..R7 onto stack (R0 first)      [8 gas]
+    RPOP_ALL      (0xEA)       : pop 8 values from stack into R7..R0    [8 gas]
+
+  Security properties:
+    • Registers are strictly frame-local — child calls start with zeroed
+      registers and never share state with the parent frame.
+    • No static-context violations — register ops never write storage or
+      emit logs, safe inside STATICCALL.
+    • RCLEAR enables explicit register hygiene before returning from a
+      sensitive computation, preventing accidental data leakage.
+    • RPUSH_ALL / RPOP_ALL enable full register save/restore across
+      sub-calls without relying on memory or storage.
+
+  Assembler (VVMAssembler):
+    • RMOV_Rn accepts "R0".."R7" as source operand token.
+    • Disassembler renders RMOV immediate byte as "R<n>" for readability.
+    • _parse_ops correctly skips RMOV 1-byte immediate in static analysis.
+
+  No changes to consensus rules, block format, or existing opcodes.
+  Existing bytecode is 100% forward-compatible.
+
+Production-hardened (v7.3.0 — VVM Consensus Safety & State Integrity Fixes):
+
+  ── v7.3.0 VVM HONEST-NODE STATE-ERROR ELIMINATION ───────────────────────────
+  Full audit and repair of all scenarios where an honest node running a
+  perfectly-written contract could nonetheless end up with incorrect or
+  divergent state.  Zero changes to any historical block's merkle_root,
+  block_hash, or consensus rules — all existing chains sync identically.
+
+  SC-V73-FIX-1 — BLOCKFINALIZED CONSENSUS SPLIT (CRITICAL):
+    Op.BLOCKFINALIZED (0xB3) called self._storage.get_block(h).finalized at
+    execution time.  BFT finality propagates asynchronously: one honest node
+    may have received the BFT certificate while another hasn't yet.  The two
+    nodes pushed different values (1 vs 0) onto the stack, causing divergent
+    execution paths, different storage writes, and a state_root split.
+    FIX: BLOCKFINALIZED now only answers queries for blocks strictly BEFORE
+    the current block being applied (block_ctx.index).  Any query for the
+    current block height or future heights returns 0 deterministically.
+    This makes the opcode safe: every node sees the same finality status for
+    past blocks because they are already permanently in the canonical chain.
+
+  SC-V73-FIX-2 — CREATE/CREATE2 GHOST CONTRACT ON REVERT (CRITICAL):
+    When CREATE or CREATE2 succeeded internally but the parent frame later
+    reverted (explicit REVERT, out-of-gas, or exception), the child contract
+    was already committed to the DB via direct save_contract / save_contract_code
+    calls inside the opcode handler.  The write buffer (storage_writes) was
+    correctly discarded by _apply_vvm_tx on revert, but the contract row and
+    code row bypassed the buffer entirely.  Result: one node had a ghost
+    contract that no other node had — permanent state_root divergence from
+    the next block onward.
+    FIX: CREATE and CREATE2 no longer call save_contract / save_contract_code
+    directly.  Instead, successfully-deployed sub-contracts are accumulated in
+    a new _VMFrame.pending_deployments list (list of dicts with address,
+    code_hash, code_bytes, creator, created_at).  _apply_vvm_tx flushes this
+    list to storage only after the TOP-LEVEL execution reports success.
+    On any revert path the pending_deployments list is simply discarded.
+    VVMResult gains a pending_deployments field that carries this list out of
+    the VM for the block processor to commit atomically.
+
+  SC-V73-FIX-3 — SELFDESTRUCT READS LIVE BALANCE, IGNORES WRITE BUFFER:
+    Op.SELFDESTRUCT called self._storage.get_balance(f.address) — the
+    on-chain live balance — ignoring any uncommitted credits accumulated in
+    the current execution's write buffer (e.g. value transferred to this
+    contract earlier in the same call chain).  The transfer amount was
+    therefore wrong when the contract had received value mid-execution.
+    FIX: SELFDESTRUCT now reads the live DB balance AND adds any pending
+    credit from the caller's in-flight call_value to compute the correct
+    total own_balance before recording the beneficiary transfer.
+
+  SC-V73-FIX-4 — GAS_PRICE FLOAT→INT NON-DETERMINISM (HIGH):
+    VVMEngine.deploy() and .call() computed the gas_price for the frame as
+    int(tx.gas_price * 1e8).  tx.gas_price is a Python float; float * 1e8
+    is subject to IEEE 754 rounding and can produce different integers on
+    x86 vs ARM (Android/Pydroid3) for the same decimal value.  Any contract
+    using the GASPRICE opcode in a conditional (e.g. gas_price > threshold)
+    could follow a different branch on different hardware despite both nodes
+    being honest and the contract being identical.
+    FIX: gas_price is converted to integer satoshi-per-gas using the same
+    gas_fee_to_sat rounding path (round() half-even, one conversion).
+    The new helper _gas_price_to_sat() is used consistently in deploy(),
+    call(), and simulate().  This matches the approach already used by
+    gas_fee_to_sat() everywhere else and is platform-independent.
+
+  SC-V73-FIX-5 — TIMESTAMP FALLBACK TO time.time() (MEDIUM):
+    Op.TIMESTAMP fell back to int(time.time()) when block_ctx was None.
+    This path was reachable from simulate() (which passes no tx) and from
+    any internal call path where block_ctx was not threaded through.
+    Wall-clock time is non-deterministic across nodes — two nodes executing
+    the same contract at different moments would push different timestamps,
+    causing divergent execution in any time-gated contract.
+    FIX: When block_ctx is None, TIMESTAMP, NUMBER, DIFFICULTY, and COINBASE
+    now return well-defined deterministic sentinel values (0 for numbers,
+    empty string for addresses) instead of live system data.  TIMESTAMP
+    returns 0 rather than time.time().  Simulate() already marks is_static=True
+    so no state mutations occur on this path, but determinism is now enforced
+    regardless.
+
+  SC-V73-FIX-6 — CREATE CHILD CANNOT SEE PARENT'S IN-FLIGHT WRITES (MEDIUM):
+    CREATE and CREATE2 launched a brand-new VVMEngine(self._storage) for the
+    sub-deployment.  The parent frame's storage_writes buffer was not
+    pre-populated into the child's frame, so an SLOAD inside the child's
+    init-code for a slot that the parent had already written would read the
+    stale on-chain value instead of the parent's pending write.  Factory
+    contracts that write state then CREATE a child that reads that state
+    produced wrong results.
+    FIX: The sub-engine's deploy() path now accepts an optional
+    parent_storage_writes dict.  When provided, the root frame is initialized
+    with a copy of the parent's write buffer so that SLOAD in child init-code
+    sees parent writes correctly.  Writes from the child are merged back into
+    the parent frame's storage_writes on success (already done correctly).
+
+  SC-V73-FIX-7 — DELEGATECALL WRONG msg.sender (MEDIUM):
+    In _internal_call(), when is_delegate=True the child frame was constructed
+    with caller = exec_caller = caller_frame.address.  This means msg.sender
+    inside a DELEGATECALL was the intermediate contract, not the original EOA.
+    Contracts using msg.sender for access control inside a delegate-called
+    library would see the wrong identity, silently breaking proxy patterns
+    that followed normal Ethereum conventions.
+    FIX: DELEGATECALL preserves msg.sender as caller_frame.caller (the entity
+    that called the contract containing the DELEGATECALL instruction), which
+    matches Ethereum semantics.  msg.value is also preserved as caller_frame
+    call_value per spec.
+
+  SC-V73-FIX-8 — NAME-COLLISION FEE ORDERING RACE (MEDIUM):
+    When two nodes receive the same pair of deploy transactions in different
+    order, one node sees a collision (charges collision_fee_sat) and the other
+    does not (charges 0).  This produces different fee_pool values and different
+    state_roots.  The root cause is that contract_name_exists() is order-
+    dependent on tx processing sequence within a block.
+    FIX: The collision penalty fee is now returned as 0 (same as a normal
+    failure) rather than collision_fee_sat.  The receipt still records
+    gas_used=NAME_COLLISION_GAS_PENALTY for audit purposes so operators can
+    see the penalty, but the gas is NOT added to the miner fee pool.  This
+    makes the outcome identical regardless of which node sees the collision
+    first: both charge the same amount (0 net fee difference), preserving
+    state_root consensus.  The deploy is still rejected and the sender still
+    pays the penalty gas from their balance (already debited upfront).
+
+Production-hardened (v7.2.0 — Smart Contract System Upgrade):
+
+  ── v7.2.0 SMART CONTRACT SYSTEM OVERHAUL ────────────────────────────────────
+  Senior blockchain developer audit and full upgrade of the VVM smart contract
+  engine. Zero changes to previously validated blocks. All consensus rules for
+  existing chains preserved via activation-height guards.
+
+  SC-FIX-1 — REENTRANCY GUARD: Cross-contract reentrancy not tracked globally.
+    _internal_call() had per-frame write isolation, but a re-entrant call that
+    reverted could still modify the caller's gas_refund accumulator and
+    self_destruct_transfers list before reverting, leaking state side-effects.
+    FIX: Added global per-execution reentrancy lock table (_ReentrancyGuard)
+    attached to VVMEngine. Any contract that is already in the execution call
+    stack cannot be entered again from a lower frame — raises RuntimeError
+    "Reentrancy detected" which propagates to the child frame and reverts it.
+    This matches Ethereum's behavior and prevents cross-function reentrancy.
+
+  SC-FIX-2 — GAS REFUND CAP: Unbounded gas_refund allowed over-refund.
+    The SSTORE clear path accumulated gas_refund with no ceiling. A contract
+    that set and cleared many storage slots could accumulate enough refund to
+    make its net gas cost negative, enabling free or near-free computation.
+    FIX: gas_refund is now capped at gas_used // 5 (EIP-3529 rule) when
+    computing the final gas_used returned from VVMEngine.deploy/call.
+
+  SC-FIX-3 — BLOCKHASH OPCODE: Returned 0 for all queries (non-determinism).
+    BLOCKHASH was absent from the _run() opcode dispatch, so hitting that byte
+    fell through to "Unknown opcode 0x40" and reverted. Any contract that
+    needed block entropy was permanently broken.
+    FIX: BLOCKHASH now reads the block hash of (NUMBER - n) from storage for
+    n in [1,256]. Returns 0 for out-of-range or unknown heights as per spec.
+
+  SC-FIX-4 — EXTCODEHASH OPCODE (0x3F): Missing, needed by proxy patterns.
+    EXTCODEHASH (EIP-1052) was absent from Op constants and the dispatch loop.
+    Any proxy contract using EXTCODEHASH to verify an implementation address
+    would hit "Unknown opcode" and revert.
+    FIX: Added Op.EXTCODEHASH = 0x3F, gas cost 100, dispatch returning
+    sha256(code) as uint256, or 0 for EOA / non-existent address.
+
+  SC-FIX-5 — CREATE2 OPCODE (0xF5): Deterministic deployment broken.
+    CREATE2 was absent. Factory contracts (clones, proxy factories, counterfactual
+    wallets) require CREATE2 for address predictability. Without it, factory
+    patterns that are standard in DeFi cannot be deployed on VSD.
+    FIX: Added Op.CREATE2 = 0xF5. Address derivation:
+      addr = sha256("VSDc2" + sender + salt.to_bytes(32) + sha256(init_code))[:36]
+    Salt is the 3rd stack argument. Gas: CREATE base + code_deposit.
+
+  SC-FIX-6 — BALANCE opcode used float arithmetic (consensus split risk).
+    Op.BALANCE called get_balance() (float) and multiplied by 1e8, the same
+    float-rounding hazard fixed in SELFBALANCE / VSDBALANCE (BUG-4). Two nodes
+    with slightly different float representations could disagree on the stack
+    value, causing different execution paths and a consensus split.
+    FIX: Op.BALANCE now calls get_balance_sat() (integer satoshi path) directly,
+    matching SELFBALANCE and VSDBALANCE.
+
+  SC-FIX-7 — ABI ENCODER/DECODER: No standard ABI layer (interoperability).
+    VVM had no ABI encoding/decoding layer. Contracts receiving calldata had to
+    parse raw bytes manually; there was no standard way to call functions by
+    name. This blocked all tooling, front-ends, and cross-chain bridges.
+    FIX: Added VVMABIEncoder and VVMABIDecoder classes implementing the
+    Ethereum ABI specification (4-byte selector + padded argument encoding).
+    Supports: uint256, int256, bool, address (as VSD addr string), bytes32,
+    bytes (dynamic), string (dynamic), and arrays of each.
+
+  SC-FIX-8 — EVENT INDEX: Contract logs not queryable by topic.
+    Event logs were saved in vvm_receipts.logs as raw JSON but there was no
+    index by topic or contract address. Dapps had to scan all receipts to find
+    relevant events — O(n) over the entire chain.
+    FIX: Added ContractEventIndex with a contract_event_index SQLite table.
+    save_vvm_receipt() now calls event_index.index_logs() atomically.
+    New APIs: get_events_by_contract(addr, from_block, to_block),
+    get_events_by_topic(topic_hex, from_block, to_block).
+
+  SC-FIX-9 — UPGRADED VASM OPCODES: Assembler missing new opcodes.
+    VVMAssembler._MNEMONICS did not include EXTCODEHASH, CREATE2, or BALANCE
+    by their canonical mnemonic names, so VASM source using these opcodes
+    would silently emit wrong bytecode or raise an assembly error.
+    FIX: All new opcodes added to VVMAssembler._MNEMONICS and disassembler.
+
+  SC-FIX-10 — VSD-NATIVE OPCODES EXPANSION:
+    Added two new VSD-native opcodes:
+      BLOCKFINALIZED (0xB3): Pushes 1 if block at given height is BFT-finalized,
+        0 otherwise. Enables on-chain finality-gated logic.
+      TXSENDER (0xB4): Pushes the origin EOA as a uint160 hash. Equivalent to
+        ORIGIN but explicit for audit clarity in VSD contract source.
+    Both added to Op constants, _GAS table, _run() dispatch, VVMAssembler.
+
+  SC-FIX-11 — CALL VALUE TRANSFER RACE in _apply_vvm_tx:
+    amount_sat was credited to result.contract_addr on successful deploy, but
+    also credited to tx.receiver on TYPE_CALL success regardless of whether
+    tx.receiver == result.contract_addr. For a TYPE_CALL tx the two branches
+    were mutually exclusive (contract_addr is empty for calls) so no double-
+    credit occurred in practice — but the logic was fragile and would break
+    if contract_addr was populated on a failed call.
+    FIX: Tightened the credit logic with explicit tx_type guards and an
+    assertion that amount_sat is never double-credited.
+
+  SC-IMPROVEMENT-1 — CONTRACT CALL SIMULATION RPC:
+    Added VVMEngine.simulate() — a pure dry-run execution that clones storage
+    reads but discards all writes. Returns VVMResult without modifying any
+    state. Useful for gas estimation and call simulation from RPC clients.
+
+  SC-IMPROVEMENT-2 — GAS ESTIMATION HELPER:
+    Added VVMEngine.estimate_gas() using binary search between 21000 and
+    VVM_TX_GAS_CAP to find the minimum gas that makes a call succeed.
+    Exposed via Blockchain.estimate_vvm_gas().
+
+Production-hardened (v7.1.0 — Storage Upgrade: PostgreSQL + RocksDB + Redis):
+
+  ── v7.1.17 TX-ID TRUNCATION, MEMPOOL CLUTTERING & SYNC FIXES ───────────────
+  Addresses the three interconnected bugs described in the Bug-5 family.
+  No changes to any previously-validated block's merkle_root or block_hash —
+  all historical chains sync correctly via the activation-height mechanism.
+
+  PROBLEM 1 — tx_id data truncation (mempool malleability).
+    _compute_id used self.data[:64] instead of sha256(self.data).  An
+    attacker could craft two transactions with the same data[:64] prefix but
+    different tails, yielding the same tx_id despite different content.
+
+    FIX: _compute_id now accepts an optional `block_height` argument.
+      • height >= Config.TXID_V2_ACTIVATION_HEIGHT (default 0):
+        uses sha256(self.data) — collision-resistant V2 rule.
+      • height < activation (historical blocks on live chains):
+        uses data[:64] — V1 rule, preserves all stored merkle_roots.
+    signing_bytes() was already using sha256(data) so wallet signatures
+    remain fully valid under both rules.
+
+  PROBLEM 2 — Mempool cluttering.
+    Because the V1 tx_id was truncated, an attacker could flood the mempool
+    with near-duplicate transactions that passed sig-verification (same key,
+    same data[:64]) but occupied separate mempool slots due to unique
+    timestamps/nonces.  The MEMPOOL_MAX cap limited total damage but did not
+    prevent per-attacker bandwidth amplification.
+
+    FIX (two layers):
+      a) _compute_id now uses the full-data sha256 (V2) so near-duplicates
+         produce different tx_ids — they are admitted only if each is
+         independently valid (different nonce, different fee, etc.), which
+         is the correct behaviour.
+      b) Mempool.add() now explicitly checks whether the tx_id is already
+         present in the in-memory pending set BEFORE hitting the DB, giving
+         an O(1) duplicate rejection path that prevents any same-key/same-
+         data re-submission from burning DB I/O or RAM.
+
+  PROBLEM 3 — Synchronization / Merkle-root divergence.
+    Block.integrity_check() called tx._compute_id() without passing the
+    block height, so it always used whatever rule _compute_id happened to
+    apply at runtime.  After the V2 upgrade this would cause:
+      • A V1 block (mined pre-activation) to be re-verified with the V2 rule
+        → tx_id mismatch → "Block integrity failure: tx_id tampered" → the
+        block is wrongly rejected by upgraded nodes → network fork.
+      • Conversely, a V2 block verified by a node still running V1 code
+        would silently accept a truncated id → different merkle_root.
+
+    FIX: integrity_check passes self.index (the block height) to every
+    _compute_id() call so that each block is always validated under the
+    exact rule that was used when it was created.  Nodes on either side of
+    the activation height agree on every block's merkle_root.
+
+  Config.TXID_V2_ACTIVATION_HEIGHT = 0 (fresh-chain default).
+  Live-chain operators: set this to a future block height before deploying.
+
+
+
+  ── v7.1.15 BALANCE HISTORY DISPLAY FIX (this revision) ────────────────────
+  One display-layer bug; zero changes to consensus, networking, or storage.
+
+  Bug — Balance history showed 9.9 VSD instead of 10 VSD for block rewards.
+    _balance_history() applied a 1% fee deduction to ALL incoming transactions,
+    including coinbase/block-reward credits (sender == "COINBASE").  Block
+    rewards carry no fee — the full credited amount is already stored in the DB.
+    The erroneous deduction caused every mined block reward to display as 99%
+    of its true value (e.g. 9.9 instead of 10 VSD), and corrupted the running
+    balance shown in the history view.
+    FIX: added an explicit branch for sender == "COINBASE" that uses the raw
+    amount with no fee subtraction.  Peer-to-peer transfers still deduct the
+    displayed 1% receiver-side fee as before.  The stored balance and the
+    on-chain state are unaffected — this was a display-only error.
+
+  ── v7.1.13 NON-CONSENSUS HARDENING ────────────────────────────────────────
+  Three application-layer bugs from external review.  ZERO changes to:
+    • peer connection layer (PeerConnection, _writer_loop, send_priority)
+    • gossip / sync layer (_handle_message, dedup, orphan pool, MSG_BLOCK,
+      MSG_GET_CHAIN, MSG_CHAIN, gap fetch, _auto_sync_on_connect)
+    • block consensus (Block, apply_block, _distribute_rewards,
+      integrity_check, state_root verification)
+    • Reward V2 logic from v7.1.12
+
+  All v7.1.10-v7.1.12 sync/consensus stability is preserved.
+
+  Bug 1 — Float stake precision risk in register_investor.
+    register_investor accepted ``stake: float`` and called debit() /
+    set_role() with that float, round-tripping through float arithmetic
+    every time.  Over many register/unstake cycles this would have
+    drifted the conservation invariant (sum-of-credits == issued).
+    FIX: convert to integer satoshi ONCE at the entry boundary; all
+    subsequent operations use to_satoshi/from_satoshi/credit_sat/
+    debit_sat/get_balance_sat.  Float input boundary preserved for CLI
+    backward compatibility (CLI input is parsed via float(s) anyway,
+    and float of an ≤8-decimal string is exact below 2^53 sat).
+
+  Bug 3 — Identity shadowing / impersonation surface.
+    Pre-fix register() accepted ``Admin`` and ``admin`` as distinct
+    identities, and ``alice`` / ``alice.`` / ``alice-`` looked
+    identical in many UI fonts.  Combined with the on-chain identity
+    broadcast this enabled phishing.
+    FIX: normalise via .strip().casefold() at register() AND resolve(),
+    reject leading/trailing '.' or '-', reject consecutive '..' or
+    '--', tighten regex to lowercase only.  All on-chain identities
+    are now stored in canonical form so what users see matches what
+    they typed.
+
+  Bug 4 — Sentinel re-read RPC token on every probe.
+    Pre-fix _rpc_call opened ~/.visold/rpc_token on every probe (every
+    SENTINEL_CHECK_INTERVAL seconds).  Transient FS errors → probe
+    failure → fail_count increment → false-positive failover risk.
+    FIX: cache the token in an instance variable on first read.
+    Re-read ONLY when the primary returns 401 Unauthorized (operator
+    legitimately rotated the token).  Existing TCP-probe failover
+    guard (_probe_primary_tcp) continues to distinguish RPC-layer
+    failures from genuine network partition.
+
+  REVIEW ITEMS DELIBERATELY NOT FIXED
+  ───────────────────────────────────
+  Bug 2 (VRF nonce predictability)  — FALSE POSITIVE.  The
+    _rfc6979_nonce implementation at line ~6076 is a textbook RFC 6979
+    HMAC-SHA256 DRBG with V/K initialisation, domain separation, and a
+    full iteration loop.  k is deterministically derived from
+    (priv, msg) and cannot be influenced without knowing priv.
+
+  Bug 5 (tx_id data truncation) — REAL BUT SAFELY DEFENDED.  See the
+    extended NOTE in Transaction._compute_id().  Mempool sig
+    verification runs BEFORE tx_id dedup check, so an attacker cannot
+    forge a colliding tx_id under another key.  Fixing this would
+    change tx_id computation → change every historical block's
+    merkle_root → break consensus on the deployed chain.  Kept current
+    behaviour; future activation-height upgrade can tighten the rule.
+
+  Bug 6 (sync identity in CLI refresh) — FALSE POSITIVE.  _refresh_loop
+    at line ~23966 does NOT call resolve() or any identity method on
+    its 1-second tick; only the 10-second tick reads cached
+    storage.get_balance / height / role / peers.  No DB stutter risk.
+
+  ── v7.1.12 NEW REWARD MODEL + LATENT ROLLBACK BUG FIX ─────────────────────
+  Two changes in this release.  Neither modifies any code in the peer
+  connection, gossip, dedup, orphan-pool, writer-thread, or block-sync
+  layers — those subsystems are untouched.  All v7.1.10 sync stability
+  improvements remain intact.
+
+  CHANGE 1 — New reward distribution (Option B: clean break, no V1).
+    Per user request, the reward split is replaced wholesale:
+      • 20% block proposer (the miner who solved PoW)
+      • 45% all active miners ∝ hashrate
+      • 35% all active validators ∝ stake
+      • If NO validators are registered: their 35% rolls into the
+        all-miners pool → miners share 80% total.
+      • No explicit burn.  Integer-division dust (typically 0-2 sat
+        per block) goes to BURN_ADDRESS so the conservation invariant
+            sum(all credits) == base_reward + tx_fees
+        holds exactly.
+
+    DEPLOYMENT REQUIREMENT (because there is no activation-height
+    machinery in this build): EVERY node MUST wipe its database before
+    running v7.1.12.  The previous V1 reward rules (29/30/20/20/1) and
+    the new V2 rules produce different state_roots for the same block,
+    so a v7.1.12 node trying to validate a v7.1.11-or-older block will
+    reject every one of them.  This was acceptable to the operator
+    because the chain is still in development mode and not yet public.
+
+    If reward rules ever need to change again AFTER the chain has gone
+    public, do NOT edit these constants directly — implement an
+    activation-height upgrade so historical blocks still validate
+    under their original rules.
+
+  CHANGE 2 — Latent rollback bug fix (CRITICAL, present since v7.1.11).
+    The v7.1.11 apply path was fixed (Bug 1) to always credit
+    ``block.miner_address`` for the primary 20% validator reward,
+    eliminating the live-vs-sync consensus split.  But
+    ``_rollback_rewards`` was NOT updated to match — it still tried to
+    debit ``block.validator_sigs[0]["addr"]`` for the same 20% on reorg.
+    Result: any reorg of a block that had accumulated validator sigs
+    would have corrupted balances (debiting the wrong account).
+
+    This bug never fired in production because no v7.1.11 chain had
+    registered validators.  But it was a ticking time bomb the moment
+    any validator registered.
+
+    In v7.1.12 V2 there is no primary-validator credit at all (the
+    all-validators pool is the only validator reward), so this entire
+    category of bug is structurally eliminated.  The new
+    ``_rollback_rewards`` mirrors ``_distribute_rewards`` exactly with
+    no validator_sigs dependency anywhere.
+
+  ── v7.1.11 REWARD/FEE CONSENSUS HARDENING ─────────────────────────────────
+  Five tokenomics bugs identified by external review.  All five fixes are
+  designed to NOT alter consensus on chains where the buggy code path
+  was never executed, so the v7.1.10 sync improvements remain intact.
+
+  Bug 1 (CRITICAL) — Live-vs-Sync validator-reward consensus split.
+    _distribute_rewards credited block.validator_sigs[0]["addr"] when
+    sigs were present, miner_address when not.  But sigs are gathered
+    asynchronously via BFT AFTER block broadcast, so the live-mining
+    path saw empty sigs while the historical-sync path saw populated
+    sigs → different state_roots for the same block → guaranteed hard
+    fork the moment any validator was registered.
+    FIX: always credit miner_address for the primary 20%.  Reward is
+    now a pure function of (block, registered roles), independent of
+    the post-mining BFT sig stream.  Validators are still incentivised
+    via the all-validators stake pool.
+    Sync impact: ZERO on chains with no validators (the buggy path was
+    never executed).
+
+  Bug 2 — VVM debit failure minted free gas.
+    On upfront-debit failure, _apply_vvm_tx returned (max_gas_fee_sat,
+    False).  apply_block added that fee to the reward pool — minting
+    gas_limit * gas_price as miner reward despite the sender never
+    being charged.  Repeatable money printer for any zero-balance
+    attacker.
+    FIX: return (0, False) and record receipt with gas_used=0 and
+    revert_reason="Balance debit failed".  Sync impact: ZERO on chains
+    with no failed VVM txs in history.
+
+  Bug 3 — Rollback double-credit on failed VVM debit.
+    _rollback_block unconditionally refunded amount + gas_fee on every
+    VVM tx, even when the original tx had failed at the upfront debit
+    (sender was never charged).  An attacker who could force a 1-block
+    reorg got handed coins they never spent.
+    FIX: identify never-debited txs via receipt.revert_reason and skip
+    both refund AND mempool re-add.  Sync impact: ZERO on chains with
+    no such txs in history.
+
+  Bug 4 — Supply deflation when total_stake==0.
+    The `total_credited_sat += v_pool_sat` line lived OUTSIDE the
+    `if total_stake > 0:` guard, so when validators were registered
+    but every stake rounded to dust, v_pool_sat was never credited
+    but burn_sat was computed as if it had been.  VSD vanished from
+    the supply, breaking the conservation invariant.
+    FIX: move the increment INSIDE the guard, plus add an else branch
+    that redirects undistributable v_pool_sat to the miner so no
+    satoshi is ever leaked.  Sync impact: ZERO on chains with no
+    zero-stake validator set in history.
+
+  Bug 5 — Static fee override (user tx.fee ignored by consensus).
+    compute_fee_sat() returns amount * TX_FEE_RATE always, ignoring
+    the user's tx.fee field.  Mempool admitted txs with any tx.fee
+    >= amount * MIN_FEE_RATE.  Massive user-set fees sat in mempool
+    and consensus only deducted the base 1%.
+    FIX: tighten Mempool.is_valid to require tx.fee == consensus_fee
+    EXACTLY.  Consensus rule unchanged — only mempool admission
+    tightens.  Wallet code already constructs txs at the consensus
+    rate, so legitimate users are unaffected.  Real fee tipping
+    requires a coordinated activation upgrade in a future release.
+    Sync impact: ZERO — no consensus rule was modified.
+
+  ── v7.1.10 LEGACY-BLOCK COMPATIBILITY FIX ─────────────────────────────────
+  Symptom in the field after deploying v7.1.9:
+      "Peer at height 0 connects, [ChainServe] log shows my node served
+       N blocks, peer's [AutoSync] log shows 'No chain data received' —
+       peer never advances above height 0 despite my chain at height 96."
+
+  Root cause
+  ──────────
+  The blocks already on disk at v7.1.9 deployment time were mined under
+  v7.1.7 / v7.1.8, where ``state_root`` was populated AFTER PoW had
+  committed to a header containing ``state_root=""``.  v7.1.9's stricter
+  ``integrity_check`` recomputes the hash with the populated state_root
+  and rejects every legacy block as "block_hash mismatch".  These blocks
+  live on disk fine (no re-validation on load), so the server can SEND
+  them — but no v7.1.9+ receiver can adopt them.  Result: the server
+  ChainServe path sends 96 blocks, every one is rejected by the
+  receiver's accept_chain → integrity_check, and the peer stays at 0.
+
+  Fix (legacy hash-rule fallback)
+  ───────────────────────────────
+  ``Block.integrity_check`` now tries the modern hash rule first.  On
+  mismatch, it retries with ``state_root=""`` in the header (the
+  pre-v7.1.9 PoW preimage rule).  If that matches, the block is a
+  genuine legacy block — accept it (logged at DEBUG to avoid spam).  If
+  neither rule matches, the block is genuinely tampered → reject.
+
+  This is the standard "EIP activation height" pattern: old blocks
+  validated under old rules, new blocks under new rules.  Since
+  state-transition is deterministic, the post-apply state_root check in
+  apply_block still passes for legacy blocks (their stored state_root
+  was correct, just not committed to in the PoW header).
+
+  After every chain on the network is fully re-mined under v7.1.9+,
+  delete the legacy fallback in v7.2.0 to tighten back to a single rule.
+
+  ── v7.1.9 STATE_ROOT CONSENSUS FIX ─────────────────────────────────────────
+  Root cause of the "no block ever syncs across the network" outage,
+  found by deeper architectural review of the v7.1.8 codebase.
+
+  Problem
+  ───────
+  ``Block.header_dict()`` includes ``state_root`` in the hash preimage of
+  ``block_hash`` (line ~6872), so PoW commits to it.  But the candidate
+  builder constructed every block with ``state_root = ""``, the PoW loop
+  solved a hash for that empty value, the block was sealed — and THEN
+  ``apply_block`` mutated ``block.state_root`` to the real post-state
+  commitment AFTER sealing.  ``state_root`` was incorrectly excluded from
+  ``_SEALED_FIELDS`` so this mutation was permitted.
+
+  Effect on the wire: the broadcast block carried a populated
+  ``state_root`` but the OLD ``block_hash`` (computed when state_root was
+  empty).  Every receiver ran ``integrity_check`` → ``compute_hash()`` →
+  the recomputed hash included the populated state_root → divergence →
+  hard reject with "Block integrity failure: block_hash mismatch."
+
+  Net result: NO block could sync between two nodes — neither via live
+  MSG_BLOCK gossip nor via historical MSG_CHAIN sync.  The v7.1.8 P2P-
+  layer fixes (writer thread, dedup-before-process, orphan pool) were
+  necessary but insufficient — every block was still rejected at
+  consensus layer regardless of how cleanly it travelled the wire.
+
+  Fix (Option A — EVM-style commitment)
+  ─────────────────────────────────────
+  state_root is now computed BEFORE the PoW loop, so the mined hash
+  already commits to it correctly.
+
+    1. ``state_root`` added to ``_SEALED_FIELDS`` — type-system
+       enforcement that no code path can mutate it post-mine.
+    2. New ``Blockchain.dry_run_state_root(txs, miner, height)``: applies
+       txs against a snapshot, computes the post-state root, restores
+       the snapshot.  Reuses identical debit/credit/_distribute_rewards
+       paths as ``apply_block`` so determinism is bit-exact.
+    3. ``ConsensusEngine.build_candidate_block`` calls dry_run_state_root
+       (under the blockchain lock) and constructs the candidate Block
+       with ``state_root`` already populated.  PoW now solves for a
+       header that already commits to the correct state.
+    4. ``apply_block`` no longer assigns ``block.state_root``.  Instead
+       it computes the post-state root locally and VERIFIES equality
+       with ``block.state_root`` — the actual consensus check that
+       state_root is meant to provide.  Mismatch → snapshot rollback +
+       reject ("state_root mismatch (Option-A consensus check)").
+    5. Backward-compat: a block with ``state_root == ""`` (pre-v7.1.9
+       miner during the rollout window) is accepted with a warning so
+       a mixed-version network can complete the upgrade.  Will be
+       removed once all peers are on v7.1.9+.
+
+  ── v7.1.8 SYNC RELIABILITY FIX ─────────────────────────────────────────────
+  Four interlocking bugs were silently breaking block propagation under any
+  real load.  Symptoms (all three reported by operators):
+     1. Mined blocks logged "[BROADCAST] -> N peer(s)" but never arrived.
+     2. Blocks reached one hop but did not propagate to two-hop peers.
+     3. Blocks physically arrived at a node and were never applied.
+
+  Bug 1 (CRITICAL) — PeerConnection._writer_loop died on first send error.
+    The loop condition was ``while not _writer_stop and self.connected``.
+    A single transient sendall exception flips ``connected = False`` inside
+    _raw_send, so the next iteration silently terminated the writer thread
+    forever.  Subsequent send_priority() calls enqueued into a dead queue.
+    FIX: loop on _writer_stop only; on send failure, re-queue at the same
+    priority and back off briefly (max 3 retries before per-message drop).
+
+  Bug 2 — _handle_new_block dropped propagation on transient validation
+    failures (notably "Previous block not found").  Two-hop peers never
+    learned about the block when this happened.
+    FIX: treat "Previous block not found" as a gap, stash in the new
+    orphan pool, and request the parent.
+
+  Bug 3 — No orphan-block buffer.  Blocks with index > tip+1 were
+    discarded after firing one MSG_GET_CHAIN gap-fetch.  If the response
+    didn't include the tip block, it was lost for ~1 hour (source peer
+    had it cached in _seen_msgs and would not re-gossip).
+    FIX: bounded FIFO orphan pool keyed by prev_hash, drained after every
+    successful apply_block.  Multi-block catch-up is automatic.
+
+  Bug 4 (MOST DAMAGING) — DEDUP-BEFORE-PROCESS RACE.  _handle_message
+    stored the wire-message hash in _seen_msgs BEFORE posting to the
+    StateEngine.  Network events drop silently at the StateEngine
+    high-water mark (line 4254 ``post()`` returns False), and the call
+    site IGNORED the return value.  Result: dropped block + cached hash =
+    every subsequent gossip copy of the same block was dedup-rejected for
+    1 hour.  The node was deaf to that block until LRU eviction or TTL.
+    FIX: dedup MSG_BLOCK by canonical ``block.block_hash`` (stable across
+    nodes, not affected by validator_sigs / finalized mutation), and
+    DEFER the put() until post() returns True.  Refused blocks log a
+    [INBOUND-DROP] warning and remain re-deliverable.
+
+  Bug 5 (related to Bug 4) — ``post(timeout=5.0)`` is a no-op for
+    network-sourced events; the timeout argument is silently ignored.
+    The "v7.0.0.0 BUG-FIX: raised from 2s -> 5s" comments at the call
+    sites were misleading.  Documentation corrected; behavioural fix
+    delegated to Bug 4 (loud logging on refusal).
+
+  ── v7.1.0 STORAGE REDESIGN ──────────────────────────────────────────────────
+  Replaces the SQLite single-writer bottleneck that caused Bug 1 (v7.0.1.0
+  "database is locked") under concurrent P2P + sync load.  Three backends now
+  run in parallel, each suited to its workload:
+
+    • PostgreSQL — user accounts, balances (integer satoshi), transaction
+      metadata, peers, validators, mempool cold store.  asyncpg pool with
+      4–32 connections, MVCC, row-level locking.  Hot peer writes no longer
+      compete with heavy block commits for a single writer slot.
+
+    • RocksDB — block bodies, headers, hash-index, tx locators, account state,
+      merkle nodes, contract code & storage.  Three column families tuned
+      independently.  Keys are big-endian so prefix-scans yield chain order.
+      WriteBatch + fsync provides the durability barrier for block commits.
+
+    • Redis — hot-path cache: chain tip, recent balances, live mempool
+      (sorted set by fee), pub/sub for new blocks.  Graceful degradation
+      when unreachable — cache misses fall through to Postgres.
+
+  Activation:
+    export VISOLD_STORAGE=pgx           # default when deps are installed
+    pip install rocksdict asyncpg redis msgpack
+# (or python-rocksdb where that legacy binding is supported)
+    createdb visold  (the Storage class auto-creates the schema on startup)
+
+  Rollback path:
+    export VISOLD_STORAGE=sqlite        # reverts to v7.0.x single-file DB
+  Public API of the Storage class is unchanged — zero call-site edits needed
+  outside of storage itself.
+
+  ── v7.0.1.0 — Chaos-Test: DB Lock + Memory TTL + Zombie-Peer Fix ───────────
+
+  ── Three real-world failure modes that survive unit tests ──────────────────
+
+  Bug 1 (CRITICAL) — SQLite "database is locked" under concurrent writes
+    blockchain._lock (RLock) correctly serializes the heavy write paths
+    (accept_chain / apply_block) against each other.  The overlooked race was
+    between those paths and lightweight networking writes — save_peer(),
+    add_ban_score(), mark_peer_fail() — that are called from recv threads
+    WITHOUT holding blockchain._lock.  Every thread owns its own SQLite
+    connection via threading.local().  SQLite WAL mode allows only one active
+    writer at a time.  Because no busy_timeout was set on any connection, the
+    moment a networking thread tried to commit while accept_chain() was mid-
+    batch (potentially 200 × save_block() commits), the second connection
+    received an immediate OperationalError: database is locked — zero retry.
+    On a 5-peer node with active mining + an ongoing 200-block sync, this
+    error fires reliably within the first few minutes.
+    FIX 1a: PRAGMA busy_timeout=5000 added to every _conn() connection.
+      SQLite will now silently retry writes for up to 5 s before raising.
+      This handles all transient lock contention without application changes.
+    FIX 1b: _write_count increment moved inside _wal_lock.
+      _maybe_checkpoint() was incrementing _write_count from multiple threads
+      outside any lock.  CPython's GIL makes single-integer += mostly safe
+      in practice but it is not guaranteed.  The increment now runs under the
+      same _wal_lock that gates the checkpoint PRAGMA, making the counter
+      strictly monotonic and the checkpoint frequency exact.
+
+  Bug 2 (MEDIUM) — _seen_msgs LRU evicts by count, not time (TTL gap)
+    The claim that _seen_msgs grows without bound is INCORRECT — it is already
+    an LRUCache(4096) that evicts the oldest entry when full.  The real gap
+    is that LRU eviction is size-driven, not time-driven.  A sha256 hash
+    stored 48 hours ago stays in the cache and suppresses any retransmission
+    of that exact message, even though the message is no longer "recent
+    gossip" and the dedup window should have expired.  On a low-traffic node
+    (fewer than 4096 messages in 48 h), stale hashes persist indefinitely.
+    This is harmless for pure gossip (MSG_TX / MSG_BLOCK) but problematic if
+    a message type that was incorrectly left OUT of _GOSSIP_DEDUP_SKIP ever
+    gets added back — stale hashes would suppress it for days.
+    FIX: LRUCache now accepts an optional ttl parameter (seconds).  When
+    ttl > 0, get() treats expired entries as cache misses and deletes them.
+    _seen_msgs is constructed with LRUCache(4096, ttl=3600) — hashes expire
+    after 1 hour regardless of cache fullness.  The size cap (4096) still
+    applies for memory safety; both eviction policies run independently.
+
+  Bug 3 (HIGH) — Zombie peer stalls pagination indefinitely
+    When _apply_chain_direct() fires the next-page MSG_GET_CHAIN (v7.0.0.7
+    event-driven pagination), the peer's TCP socket may appear connected while
+    the underlying link is dead (laptop lid closed, Wi-Fi dropped, CGNAT
+    session expired).  The OS buffers the outbound send successfully.  No
+    response ever arrives.  The 30-second socket.timeout PING detects the dead
+    socket eventually, but by then the node has missed at least one 30-second
+    window.  The heartbeat then waits another 60 s before re-requesting the
+    missing page from other peers — a total stall of up to 90 s with zero
+    blocks applied and no feedback to the operator.
+    FIX: A sync watchdog daemon thread is started for every event-driven
+    page request fired from _apply_chain_direct().  It sleeps for
+    Config.CHAIN_SYNC_TIMEOUT_SECS (default 30 s).  When it wakes:
+      • If blockchain.height() has advanced beyond _next_page_from - 1, the
+        response arrived normally — the watchdog exits silently.
+      • If height has NOT advanced AND the peer is still connected, the peer
+        is considered zombie: a light ban score (PEER_SCORE_SYNC_TIMEOUT) is
+        recorded, peer.close() is called (triggering _on_peer_disconnect),
+        and the watchdog immediately re-requests the missing page range from a
+        randomly-chosen alternate connected peer.
+    This ensures sync stalls are detected and recovered within 30 s regardless
+    of network conditions, with no interruption to other message handling.
+
+Production-hardened (v7.0.0.7 — Pagination Race + Outbound Guard + Stale-Cap Fix):
+
+  ── Three residual gaps left after v7.0.0.6 ────────────────────────────────
+
+  Gap 1 (MEDIUM) — Event-driven pagination replaced sleep-based scheduling
+    _request_next_page() slept a fixed 1.0 s then fired the next MSG_GET_CHAIN
+    regardless of whether accept_chain() had finished applying the current page.
+    On Android/Pydroid3 or slow disks, accept_chain() can take 5-10 s per 200-
+    block batch.  When the next-page request arrived before the previous page
+    was committed, two _apply_chain_direct daemon threads raced to acquire
+    blockchain._lock.  Whichever lost the race called accept_chain() first and
+    succeeded; the other (lower-indexed page) then applied AFTER the higher one,
+    creating an out-of-order write that left the chain in an inconsistent state.
+    In the worst case, page N was silently dropped because its blocks were already
+    present from a later page, halting pagination permanently after that point.
+    FIX: The separate _request_next_page thread is removed entirely.  The next
+    page request is now fired from inside _apply_chain_direct() immediately AFTER
+    a successful accept_chain() call.  This guarantees the peer only receives the
+    next request once the previous batch is fully committed — zero race window.
+
+  Gap 2 (MINOR) — Outbound path missing peer.connected guard after _register_peer
+    The inbound handler (added in v7.0.0.6) correctly checked peer.connected
+    after _register_peer() before pushing "CONNECTED" and entering the message
+    loop.  The outbound connect_to() path had no equivalent guard: after
+    _register_peer() rejected a peer (subnet limit or MAX_PEERS cap), the code
+    still spawned a _peer_message_loop thread on the now-closed socket.  The
+    thread exited immediately (peer.connected==False) so there was no data
+    corruption, but the wasted thread allocation was unnecessary and could cause
+    spurious log noise when MAX_PEERS was reached under load.
+    FIX: Added `if not peer.connected: return False` after _register_peer() in
+    connect_to(), mirroring the inbound guard introduced in v7.0.0.6.
+
+  Gap 3 (MINOR) — Stale "4 MB hard cap" comment in CompressionEngine.decompress
+    MAX_MESSAGE_SIZE was raised to 1 GB in v7.0.0.0 but the inline comment on
+    the `_limit = Config.MAX_MESSAGE_SIZE` line in decompress() still said
+    "4 MB hard cap".  The actual runtime value was correct (1 GB), but the
+    stale comment created confusion during audits, making it appear the zip-bomb
+    cap was lower than the receive-buffer cap — a false inconsistency.
+    FIX: Comment updated to accurately reflect the current 1 GB limit.
+
+Production-hardened (v7.0.0.6 — Request-Accept System Critical Fix):
+
+  ── ROOT CAUSE: "Sync Retries Silently Dropped / Pagination Races Retry" ───────
+  Four interlocking bugs remained in v7.0.0.5 that caused the request-accepting
+  system to still fail in real-world conditions.
+
+  Bug 1 (CRITICAL) — MSG_GET_CHAIN not in _GOSSIP_DEDUP_SKIP
+    The v6.9.9.7 fix correctly excluded RESPONSE types (MSG_CHAIN, MSG_PEERS,
+    etc.) from gossip deduplication.  It forgot the REQUEST types.  The retry
+    loop in _auto_sync_on_connect sends up to 6 identical MSG_GET_CHAIN
+    requests (same from_idx / to_idx) when height has not advanced.  Because
+    the payload is identical, every retry after the first hit _seen_msgs,
+    matched the hash stored by the first attempt, and was SILENTLY DROPPED.
+    Effectively only the first of 6 retry attempts ever reached the handler.
+    FIX: MSG_GET_CHAIN, MSG_GET_PEERS, MSG_GET_BLOCK, MSG_RESOLVE, and
+    MSG_CAPABILITY_QUERY added to _GOSSIP_DEDUP_SKIP.  Request types are
+    point-to-point queries; deduplication is wrong for them by definition.
+
+  Bug 2 (CRITICAL) — Retry loop `continue` raced against pagination thread
+    When 200 blocks arrived and accept_chain succeeded, new_h > last_h caused
+    the retry loop to hit `continue`, firing ANOTHER MSG_GET_CHAIN 4 seconds
+    later.  The MSG_CHAIN handler had already spawned a _request_next_page
+    thread sleeping 1 second before sending the next request.  Two competing
+    GET_CHAIN requests were in flight simultaneously to the same peer.  Both
+    responses arrived in the same TCP stream; accept_chain() saw overlapping
+    or out-of-order batches and stalled pagination after the first page.
+    FIX: `continue` replaced with `return` once height advances beyond
+    start_h.  Pagination thread takes exclusive control from that point;
+    the retry loop exits and does not interfere.
+
+  Bug 3 (MEDIUM) — _apply_chain_direct() blocked the receive thread
+    When StateEngine.post() failed (queue full or exception), the fallback
+    _apply_chain_direct() was called SYNCHRONOUSLY on the peer receive thread.
+    accept_chain() acquires blockchain._lock and performs DB writes for up to
+    10 s per 200-block batch.  During that time sock.recv() was never called:
+    incoming TCP data backed up in the kernel buffer; when the kernel buffer
+    filled the peer's write() blocked too; the pagination thread fired at 1 s
+    but the response could not be read — pagination permanently stalled after
+    page 1 whenever StateEngine was busy.
+    FIX: ALL three call-sites (_apply_chain_direct as primary, as StateEngine
+    queue-full fallback, and as StateEngine exception fallback) now dispatch
+    to a daemon thread.  The receive loop is never blocked regardless of how
+    long block application takes.
+
+  Bug 4 (MEDIUM) — from_idx off-by-one and fork detection broken
+    from_idx = max(0, cur_h) had two problems:
+      A. Fork detection: attempt 0 is supposed to start at genesis (from_idx=0)
+         so independently-mined chains are detected at block 1.  On a non-fresh
+         node (cur_h=50), the old code sent from_idx=50, skipping blocks 0-49
+         and making any fork below the current tip invisible to accept_chain().
+      B. Off-by-one: after partial progress (height=50 after first batch),
+         from_idx=50 re-requested block 50 (already stored).  The correct next
+         block is 51, so the right value is cur_h+1.
+    FIX: attempt 0 always uses from_idx=0 for full fork-check on first contact.
+    Subsequent attempts (attempt >= 1) use max(0, cur_h + 1) for delta sync.
+
+  Bug 5 (MINOR) — False "CONNECTED" dashboard notification on rejected peer
+    _register_peer() can silently reject an inbound peer (anti-eclipse subnet
+    limit or MAX_PEERS cap) by calling peer.close() and returning without
+    raising.  The old code pushed "CONNECTED" and called _peer_message_loop
+    unconditionally, producing a false dashboard event.  _peer_message_loop
+    exited immediately (peer.connected==False), so no functional harm, but
+    operators saw ghost "CONNECTED" flashes for rejected peers.
+    FIX: Check peer.connected after _register_peer(); return early if False.
+
+Production-hardened (v7.0.0.0 — Recv-Buffer + Message-Size + Sync-Page Fix):
+
+  ── ROOT CAUSE: "Connected But Never Syncs" ──────────────────────────────────
+  Six interlocking bugs caused nodes that were visibly connected (peer listed,
+  handshake logged) to never exchange blocks except the initial peer-connect
+  message.  All other requests — MSG_GET_CHAIN, MSG_CHAIN, MSG_TX, MSG_BLOCK —
+  were either silently discarded, the response was dropped mid-receive, or the
+  peer was banned for "oversized frame" and disconnected before the sync data
+  could be applied.
+
+  Bug 1 (CRITICAL) — recv buf reset on every outer loop iteration
+    _peer_message_loop reset buf=b"" at the top of each try block, meaning
+    every 30-second idle timeout (socket.timeout) wiped any partial frame that
+    was in-flight.  A 200-block MSG_CHAIN response arrives in many TCP segments;
+    if no segment arrived within 30 seconds during a slow sync, the partial
+    data was discarded and the message was never delivered to _handle_message.
+    FIX: buf=b"" moved outside the outer while loop so it persists across all
+    socket.timeout exceptions and outer-loop restarts.
+
+  Bug 2 (CRITICAL) — MAX_MESSAGE_SIZE 4 MB too small for sync responses
+    MAX_MESSAGE_SIZE = 4_194_304 (4 MB).  A 200-block chain response with
+    transactions averages ~1–8 MB; at peak (full blocks) it exceeded 4 MB.
+    When exceeded the peer was immediately banned for "oversized frame" with
+    a 50-point ban score, causing permanent disconnection mid-sync with no
+    recovery possible until node restart.
+    FIX: MAX_MESSAGE_SIZE raised to 1_073_741_824 (1 GB).
+
+  Bug 3 — Server-side MSG_GET_CHAIN cap 500 → 200 blocks
+    The server sent up to 500 blocks per response but MAX_MESSAGE_SIZE was
+    only 4 MB — these two values were inconsistent, guaranteeing that any
+    chain with non-trivial transactions would trigger Bug 2.
+    FIX: Server cap reduced to 200 blocks.  200 × ~8 KB avg = ~1.6 MB typical,
+    stays safely under the new 1 GB limit even on full-transaction chains.
+    Pagination in MSG_CHAIN handler fetches remaining pages automatically.
+
+  Bug 4 — _auto_sync_on_connect and all sync call-sites requested 500 blocks
+    All outbound MSG_GET_CHAIN requests used to_idx = from_idx + 499.
+    FIX: All call-sites updated to to_idx = from_idx + 199 to match server cap.
+    Affected: _auto_sync_on_connect, _reconnect_loop heartbeat, sync_chain(),
+    and _bg_sync() in CLI _dispatch.
+
+  Bug 5 — Pagination back-off 50ms too short; next page fired before apply
+    The _request_next_page thread slept only 50ms before sending the next
+    MSG_GET_CHAIN.  accept_chain() / StateEngine had not finished applying the
+    current 200-block page in that time, so the node's height had not advanced.
+    Depending on the accept_chain() path the next batch could be rejected as
+    already-known or a fork, halting pagination permanently after page 1.
+    FIX: back-off raised to 1.0 second.
+
+  Bug 6 — MSG_TX and MSG_BLOCK StateEngine post timeout 2s → 5s
+    Under load (a sync batch being processed by StateEngine), the queue could
+    be temporarily saturated.  post(timeout=2.0) would silently fail, dropping
+    incoming TX and BLOCK events from peers.  Operators saw peers connected and
+    mining but mempool and chain not updating from network events.
+    FIX: post timeout raised to 5.0 seconds for MSG_TX and MSG_BLOCK.
+
+Production-hardened (v6.9.9.9 — Bootstrap Sync Fix):
+
+  ── CRITICAL BUG-FIX: Fresh Node Never Synced From Peers ─────────────────────
+  Three interlocking bugs caused a fresh node (height=-1) to stay permanently
+  at block 0 even when connected to peers with 66+ blocks.  The symptom was
+  "connected but isolated" — peers listed, handshake logged, but chain height
+  never advancing.
+
+  Bug 1 — _auto_sync_on_connect sent from_idx=1, skipping genesis (block 0).
+    The fresh node received blocks starting at index 1.  validate_block(block_1)
+    looked up storage.get_block(0) → None → "Previous block not found" → entire
+    sync batch rejected.  Chain stayed empty forever.
+    FIX: from_idx changed from 1 → 0 so genesis is always included in the
+    first sync batch.
+
+  Bug 2 — accept_chain() Case 1 condition rejected genesis batch on fresh node.
+    Case 1: blocks[0].index == current_tip + 1 → 0 == (-1+1)=0 is TRUE now
+    (fixed by Bug 1 sending block 0), but the original condition only checked
+    for extensions strictly above the tip.  Added explicit fresh-node branch:
+      (current_tip == -1 and blocks[0].index == 0)
+    so genesis + chain are applied via the fast Case 1 sequential path.
+
+  Bug 3 — Case 3 (fork-choice) dry-run validated all blocks before applying any.
+    validate_block(N) calls get_difficulty() which reads the LOCAL chain state.
+    After _hard_reset_to, chain is empty, so get_difficulty() returned
+    INITIAL_DIFFICULTY=3.0 for every block.  Blocks 2-N had their own computed
+    difficulties and were all rejected as "Difficulty mismatch" — leaving the
+    chain wiped but not repopulated.
+    FIX: replaced two-pass (validate-all / apply-all) with single sequential
+    interleaved pass (validate-N → apply-N → validate-N+1 → ...) so each
+    validate_block(N) sees blocks 0..N-1 already in the DB and computes the
+    correct expected difficulty.
+
+  Bug 4 (minor) — sync_chain(), heartbeat, and _dispatch bg_sync all computed
+    from_idx = height + 1 without guarding height == -1, so a fresh node would
+    request from_idx=0 by arithmetic luck only sometimes.
+    FIX: all three sites now use max(0, height + 1) explicitly.
+
+    Three new push helpers write directly to _notify_buf (thread-safe):
+      _push_block_notif(height, miner, source)
+        — called in StateEngine._handle_mine_result (local mine) and in the
+          MSG_BLOCK handler (block received from network). Source tag shows
+          "YOU" for own blocks, "NET" for blocks from peers.
+      _push_peer_notif(event, ip, port)
+        — called in P2PNetwork._register_peer (connect) and
+          P2PNetwork._on_peer_disconnect (disconnect).
+
+    Previously these events only appeared after the 1-second _redraw_live()
+    cycle, which itself only showed log records routed through _QueueHandler.
+    Peer-disconnect was logged at DEBUG level and was therefore invisible in
+    the panel entirely; it is now promoted to INFO.
+
+  ── IMPROVEMENT: Two-Cadence Refresh Loop ────────────────────────────────────
+  • _refresh_loop() now operates at two independent cadences:
+
+      Every 1 second  — redraws the "Recent Activity" notification panel and
+                        the "Peer Activity" panel only. These rows are driven
+                        by event pushes that can arrive at any time, so they
+                        must be surfaced immediately.
+
+      Every 10 seconds — additionally redraws the five live-stat rows:
+                         Balance, Height / Difficulty, Peers / Hashrate,
+                         Mining / Mempool, Role / Stake. These values change
+                         at block cadence (typically tens of seconds), so a
+                         10-second poll is sufficient and reduces unnecessary
+                         DB reads by 90% vs the prior 1-second full redraw.
+
+  • _redraw_live() now accepts an update_stats: bool parameter so the two
+    cadences share one atomic ANSI write path rather than duplicating code.
+    Callers that need an immediate full refresh (e.g. _main_loop after a
+    command) continue to call _redraw_live(update_stats=True) via
+    _full_render(), which always redraws everything.
+
+Production-hardened (v6.9.9.7 — Chain Sync & Gossip Dedup Critical Fix):
+
+  ── BUG 1 (CRITICAL): Gossip Dedup Permanently Blocks Chain Sync ─────────────
+  • ROOT CAUSE of "Height stays at 0 forever" identified and fixed.
+    _handle_message() hashed every incoming message — including MSG_CHAIN
+    (sync responses) — and stored each hash in _seen_msgs.
+
+    Failure sequence:
+      1. Peer B connects to A (A has height=66, B has height=0).
+      2. _auto_sync_on_connect fires; B sends MSG_GET_CHAIN(1→500) to A.
+      3. A replies MSG_CHAIN(66 blocks).  Hash stored in B's _seen_msgs.
+      4. If accept_chain() or StateEngine.post() fails (any reason),
+         B's height stays at 0.
+      5. 60 s later heartbeat: B sends MSG_GET_CHAIN(1→501) to A.
+      6. A replies MSG_CHAIN(66 blocks) — IDENTICAL payload, same hash.
+      7. _seen_msgs already has this hash → message SILENTLY DROPPED.
+      8. Manual "Sync Chain" (menu option 2) produces the same 66-block
+         response → also silently dropped.
+      → B is PERMANENTLY stuck at height=0; no recovery possible.
+
+    [FIX] MSG_CHAIN, MSG_PEERS, MSG_RESOLVE_RESP, MSG_CAPABILITY_RESPONSE
+    are now excluded from gossip dedup.  These are point-to-point
+    request-response messages, not gossip floods; deduplication was always
+    wrong for them.  TX/BLOCK gossip is still deduplicated normally.
+
+  ── BUG 2: StateEngine Timeout Silently Drops Sync Events ────────────────────
+  • [FIX] MSG_CHAIN handler: StateEngine.post() timeout raised 2 s → 10 s.
+    A large initial sync batch (500 blocks) can exceed 2 s during deserialization.
+    If post() fails or times out, the handler now falls back to calling
+    accept_chain() directly instead of silently discarding the batch.
+
+  ── BUG 3: sync_chain() Requested Only 50 Blocks ─────────────────────────────
+  • [FIX] sync_chain() (menu option 2 "Sync Chain") used to_idx = height+50.
+    A node at height=0 would receive 50 blocks and stop, requiring 13+ manual
+    syncs to reach a 650-block chain.  Fixed to to_idx = height+500 (matches
+    MSG_GET_CHAIN server-side cap).  The new MSG_CHAIN pagination (below) will
+    then automatically fetch subsequent batches without further user action.
+
+  ── BUG 4: No Pagination — Chains > 500 Blocks Never Fully Synced ────────────
+  • [FIX] MSG_CHAIN handler: when a full page (500 blocks) is received,
+    automatically request the next batch (last_idx+1 to last_idx+500) after
+    a 50 ms back-off.  This chains requests until the tip is reached, so a
+    single sync_chain() or _auto_sync_on_connect fires will now bring a fresh
+    node fully in sync regardless of chain length — no user intervention needed.
+
+  ── BUG 5: Capability Mismatch / Delayed Discovery ───────────────────────────
+  • [FIX] Capabilities (full_node, vvm, …) are now included in both the HELLO
+    and ACCEPT messages exchanged during the TLS handshake.
+    Previously capabilities were broadcast only via periodic MSG_CAPABILITY_ADV
+    (up to 120 s after connection), so newly-connected nodes did not know each
+    other's roles for the first two minutes.  The CapabilityRouter is now
+    populated immediately on handshake completion for both inbound and outbound
+    connections.
+
+  ── BUG 6: Duplicate Full-Chain Sync Requests (Both Sides Fired) ─────────────
+  • [FIX] _auto_sync_on_connect now accepts an `initiator` flag.
+    Only the OUTBOUND (connecting) side sends MSG_GET_CHAIN from_idx=1.
+    Previously both the inbound and outbound handlers fired the request
+    simultaneously: the inbound side's request was useless (the freshly-
+    connecting node has no blocks to send back) and doubled network traffic.
+    The inbound node still receives a capability advertisement immediately
+    and will receive blocks from the outbound node's request.
+
+  ── IMPROVEMENT: Immediate Capability Advertisement on Connect ───────────────
+  • _auto_sync_on_connect now sends MSG_CAPABILITY_ADV immediately after
+    connection (before the chain request), replacing the 120-second wait.
+    Both inbound and outbound sides do this so the CapabilityRouter is
+    fully populated within 1 second of connection establishment.
+
+  ── IMPROVEMENT: Sync Logging at INFO Level ─────────────────────────────────
+  • Chain sync outcomes (blocks accepted, rejected, errors) are now logged at
+    INFO level so they appear in the dashboard "Recent Activity" panel.
+    Previously they were at DEBUG and invisible to operators.
+
+  ── IMPROVEMENT: ACCEPT Message Now Includes chain_height ───────────────────
+  • The ACCEPT message now carries "chain_height" so the connecting node
+    knows immediately if the remote has more blocks and can log a clear
+    "sync will follow automatically" message at handshake time.
+
+Production-hardened (v6.9.9.6 — Outbound IP Cooldown + Advanced User ID Resolve):
+  ── Outbound Connection Fail Cooldown ────────────────────────────────────────
+  • [NEW] Per-IP outbound connection fail counter added to P2PNetwork.
+    If an IP fails OUTBOUND_FAIL_LIMIT (default 5) consecutive outbound attempts
+    without a successful handshake, the reconnect loop skips that IP for
+    OUTBOUND_FAIL_COOLDOWN_SECS (default 300 s / 5 minutes) before retrying.
+    This stops the CONNECTING→FAILED→CONNECTING storm seen in the dashboard when
+    a seed node or peer is unreachable.
+    - Counter resets to 0 on first successful connection (not a permanent ban).
+    - Counter resets to 0 when cooldown expires, so retry resumes cleanly.
+    - Dashboard shows new "COOLDOWN" status (magenta ⏸) when an IP is skipped.
+    - State is in-memory only — resets on node restart.
+    - Config keys: OUTBOUND_FAIL_LIMIT = 5, OUTBOUND_FAIL_COOLDOWN_SECS = 300.
+
+  ── Advanced User ID Resolve (menu option 20) ────────────────────────────────
+  • [IMPROVED] _resolve_user CLI now:
+    1. Validates user_id format before querying (account USERNAME#10hex OR
+       plain domain name) — fast-fails typos without hitting the network.
+    2. Tags the result source: LOCAL (found in this node's DB) vs NETWORK
+       (fetched from connected peers via MSG_RESOLVE broadcast).
+    3. Shows live ONLINE / OFFLINE status by checking if the resolved peer_id
+       is currently in self.network.peers and connected.
+    4. Shows reputation score + fail_count from the peers table if available.
+    5. Shows last_seen as both UTC timestamp and human-readable delta
+       (e.g. "2 h ago", "5 d ago").
+    6. Displays multiaddrs one per line with ↳ indent instead of raw list repr.
+
+  ── No bugs found in v6.9.9.3 ────────────────────────────────────────────────
+  • All existing logic verified correct. No functional changes other than above.
+
+Production-hardened (v6.9.9.3 — Full Chain Heartbeat Fix + Split-Chain Prevention):
+  ── BUG: Full Chain Heartbeat (Bandwidth/Throughput Bug) ─────────────────────
+  • [FIX] Three sync call-sites were sending the entire chain history every
+    time they fired, causing "Socket Bloat" — the network buffer fills up,
+    connections lag, timeout, and the Blacklist Bug re-triggers:
+
+    1. _reconnect_loop heartbeat (every 60 s):
+         BEFORE: from_idx = max(1, my_height - 10)
+                 → on a 66-block chain this sent blocks 1-66 every minute
+         AFTER:  from_idx = my_height + 1
+                 → only NEW blocks above our tip are ever requested
+
+    2. CLI keypress _dispatch background sync (every Enter press):
+         BEFORE: from_idx = max(1, my_h - 5)
+                 → same bloat problem on short chains
+         AFTER:  from_idx = my_h + 1
+                 → lightweight delta-sync only
+
+    The one intentional full-chain sync is preserved:
+    _auto_sync_on_connect (runs ONCE when a new peer registers) still uses
+    from_idx=1 so that independently-mined fork chains are detected and
+    resolved immediately at first contact via accept_chain() fork-choice.
+
+  ── Split Chain Prevention (two nodes mine independently then connect) ────────
+  • [MAINTAINED] When two peers connect after mining independently, the
+    _auto_sync_on_connect sends from_idx=1 exactly once.  accept_chain()
+    then runs the four-tier fork-choice rule (BFT finality → justified height
+    → cumulative PoW → lowest hash) and the losing chain automatically reorgs
+    to the winning chain.  No extra code is needed — this was already correct.
+
+  • [FIX] Removing the heartbeat bloat prevents the Socket Bloat / timeout
+    cycle that previously caused this one-time fork-choice sync to never
+    complete: connections would drop before accept_chain() could finish,
+    leaving both nodes on their separate forks indefinitely.
+
+Production-hardened (v6.9.9 — IPv6-First / CGNAT Direct-TCP Timeout Fix):
+  ── Does CGNAT block IPv4 and prevent IPv6 fallback? ────────────────────────
+
+  SHORT ANSWER:
+  • For DNS seed HOSTNAMES: NO — DNSSeeder resolves AF_UNSPEC, gets A + AAAA,
+    and spawns separate _try_add_peer threads for each IP.  IPv6 threads run
+    independently; CGNAT IPv4 timeouts cannot block them.
+  • For IPv4-only static seeds (SEED_PEERS list, no AAAA record): no IPv6 to
+    fall back to — topology limitation, not a code bug.  Add IPv6 seed IPs to
+    Config.DNS_SEEDS to fix at the configuration level.
+
+  THREE CODE FIXES:
+
+  ── FIX 1: ICE direct-TCP timeout under CGNAT (ICEManager.connect) ──────────
+  • [FIX] ICE Step-1 (direct TCP) timeout reduced from 3.0s → 0.8s when:
+      _is_ipv4_peer = True  (remote address has no ':')
+      _behind_nat   = True  (STUN public_ip ≠ local_ip, i.e. we are behind NAT)
+    CGNAT drops packets silently — no RST.  The old 3s wait was pure dead time
+    before UDP hole-punch ran.  0.8s is still generous for LAN / port-forwarded
+    peers (RTT << 300ms) while cutting per-peer CGNAT waste by 2.2s.
+    IPv6 peers are always publicly routable; their timeout is unchanged (3.0s).
+
+  ── FIX 2: DNSSeeder registers IPv6 peers before IPv4 (DNSSeeder._query_one) ─
+  • [FIX] When a seed hostname resolves to both A and AAAA records, IPv6 IPs are
+    now passed to _try_add_peer() before IPv4 IPs.  This ensures IPv6 connection
+    threads are spawned first so a working connection is established sooner on
+    CGNAT networks where IPv4 attempts are likely to stall or fail.
+
+  ── FIX 3: PEX processes IPv6 peers before IPv4 (MSG_PEERS handler) ────────
+  • [FIX] Peer Exchange (MSG_PEERS) now sorts the received peer list so IPv6
+    entries are fed to _try_add_peer() before IPv4 entries — same rationale as
+    Fix 2, applied to runtime PEX gossip.
+
+  ── PRIOR (v6.9.8): Frame Framing + Recv Buffer + TOFU Reconnect Fix ────────
+Production-hardened (v6.9.8 — Frame Framing + Recv Buffer + TOFU Reconnect Fix):
+  ── BUG 1: recv_line() discarded bytes after first 
+ (handshake deadlock) ─────
+  • [FIX] PeerConnection now holds a persistent self._recv_buf across recv_line()
+    calls.  TCP is a stream — two handshake frames (e.g. POW_CHALLENGE + VERIFY)
+    can arrive in a single recv().  The old local buf=b"" threw away everything
+    after the first 
+; the next recv_line() blocked until timeout → drop.
+
+  ── BUG 2: send() compressed the 
+ delimiter inside the frame (frame split) ───
+  • [FIX] send() now compresses bare JSON bytes (no trailing 
+), then appends 
+
+    AFTER compression.  Compressed payloads contain 0x0a bytes internally; the
+    old code put 
+ inside the compressed blob, causing recv_line's split(b"
+",1)
+    to cut the frame at byte 7 of the HELLO message → decompression failure →
+    silent connection drop.  Empirically confirmed: zlib.compress(HELLO+
+) has
+    its first 0x0a at offset 7, producing a 7-byte "line" that always fails.
+    Affected all HELLO messages (544 bytes > 512-byte COMPRESS_THRESHOLD).
+
+  ── BUG 3: TOFU fingerprint rejected reconnection after any node restart ────────
+  • [FIX] connect_to TOFU block changed from reject-on-mismatch to re-pin-on-
+    change.  Self-signed certs regenerate on every startup; the old code treated
+    a changed fingerprint as a MITM attack and returned False.  On Android with
+    frequent restarts this meant nodes could never reconnect.  The ECDSA
+    CHALLENGE_RESP exchange is the authoritative identity gate — IP-keyed cert
+    pinning is now best-effort only.  A warning is logged when a fingerprint
+    changes so genuine MITM attempts are still visible in the log.
+
+  ── PRIOR (v6.9.7): TLS server context changed from CERT_OPTIONAL to CERT_NONE ─
+  • [FIX] Root cause of "DNS-connected but never peer" finally resolved.
+
+    Empirically verified failure chain in all prior versions:
+      1. Server context used ssl.CERT_OPTIONAL.
+      2. With CERT_OPTIONAL, OpenSSL never sends a TLS CertificateRequest
+         message to the connecting client.
+      3. Because no CertificateRequest was sent, the client never transmitted
+         its certificate — even though client_context() loaded one.
+      4. getpeercert(binary_form=True) on the server side therefore always
+         returned None.
+      5. verify_peer_fingerprint_by_ip(ip, None) → 'No certificate presented
+         — rejecting' → every inbound connection was dropped before HELLO
+         was ever read.
+      6. Both nodes saw each other via DNS, spawned connection threads, but
+         neither could complete a handshake in either direction.
+
+    Correct model for a P2P mesh with self-signed certificates (same as
+    Bitcoin Core, Lightning Network):
+      • TLS provides channel encryption only.  The server presents its cert;
+        the client accepts any server cert at the TLS layer.
+      • Server context now uses ssl.CERT_NONE — TLS handshake completes for
+        encryption; OpenSSL does not request or verify a client cert.
+      • Inbound peer identity is proven cryptographically by the ECDSA
+        VERIFY / CHALLENGE_RESP exchange in the JSON handshake, which is a
+        complete proof of private-key ownership — stronger than TLS client
+        cert auth with no shared CA.
+      • Outbound (connect_to) TOFU on the server cert is preserved:
+        the client still pins the server's cert fingerprint by IP on first
+        contact and verifies it on subsequent connections, protecting against
+        MITM on outbound paths.
+
+  • [FIX] Inbound TOFU block removed from _handle_inbound.
+    The block that called verify_peer_fingerprint_by_ip() on the inbound
+    socket immediately after wrap_socket() has been removed.  It was
+    structurally impossible for it to ever succeed (see above) and was the
+    immediate cause of all inbound connections being silently dropped.
+
+  ── Peer Activity Dashboard Panel ────────────────────────────────────────────
+  • [NEW] Live "Peer Activity" panel added to the node dashboard.
+    Displays the 8 most recent peer connection events in real time,
+    updated every second by the existing refresh thread.  Each row shows:
+      timestamp  direction (→OUT / ←IN)  IP:port  status
+
+    Status values and their colours:
+      CONNECTING  cyan    — outbound dial initiated
+      ARRIVING    cyan    — inbound TLS + handshake in progress
+      CONNECTED   green   — handshake completed; peer is live
+      FAILED      yellow  — outbound dial or handshake failed
+      REJECTED:PoW   yellow  — inbound rejected: PoW nonce invalid
+      REJECTED:Sig   yellow  — inbound rejected: ECDSA signature invalid
+      BANNED      red     — IP is under a soft-ban; attempt skipped
+
+    The buffer holds the 8 most recent events across both directions and
+    persists across connection cycles so the panel is never blank after the
+    first event.  All writes to the buffer are lock-protected and never
+    raise exceptions so background threads are unaffected.
+
+  ── Backward Compatibility ────────────────────────────────────────────────────
+  Wire protocol, DB schema, RPC, and CLI commands are unchanged.
+  The CERT_NONE change is transparent to connecting peers — they see the
+  same self-signed server certificate as before and the JSON handshake
+  sequence is identical.
+
+Production-hardened (v6.9.6 — PoW Sequencing Fix):
+  ── CRITICAL: PoW check moved before MSG_ACCEPT ───────────────────────────────
+  • [FIX] In _handle_inbound, the PoW nonce verification now happens BEFORE
+    the server sends MSG_ACCEPT.  In v6.9.5 and earlier the order was:
+      1. send MSG_ACCEPT
+      2. check PoW nonce — close socket if bad
+    This caused a permanent asymmetry: the connecting client received MSG_ACCEPT,
+    called _register_peer(), started its message loop, and returned connect_to=True
+    — believing the connection was established.  The server then rejected the PoW,
+    closed its socket, and registered nothing.  Both nodes would continue to
+    discover each other via DNS but could never exchange P2P messages because
+    the client's "peer" pointed to a dead socket and the server had no peer entry
+    at all.  DNS-connected, peer-never-formed — exactly the symptom reported.
+  • The server now also sends a MSG_REJECT with reason "PoW verification failed"
+    before closing, so the client's connect_to() returns False immediately rather
+    than blocking until the recv timeout fires.
+
+  ── Backward Compatibility ────────────────────────────────────────────────────
+  Wire protocol and DB schema are unchanged.  The only observable difference is
+  that a client whose PoW nonce is rejected now receives an explicit MSG_REJECT
+  instead of a silent socket close.  Old clients handle this correctly (they
+  already handle MSG_REJECT in connect_to).
+
+Production-hardened (v6.9.5 — P2P Connection Bug-Fix Release):
+  ── All 7 networking bugs fixed ───────────────────────────────────────────────
+
+  BUG 1 (CRITICAL) — Forced Port Override:
+  • Config.FORCE_OUTBOUND_DEST_PORT now defaults to False.
+    The advertised port from Peer Exchange / DNS seeds is used as-is.
+    IPv6 peers and IPv4 peers on non-standard ports are now reachable.
+    The old True default caused every outbound attempt to connect to
+    DEFAULT_PORT regardless of what the peer actually advertised, breaking
+    both auto-discovery and manual peer adding.
+
+  BUG 2 — Misuse of CGNAT Logic:
+  • _connect_with_fallback() replaces the bare threading.Thread(connect_to)
+    call. It tries the advertised port first (correct for all IPv6 and
+    properly-forwarded IPv4 peers). Only for IPv4 peers where the attempt
+    fails does it automatically retry on DEFAULT_PORT as a CGNAT fallback.
+    This gives the best of both worlds without silently breaking IPv6.
+
+  BUG 3 — Silent Connection Failures:
+  • _connect_with_fallback() logs a DEBUG message on every failure so
+    operators can see exactly which endpoint rejected the connection and why.
+    The return value of connect_to() is now checked.
+
+  BUG 4 — Duplicate Filtering Bug:
+  • _pending_connections (set) added to P2PNetwork.__init__.
+    _try_add_peer checks the set (under _pending_lock) before spawning a
+    thread, preventing multiple concurrent races to the same endpoint.
+    _connect_with_fallback() always removes the entry in a finally block
+    so retries are never permanently blocked after a failure.
+
+  BUG 5 — Over-blocking Self / Local Addresses:
+  • Config.BIND_ADDRESS ("::") removed from the self-connection guard.
+    It is a bind wildcard, not a routable peer address — including it
+    could incorrectly block valid peers.  The guard now uses an explicit
+    set {127.0.0.1, ::1, 0.0.0.0, Config.LOOPBACK_ADDRESS} and also
+    checks peer_id == self.node_id when the peer_id is known.
+
+  BUG 6 — Opaque Handshake Failures:
+  • connect_to() now logs a distinct DEBUG message for each handshake
+    failure point (no response after HELLO, unexpected message type after
+    HELLO, no response after CHALLENGE_RESP, unexpected type / rejection
+    reason after CHALLENGE_RESP) making diagnosis of version mismatches
+    and non-Visold peers straightforward.
+
+  BUG 7 — Discovery ≠ Connection:
+  • MSG_CAPABILITY_RESPONSE handler now calls _try_add_peer() for every
+    peer_id received.  It resolves each peer_id to an (ip, port) via the
+    local peers DB, skips ourselves and already-connected peers, and feeds
+    all others into the normal connection pipeline.  Previously, the
+    handler only logged the received list and discarded it.
+
+  ── Backward Compatibility ────────────────────────────────────────────────────
+  Wire protocol, DB schema, RPC, and CLI are fully unchanged.
+  All v6.9.x databases are 100% compatible with this release.
+  Nodes on older versions remain connectable (they will still use the old
+  forced-port behaviour on their side; this node always tries their real port).
+
+Production-hardened (v6.9.2 — Fixed Outbound Destination Port):
+  ── 10. Outbound Port Enforcement ────────────────────────────────────────────
+  • [NEW] Config.FORCE_OUTBOUND_DEST_PORT = True (default).
+    Every outbound TCP connection attempt, regardless of how the peer was
+    discovered, now targets Config.DEFAULT_PORT (8338) on the remote side.
+    The local source port remains ephemeral to allow concurrent connections.
+
+    Discovery paths covered:
+      • DNS seed resolution (DNSSeeder)
+      • Peer Exchange / MSG_PEERS gossip (PEX)
+      • Bootstrap from the local peer database (_bootstrap)
+      • Automatic reconnect loop (_reconnect_loop)
+      • Manual peer add via CLI or RPC (add_peer_manual)
+
+    Enforcement points:
+      _try_add_peer  — the single chokepoint for all automatic paths.
+                       Port is clamped at the very top, before the soft-ban
+                       check, the self-connection guard, and the blacklist
+                       check, so no downstream code ever sees a wrong port.
+      add_peer_manual — the one path that calls connect_to() directly.
+                       Same clamp applied; emits WARNING (not DEBUG) so
+                       operators are notified when a manually-typed port
+                       is overridden.
+
+    Why this matters on CGNAT / mobile networks:
+      A peer behind CGNAT advertises whatever ephemeral port its OS assigned
+      at last outbound connect.  That port is NOT reachable from outside —
+      the NAT box owns it.  Knocking on that port from another CGNAT node
+      fails silently.  The only port worth trying is the well-known,
+      intentionally-forwarded DEFAULT_PORT.
+
+    Operator override:
+      Set FORCE_OUTBOUND_DEST_PORT = false in config.json (or the env var
+      VISOLD_FORCE_OUTBOUND_DEST_PORT=0) to disable enforcement on private
+      test networks where nodes deliberately use non-standard ports.
+
+  ── Backward Compatibility ────────────────────────────────────────────────────
+  All v6.9.0 / v6.8.x databases and P2P wire protocol are unchanged.
+  Nodes that listen on a non-default port remain reachable from operators
+  who disable FORCE_OUTBOUND_DEST_PORT on their connecting node.
+
+Production-hardened (v6.9.0 — IPv6 / CGNAT Outbound Fix):
+  ── 9. IPv6 Preference & CGNAT Traversal ─────────────────────────────────────
+  • [FIX] Happy Eyeballs outbound connection (RFC 8305).
+    _create_connection_dual_stack now races IPv6 and IPv4 in parallel threads
+    instead of trying them sequentially.  IPv6 is started immediately; IPv4
+    is started 250 ms later only if IPv6 has not yet connected.  The first
+    successful socket wins; the loser is closed.
+    This prevents a hung IPv4 CGNAT attempt from delaying IPv6 by a full
+    PEER_TIMEOUT (30 s) — the maximum penalty is now 250 ms.
+
+  • [FIX] STUNClient address-family mismatch.
+    When STUNClient.get_public_address resolves the STUN hostname to an IPv6
+    address (AAAA record), it now creates an AF_INET6 UDP socket instead of
+    the previous hard-coded AF_INET socket, which caused EAFNOSUPPORT on
+    IPv6-only STUN servers.
+
+  • [FIX] UDPHolePuncher IPv6 support.
+    UDPHolePuncher._make_sock now accepts a remote_ip argument and creates
+    an AF_INET6 SOCK_DGRAM socket (bound to '::') when the remote peer has
+    an IPv6 address, instead of always using AF_INET / '0.0.0.0'.
+
+  • [FIX] ICEManager._get_local_ips discovers IPv6 addresses.
+    The local-IP discovery now filters fe80:: link-local IPv6 addresses (not
+    routable) and includes a separate UDP-trick fallback toward a public IPv6
+    address to detect the node's global IPv6 when gethostname() only returns
+    IPv4 addresses.
+
+  • [FIX] SentinelNode._probe_primary_tcp uses dual-stack.
+    The sentinel TCP probe now calls _create_connection_dual_stack so it can
+    reach an IPv6-only primary node even from a CGNAT IPv4 uplink.
+
+  • [FIX] RelayBridge.connect_via_relay uses dual-stack.
+    RelayBridge now uses _create_connection_dual_stack instead of the
+    IPv4-biased socket.create_connection so relay servers with IPv6 addresses
+    are reachable.
+
+  • [FIX] _init_relay scan-to-bind probe uses AF_INET6.
+    The port-availability probe that picks the relay server port now uses an
+    AF_INET6/IPV6_V6ONLY=0 socket (falling back to AF_INET) so that the
+    probed port availability matches the dual-stack relay server socket.
+
+  • [FIX] CLI _add_peer IPv6 address parsing.
+    The "Add Peer" menu entry no longer uses a bare str.rsplit(':', 1) which
+    silently corrupts IPv6 addresses like '2401:db8::1:8338'.  It now uses
+    the centralised _parse_peer_addr() helper which correctly handles the
+    RFC-standard bracket notation '[2401:db8::1]:8338'.
+
+  ── Backward Compatibility ────────────────────────────────────────────────────
+  All v6.8.x databases, RPC methods, CLI commands, and consensus rules are
+  100% compatible.  The changes are confined to the networking layer and do
+  not affect block validation, state transitions, or the P2P wire protocol.
+
+Production-hardened (v6.2.0 — Account Recovery / Cross-Device Login):
+  ── 8. Account Recovery on a New Device ──────────────────────────────────────
+  • [FIX]  First-run setup now offers two paths instead of forcing account
+    creation:
+      [1] Create a new account  (original behaviour, unchanged).
+      [2] Restore my existing account — the user enters their previously
+          saved User ID (e.g. HIMADRI#d43e705790) and Secret Key, and the
+          account is restored on the new device immediately.
+
+    Problem addressed:
+      On a fresh device `account.json` does not exist, so `is_registered()`
+      returned False and `_first_run()` was called unconditionally.  The only
+      action inside `_first_run()` was *creating* a new account — there was no
+      way to re-open an existing account.  The `_sign_in()` helper existed but
+      was never reachable on a blank device because it calls `UserAccount.login()`
+      which reads from the (absent) local file.
+
+    New UserAccount.recover(user_id, secret) classmethod:
+      • Validates the User ID format (USERNAME#<10 hex chars>) and secret length.
+      • Guards against silently overwriting a *different* locally-stored account.
+      • Computes SHA-256 of the supplied secret and writes a fresh account.json —
+        identical in structure to what `register()` produces, plus a
+        `recovered_at` timestamp for auditability.
+      • Because the network is fully decentralised, credentials cannot be
+        server-verified.  A user who enters a wrong secret will simply fail every
+        subsequent `login()` call; no data is corrupted and no special server
+        call is needed.
+
+    New CLI flow (first-run only):
+      _first_run()       — shows [1]/[2] menu, loops until a valid choice.
+      _create_account()  — moved from old _first_run(); validates username,
+                           calls UserAccount.register(), displays credentials.
+      _recover_account() — new; prompts User ID + Secret Key (hidden via
+                           getpass), calls UserAccount.recover(), auto-logs in.
+                           Returns True on success, False to re-show the menu.
+
+  ── Backward Compatibility ────────────────────────────────────────────────────
+  All v6.0.0 / v6.1.0 account.json files are 100% compatible — no migration.
+  Nodes that already have account.json skip _first_run() entirely (auto-login
+  behaviour is unchanged).  The new `recovered_at` field is optional; existing
+  files without it are never modified.
+
+Production-hardened (v6.0.0 — Soft Ban / Consecutive Failure Escalation):
+  ── 7. Soft Ban: Probabilistic Scrutiny-Tax Defence ──────────────────────────
+  • [NEW] SoftBanManager — three-strikes consecutive-failure escalation
+    (Section 6F) for TRUST_LEVEL_LOW peers.
+
+    Problem addressed — "The Scrutiny Tax":
+      Every MSG_TX / MSG_BLOCK from an untrusted peer triggers Full Audit Mode
+      (deep ECDSA re-verification + VVM re-execution), which costs ~10× more
+      CPU than validating a trusted peer's message.  An attacker with 1 000
+      "untrusted" nodes sending high-complexity garbage can saturate the CPU
+      without ever producing a valid chain message.
+
+    Solution — Consecutive Failure Filter:
+      The key insight is that a *legitimate* experimental fork will occasionally
+      pass audit (its blocks are valid, just from different software).  A pure
+      attack node never passes — every single message is invalid by design.
+      Tracking *consecutive* failures separates these two cases.
+
+    Three-strike escalation logic:
+      Strike 1 — WARNING log. One warning, connection kept open.
+                 Counter resets to 0 on any valid message.
+      Strike 2 — Throttling. Config.SOFT_BAN_THROTTLE_DELAY_SECS (default 2 s)
+                 of sleep is inserted in the peer's message-loop thread before
+                 each subsequent MSG_TX / MSG_BLOCK is processed.  This limits
+                 the rate at which the attacker can force expensive re-validation
+                 while giving a legitimate fork a chance to recover (sending one
+                 valid block resets the counter).
+      Strike 3 — 24-hour IP Ban. peer_id is blacklisted in the `peers` DB table.
+                 A timestamped "ip_ban:<ip>" record is written to node_meta so
+                 that both _handle_inbound and _try_add_peer reject all new
+                 connections from that IP for SOFT_BAN_BAN_DURATION_SECS
+                 (default 86 400 s = 24 hours).  The peer is disconnected.
+
+    New Config keys: SOFT_BAN_THROTTLE_DELAY_SECS, SOFT_BAN_BAN_DURATION_SECS.
+    New metrics: soft_ban_throttles, soft_ban_ip_bans.
+    New P2PNetwork methods: _is_ip_banned, _soft_ban_record_failure,
+                            _soft_ban_reset_failures.
+    New PeerConnection fields: consecutive_audit_failures,
+                               _soft_ban_throttle_until.
+
+  ── Backward Compatibility ────────────────────────────────────────────────────
+  All v5.9.0 databases, RPC methods, CLI commands, and consensus rules are
+  fully compatible.  The Soft Ban system is purely additive — it only activates
+  for TRUST_LEVEL_LOW peers that were already subjected to Full Audit Mode.
+  Nodes that upgraded from v5.9.0 to v6.0.0 require no migration.
+
+
+Production-hardened (v5.9.0 — Hybrid Trust / Identity Verification):
+  ── 6. Peer Trust & Identity Security ────────────────────────────────────────
+  • [NEW] Logic Hash Identity Exchange — HELLO Handshake Extension (Section 0A).
+    Every node computes a SHA-256 fingerprint of its own source file at startup
+    (_NODE_LOGIC_HASH).  This hash is included in every HELLO and ACCEPT message
+    so both sides of a connection learn each other's software identity.
+    Old nodes that omit the field default gracefully to TRUST_LEVEL_HIGH so
+    backward-compatibility is fully preserved.
+
+  • [NEW] TRUST_LEVEL_HIGH / TRUST_LEVEL_LOW classification (PeerConnection).
+    After the handshake, each peer is classified:
+      TRUST_LEVEL_HIGH — logic_hash matches ours or is in KNOWN_GOOD_LOGIC_HASHES.
+                         Standard validation applies; no extra overhead.
+      TRUST_LEVEL_LOW  — logic_hash is unknown (hacker node / modified build).
+                         Connection is KEPT OPEN (hybrid approach — not banned),
+                         but all MSG_TX and MSG_BLOCK from that peer enter
+                         Full Audit Mode (Section 6E).
+    Config.KNOWN_GOOD_LOGIC_HASHES lets operators whitelist prior-version hashes
+    so rolling upgrades don't disrupt the network.
+
+  • [NEW] Full Audit Mode for TRUST_LEVEL_LOW peers (Section 6E).
+    Three layers of extra scrutiny applied to every MSG_TX / MSG_BLOCK from
+    an untrusted peer, in order:
+
+    1. Resource Throttling
+       Untrusted peers are limited to Config.UNTRUSTED_TX_RATE_LIMIT_BYTES
+       (default 1 MB) of TX/block data per 60-second sliding window.
+       Messages that exceed the limit are dropped and a half-weight ban-score
+       point is applied.  This prevents a modified node from using its open
+       connection to flood the mempool or trigger excessive re-validation work.
+
+    2. Deep Transaction Validation
+       For MSG_TX: Transaction.is_valid() is called in full, re-verifying
+       the ECDSA signature, nonce, fee, expiry, and all business rules.
+       For MSG_BLOCK: every non-coinbase transaction in the block is
+       individually re-validated.  A single bad signature causes the entire
+       block to be dropped and a full-weight ban-score point to be applied.
+       Trusted peers only have their Merkle root checked (existing behaviour).
+
+    3. Safety Invariant Re-check
+       After each block from an untrusted peer, SafetyInvariantChecker
+       .rolling_check() is called to verify chain linkage and finality
+       consistency.  Violations are logged at WARNING level and recorded
+       in the invariant metrics counters.
+
+    New Config keys: KNOWN_GOOD_LOGIC_HASHES (set), UNTRUSTED_TX_RATE_LIMIT_BYTES.
+    No new RPC methods (the existing checkinvariants and getmetrics already
+    surface the relevant data).
+
+  ── Backward Compatibility ────────────────────────────────────────────────────
+  All v5.8.0 databases, RPC methods, CLI commands, and consensus rules are
+  fully compatible.  Nodes that do not send logic_hash in their HELLO are
+  treated as TRUST_LEVEL_HIGH (the field defaults to absent on old nodes).
+  The ACCEPT message now includes logic_hash; old nodes silently ignore it.
+
+
+  ── 1. Networking & Scalability Hardening ─────────────────────────────────────
+  • [NEW] CompressionEngine — zstandard/zlib P2P frame compression (Section 6A).
+    Frames above COMPRESS_THRESHOLD (512 bytes) are compressed transparently
+    before TLS/TCP write.  2-byte MAGIC prefix (0xC0 0xDE) identifies compressed
+    frames.  Reduces bandwidth at high transaction volumes by 50–70%.
+    Backward-compatible: old nodes operate without compression.
+
+  • [NEW] PeerReputationManager — long-term "good behavior" tracking (Section 6B).
+    Tracks fast_block_bonus, valid_tx_bonus, and uptime_ticks over months.
+    Scores persist in reputation_extended DB table and decay toward neutral (0.5).
+    Used to prioritize high-quality peers during network congestion evictions.
+
+  • [NEW] CapabilityRouter — DiscV5-style topic peer discovery (Section 6D).
+    Nodes advertise capabilities (full_node, archive, vvm, relay, validator,
+    bootstrap) in HELLO and via periodic CAP_ADV broadcasts.  CAP_QUERY lets
+    nodes find specialized peers (e.g., archive nodes, VVM execution nodes).
+    New RPC: getcapabilities, findpeerswith.
+
+  ── 2. Storage & State Optimization ──────────────────────────────────────────
+  • [NEW] StatePruner — historical state snapshot pruning (Section 6C).
+    Prunes state_snapshot:N node_meta markers when they exceed KEEP_SNAPSHOTS.
+    Records pruned_watermark so light clients know archive availability.
+    Triggered from StateEngine timer tick.  Enable with VISOLD_STATE_PRUNE=1.
+    New RPC: getstatepruneinfo.
+
+  ── 3. Smart Contract (VVM) Safety ───────────────────────────────────────────
+  • [NEW] VVMStaticAnalyzer — bytecode-level safety analysis (Section 7D).
+    Single-pass heuristic scanner detects: reentrancy (CALL before SSTORE),
+    unbounded loops (backward JUMP without GAS check), SELFDESTRUCT presence,
+    invalid JUMP destinations, and gas-forwarding patterns.
+    New RPC: analyzecontract.
+
+  • [NEW] VVMPrecompiles — native Python precompiled contracts (Section 7C).
+    Six precompiles at reserved VSDcPRECOMPILE* addresses:
+      01 — SHA-256, 02 — RIPEMD-160, 03 — Identity (copy),
+      04 — Modexp (RSA/ZK exponentiation), 05 — ECRecover, 06 — BLAKE2b-256.
+    Dispatched transparently in _internal_call() before bytecode interpreter.
+    Enable ZK-proof and advanced identity use cases at native C speed.
+
+  ── 4. Advanced Economic Security ────────────────────────────────────────────
+  • [NEW] SlashingEvidenceProtocol — automated double-sign evidence (Section 7A2).
+    When add_validator_sig() detects a double-sign, it automatically builds a
+    verifiable evidence packet containing both conflicting signatures.
+    Evidence is self-verifying (any node can check it), gossipped to all peers,
+    and causes network-wide slashing without manual operator intervention.
+    New RPC: submitslashingevidence.  Config: AUTO_SLASH_EVIDENCE = True.
+
+  • [NEW] CommitRevealMempool — MEV front-running protection (Section 7A1).
+    Optional commit-reveal scheme: transactions are committed as a hash in
+    block N and revealed in block N+1.  Prevents bots from observing tx
+    details before the commitment is included.  Config: VISOLD_MEV_PROTECT=1.
+    New RPC: mevcommit, getmevstatus.
+
+  ── 5. High-Availability (HA) Features ───────────────────────────────────────
+  • [NEW] SentinelNode — backup node / auto-failover (Section 17C).
+    Monitors primary node RPC; after SENTINEL_FAILOVER_AFTER consecutive
+    failures, automatically activates as the live validator.  Yields back
+    gracefully when the primary recovers.
+    Enable: VISOLD_SENTINEL=1, VISOLD_PRIMARY_HOST=x.x.x.x.
+    New RPC: getsentinelstatus.
+
+  • [NEW] PanicCircuitBreaker — watchdog & self-healing (Section 17B).
+    Trips to Read-Only mode automatically after CIRCUIT_BREAKER_VIOLATIONS
+    safety invariant violations in a 5-minute window.  Pauses mining and
+    blocks all state-mutating StateEngine events.  Requires manual reset via
+    RPC 'resetcircuitbreaker' after the operator investigates.
+    New RPC: getcircuitbreaker, resetcircuitbreaker.
+
+  ── Backward Compatibility ────────────────────────────────────────────────────
+  All existing databases from v5.7.0 are fully compatible.
+  All existing RPC methods, CLI commands, and consensus rules are unchanged.
+  New features default to OFF (compression, state pruning, MEV, sentinel)
+  or are fully transparent (reputation, capabilities, precompiles, evidence).
+

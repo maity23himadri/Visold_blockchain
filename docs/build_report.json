@@ -1,0 +1,1277 @@
+{
+ "modules": {
+  "api/rpc_server": {
+   "lines": 1340,
+   "units": 1,
+   "origin": "L40412-41687",
+   "deps": [
+    "kernel/config",
+    "kernel/events",
+    "kernel/logging_setup",
+    "kernel/metrics",
+    "kernel/units",
+    "ledger/transaction",
+    "mempool/mev",
+    "network/capabilities",
+    "network/spv",
+    "rollup/l2_state",
+    "vm/engine",
+    "vm/naming",
+    "vm/static_analyzer"
+   ]
+  },
+  "chain/blockchain": {
+   "lines": 4765,
+   "units": 1,
+   "origin": "L25780-30470",
+   "deps": [
+    "consensus/difficulty",
+    "crypto/ecc",
+    "crypto/hashing",
+    "economics/monitor",
+    "governance/engine",
+    "governance/versioning",
+    "kernel/clock",
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/metrics",
+    "kernel/units",
+    "ledger/block",
+    "ledger/transaction",
+    "mempool/pool",
+    "rollup/batches",
+    "rollup/l2_state",
+    "rollup/ledger_sync",
+    "state/batch_proxy",
+    "storage/rolling_window_pruner",
+    "storage/snapshot",
+    "storage/storage",
+    "vm/engine",
+    "vm/event_index",
+    "vm/naming",
+    "vm/precompiles"
+   ]
+  },
+  "chain/consensus_engine": {
+   "lines": 375,
+   "units": 1,
+   "origin": "L30668-30996",
+   "deps": [
+    "chain/blockchain",
+    "consensus/difficulty",
+    "crypto/ecc",
+    "crypto/vrf",
+    "kernel/config",
+    "kernel/logging_setup",
+    "ledger/block",
+    "ledger/transaction"
+   ]
+  },
+  "chain/roles": {
+   "lines": 231,
+   "units": 1,
+   "origin": "L30475-30663",
+   "deps": [
+    "kernel/config",
+    "kernel/events",
+    "kernel/units",
+    "ledger/transaction",
+    "storage/storage"
+   ]
+  },
+  "chain/sequencer": {
+   "lines": 584,
+   "units": 1,
+   "origin": "L25231-25767",
+   "deps": [
+    "kernel/config",
+    "kernel/events",
+    "kernel/logging_setup",
+    "kernel/metrics",
+    "ledger/transaction",
+    "rollup/batches",
+    "rollup/l2_state",
+    "rollup/proofs"
+   ]
+  },
+  "cli/entry": {
+   "lines": 137,
+   "units": 1,
+   "origin": "L50039-50135",
+   "deps": [
+    "cli/handler",
+    "cli/interactive",
+    "cli/terminal",
+    "kernel/config",
+    "testing/suite"
+   ]
+  },
+  "cli/handler": {
+   "lines": 491,
+   "units": 1,
+   "origin": "L49620-50033",
+   "deps": [
+    "kernel/config",
+    "kernel/units",
+    "wallet/wallet"
+   ]
+  },
+  "cli/interactive": {
+   "lines": 3717,
+   "units": 1,
+   "origin": "L44937-48568",
+   "deps": [
+    "cli/terminal",
+    "kernel/config",
+    "kernel/events",
+    "kernel/logging_setup",
+    "kernel/messages",
+    "kernel/netutil",
+    "kernel/notifications",
+    "kernel/units",
+    "ledger/block",
+    "ledger/transaction",
+    "node/security_gate",
+    "node/visold_node",
+    "rollup/l2_state",
+    "rollup/proofs",
+    "vm/engine",
+    "vm/naming",
+    "wallet/hd"
+   ]
+  },
+  "cli/terminal": {
+   "lines": 123,
+   "units": 8,
+   "origin": "L44864-44907, L44911-44935",
+   "deps": []
+  },
+  "consensus/difficulty": {
+   "lines": 673,
+   "units": 1,
+   "origin": "L8493-9127",
+   "deps": [
+    "kernel/config"
+   ]
+  },
+  "consensus/hashrate_governor": {
+   "lines": 417,
+   "units": 1,
+   "origin": "L9163-9512",
+   "deps": [
+    "consensus/difficulty",
+    "kernel/config"
+   ]
+  },
+  "consensus/mining_safety": {
+   "lines": 288,
+   "units": 1,
+   "origin": "L9548-9765",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup"
+   ]
+  },
+  "consensus/rate_defection": {
+   "lines": 592,
+   "units": 1,
+   "origin": "L9823-10320",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup"
+   ]
+  },
+  "consensus/slashing": {
+   "lines": 242,
+   "units": 1,
+   "origin": "L19002-19195",
+   "deps": [
+    "crypto/ecc",
+    "crypto/hashing",
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/metrics"
+   ]
+  },
+  "crypto/base58": {
+   "lines": 63,
+   "units": 3,
+   "origin": "L10328-10354",
+   "deps": []
+  },
+  "crypto/ecc": {
+   "lines": 185,
+   "units": 14,
+   "origin": "L10364-10403, L10408-10449, L10452-10477, L10480-10484",
+   "deps": [
+    "crypto/base58",
+    "kernel/compat"
+   ]
+  },
+  "crypto/hashing": {
+   "lines": 46,
+   "units": 3,
+   "origin": "L10771-10781, L10842-10843",
+   "deps": []
+  },
+  "crypto/keystore": {
+   "lines": 233,
+   "units": 10,
+   "origin": "L3545-3549, L10846-10920, L10923-11004",
+   "deps": [
+    "kernel/compat"
+   ]
+  },
+  "crypto/mnemonic": {
+   "lines": 234,
+   "units": 5,
+   "origin": "L11008-11171, L11174-11206",
+   "deps": []
+  },
+  "crypto/parallel_verify": {
+   "lines": 104,
+   "units": 5,
+   "origin": "L6757-6771, L6774-6795, L6801",
+   "deps": [
+    "crypto/ecc",
+    "kernel/logging_setup"
+   ]
+  },
+  "crypto/vrf": {
+   "lines": 317,
+   "units": 11,
+   "origin": "L10514, L10517-10518, L10523-10559, L10564-10567, L10570-10586, L10589-10591, L10596-10617, L10622-10633, L10638-10691, L10696-10768",
+   "deps": [
+    "crypto/ecc"
+   ]
+  },
+  "economics/monitor": {
+   "lines": 336,
+   "units": 1,
+   "origin": "L7993-8287",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/metrics"
+   ]
+  },
+  "economics/rewards": {
+   "lines": 431,
+   "units": 19,
+   "origin": "L49242-49274, L49277-49279, L49283-49332, L49335-49371, L49375-49412, L49415-49423, L49427-49520, L49524-49550, L49554-49580",
+   "deps": []
+  },
+  "governance/engine": {
+   "lines": 796,
+   "units": 3,
+   "origin": "L5983-5997, L6000-6078, L6081-6732",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/metrics"
+   ]
+  },
+  "governance/versioning": {
+   "lines": 123,
+   "units": 1,
+   "origin": "L5900-5975",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/metrics"
+   ]
+  },
+  "identity/names": {
+   "lines": 180,
+   "units": 1,
+   "origin": "L40275-40407",
+   "deps": [
+    "crypto/hashing",
+    "kernel/config",
+    "kernel/events",
+    "kernel/logging_setup",
+    "kernel/units",
+    "ledger/transaction",
+    "network/p2p",
+    "storage/storage"
+   ]
+  },
+  "kernel/clock": {
+   "lines": 254,
+   "units": 2,
+   "origin": "L5671-5883, L5887",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/metrics"
+   ]
+  },
+  "kernel/compat": {
+   "lines": 240,
+   "units": 14,
+   "origin": "L2885-2890, L2911-2922, L3389-3393, L3398-3402, L3406-3410, L3413-3418, L3425-3430, L3435-3440, L3448-3483, L3489-3524, L3534-3538",
+   "deps": []
+  },
+  "kernel/config": {
+   "lines": 1114,
+   "units": 1,
+   "origin": "L3819-4897",
+   "deps": []
+  },
+  "kernel/events": {
+   "lines": 126,
+   "units": 3,
+   "origin": "L7071-7095, L7099-7117, L7120-7148",
+   "deps": []
+  },
+  "kernel/logging_setup": {
+   "lines": 172,
+   "units": 12,
+   "origin": "L3595-3606, L3629, L3736-3769, L3772-3785, L3788-3793, L3796-3814",
+   "deps": [
+    "kernel/notifications"
+   ]
+  },
+  "kernel/lru_cache": {
+   "lines": 110,
+   "units": 1,
+   "origin": "L31143-31218",
+   "deps": []
+  },
+  "kernel/messages": {
+   "lines": 161,
+   "units": 29,
+   "origin": "L31223-31241, L31249-31256, L31263, L31275, L31298",
+   "deps": []
+  },
+  "kernel/metrics": {
+   "lines": 115,
+   "units": 2,
+   "origin": "L5586-5661, L5665",
+   "deps": []
+  },
+  "kernel/netutil": {
+   "lines": 284,
+   "units": 7,
+   "origin": "L4980-5219",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup"
+   ]
+  },
+  "kernel/notifications": {
+   "lines": 139,
+   "units": 8,
+   "origin": "L3636, L3641, L3653-3690, L3693-3711, L3714-3733",
+   "deps": []
+  },
+  "kernel/serialization": {
+   "lines": 50,
+   "units": 2,
+   "origin": "L3374-3385",
+   "deps": []
+  },
+  "kernel/source_identity": {
+   "lines": 86,
+   "units": 1,
+   "origin": "L3579-3583",
+   "deps": []
+  },
+  "kernel/units": {
+   "lines": 113,
+   "units": 6,
+   "origin": "L4900, L4907-4973",
+   "deps": [
+    "kernel/config"
+   ]
+  },
+  "ledger/block": {
+   "lines": 561,
+   "units": 1,
+   "origin": "L11912-12425",
+   "deps": [
+    "consensus/difficulty",
+    "crypto/hashing",
+    "crypto/parallel_verify",
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/metrics",
+    "ledger/transaction"
+   ]
+  },
+  "ledger/transaction": {
+   "lines": 537,
+   "units": 1,
+   "origin": "L11423-11907",
+   "deps": [
+    "crypto/ecc",
+    "crypto/hashing",
+    "kernel/config",
+    "kernel/units",
+    "rollup/batches",
+    "rollup/l2_state",
+    "vm/naming"
+   ]
+  },
+  "mempool/mev": {
+   "lines": 164,
+   "units": 2,
+   "origin": "L18874-18990, L18994",
+   "deps": [
+    "crypto/hashing",
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/metrics"
+   ]
+  },
+  "mempool/pool": {
+   "lines": 1014,
+   "units": 2,
+   "origin": "L17919-17998, L18001-18866",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/metrics",
+    "kernel/units",
+    "ledger/transaction",
+    "rollup/batches",
+    "storage/storage"
+   ]
+  },
+  "mining/engine": {
+   "lines": 718,
+   "units": 1,
+   "origin": "L39548-40211",
+   "deps": [
+    "chain/blockchain",
+    "chain/consensus_engine",
+    "consensus/difficulty",
+    "consensus/hashrate_governor",
+    "consensus/mining_safety",
+    "crypto/vrf",
+    "kernel/config",
+    "kernel/events",
+    "kernel/logging_setup",
+    "kernel/messages",
+    "kernel/metrics",
+    "ledger/block",
+    "mining/parallel_miner",
+    "network/p2p",
+    "storage/storage"
+   ]
+  },
+  "mining/gpu_kernels": {
+   "lines": 286,
+   "units": 2,
+   "origin": "L38799-38957, L38961-39054",
+   "deps": []
+  },
+  "mining/parallel_miner": {
+   "lines": 526,
+   "units": 1,
+   "origin": "L39057-39542",
+   "deps": [
+    "consensus/difficulty",
+    "kernel/compat",
+    "kernel/config",
+    "kernel/logging_setup",
+    "mining/gpu_kernels",
+    "mining/workers"
+   ]
+  },
+  "mining/workers": {
+   "lines": 312,
+   "units": 3,
+   "origin": "L38545-38582, L38587-38729, L38737-38794",
+   "deps": [
+    "kernel/compat"
+   ]
+  },
+  "network/block_download": {
+   "lines": 290,
+   "units": 1,
+   "origin": "L17043-17266",
+   "deps": [
+    "kernel/logging_setup",
+    "kernel/messages",
+    "ledger/block"
+   ]
+  },
+  "network/capabilities": {
+   "lines": 233,
+   "units": 18,
+   "origin": "L16602-16604, L16607-16610, L16613-16616, L16619-16624, L17761-17894",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/metrics"
+   ]
+  },
+  "network/compression": {
+   "lines": 172,
+   "units": 1,
+   "origin": "L16223-16349",
+   "deps": [
+    "kernel/compat",
+    "kernel/config",
+    "kernel/logging_setup"
+   ]
+  },
+  "network/dns_seeder": {
+   "lines": 147,
+   "units": 1,
+   "origin": "L33348-33448",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/netutil"
+   ]
+  },
+  "network/kademlia": {
+   "lines": 176,
+   "units": 2,
+   "origin": "L31001-31138",
+   "deps": [
+    "kernel/config"
+   ]
+  },
+  "network/message_logger": {
+   "lines": 227,
+   "units": 2,
+   "origin": "L31653-31809, L31815-31822",
+   "deps": [
+    "kernel/logging_setup"
+   ]
+  },
+  "network/nat/hole_punch": {
+   "lines": 238,
+   "units": 1,
+   "origin": "L32334-32535",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/netutil"
+   ]
+  },
+  "network/nat/ice": {
+   "lines": 545,
+   "units": 3,
+   "origin": "L32837-32852, L32855-32878, L32882-33338",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/netutil",
+    "network/nat/hole_punch",
+    "network/nat/relay",
+    "network/nat/stun"
+   ]
+  },
+  "network/nat/relay": {
+   "lines": 332,
+   "units": 1,
+   "origin": "L32538-32832",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/netutil"
+   ]
+  },
+  "network/nat/stun": {
+   "lines": 223,
+   "units": 2,
+   "origin": "L32151-32184, L32187-32331",
+   "deps": [
+    "kernel/logging_setup"
+   ]
+  },
+  "network/nat/upnp": {
+   "lines": 356,
+   "units": 1,
+   "origin": "L31828-32141",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/netutil"
+   ]
+  },
+  "network/p2p": {
+   "lines": 5192,
+   "units": 1,
+   "origin": "L33451-38510",
+   "deps": [
+    "chain/blockchain",
+    "consensus/slashing",
+    "crypto/ecc",
+    "crypto/hashing",
+    "kernel/config",
+    "kernel/events",
+    "kernel/logging_setup",
+    "kernel/lru_cache",
+    "kernel/messages",
+    "kernel/metrics",
+    "kernel/netutil",
+    "kernel/notifications",
+    "kernel/source_identity",
+    "ledger/block",
+    "ledger/transaction",
+    "network/block_download",
+    "network/capabilities",
+    "network/compression",
+    "network/dns_seeder",
+    "network/kademlia",
+    "network/message_logger",
+    "network/nat/ice",
+    "network/nat/upnp",
+    "network/peer_connection",
+    "network/tls",
+    "network/udp/latency",
+    "network/udp/transport",
+    "network/udp/wire",
+    "rollup/l2_state",
+    "storage/storage"
+   ]
+  },
+  "network/peer_connection": {
+   "lines": 366,
+   "units": 1,
+   "origin": "L31300-31628",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup",
+    "network/compression",
+    "network/message_logger"
+   ]
+  },
+  "network/reputation": {
+   "lines": 176,
+   "units": 1,
+   "origin": "L16357-16490",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup"
+   ]
+  },
+  "network/spv": {
+   "lines": 235,
+   "units": 1,
+   "origin": "L8293-8488",
+   "deps": [
+    "crypto/hashing",
+    "kernel/config"
+   ]
+  },
+  "network/tls": {
+   "lines": 397,
+   "units": 1,
+   "origin": "L5224-5579",
+   "deps": [
+    "kernel/compat",
+    "kernel/config",
+    "kernel/logging_setup"
+   ]
+  },
+  "network/udp/latency": {
+   "lines": 127,
+   "units": 1,
+   "origin": "L2468-2547",
+   "deps": []
+  },
+  "network/udp/reliability": {
+   "lines": 251,
+   "units": 2,
+   "origin": "L1986-2076, L2080-2193",
+   "deps": [
+    "network/udp/wire"
+   ]
+  },
+  "network/udp/session": {
+   "lines": 286,
+   "units": 1,
+   "origin": "L2197-2426",
+   "deps": [
+    "network/udp/reliability",
+    "network/udp/wire"
+   ]
+  },
+  "network/udp/transport": {
+   "lines": 357,
+   "units": 2,
+   "origin": "L2551-2674, L2690-2878",
+   "deps": [
+    "network/udp/session",
+    "network/udp/wire"
+   ]
+  },
+  "network/udp/wire": {
+   "lines": 235,
+   "units": 30,
+   "origin": "L1914-1930, L1939-1940, L1943-1948, L1952-1956, L1959-1973, L1976-1982, L2430-2433, L2436-2448, L2677-2686",
+   "deps": []
+  },
+  "node/security_gate": {
+   "lines": 104,
+   "units": 1,
+   "origin": "L40216-40270",
+   "deps": [
+    "chain/blockchain",
+    "crypto/ecc",
+    "crypto/hashing",
+    "kernel/config",
+    "kernel/source_identity",
+    "storage/storage"
+   ]
+  },
+  "node/visold_node": {
+   "lines": 1288,
+   "units": 2,
+   "origin": "L43643-44543, L44548-44851",
+   "deps": [
+    "api/rpc_server",
+    "chain/blockchain",
+    "chain/consensus_engine",
+    "chain/roles",
+    "chain/sequencer",
+    "consensus/difficulty",
+    "consensus/rate_defection",
+    "consensus/slashing",
+    "crypto/hashing",
+    "identity/names",
+    "kernel/config",
+    "kernel/events",
+    "kernel/logging_setup",
+    "kernel/netutil",
+    "kernel/units",
+    "ledger/transaction",
+    "mempool/mev",
+    "mining/engine",
+    "network/capabilities",
+    "network/p2p",
+    "network/reputation",
+    "node/security_gate",
+    "resilience/hardened_core",
+    "resilience/panic_breaker",
+    "resilience/safety_invariants",
+    "resilience/sentinel",
+    "rollup/l2_state",
+    "selfhealing/hardening/patches",
+    "selfhealing/orchestrator",
+    "selfhealing/storage_patch",
+    "state/engine",
+    "storage/state_pruner",
+    "storage/storage",
+    "wallet/hd",
+    "wallet/wallet"
+   ]
+  },
+  "resilience/hardened_core": {
+   "lines": 1109,
+   "units": 40,
+   "origin": "L41881-41895, L41900-41901, L41904-41907, L41910-41929, L41932-41940, L41946-42128, L42131, L42134-42201, L42204, L42207-42348, L42351, L42354-42437, L42440-42547, L42550-42593, L42596-42718, L42721-42744, L42747-42753, L42756-42763, L42766-42775, L42778-42878",
+   "deps": [
+    "kernel/compat",
+    "kernel/logging_setup"
+   ]
+  },
+  "resilience/panic_breaker": {
+   "lines": 207,
+   "units": 1,
+   "origin": "L41695-41860",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/metrics"
+   ]
+  },
+  "resilience/safety_invariants": {
+   "lines": 430,
+   "units": 1,
+   "origin": "L43252-43637",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/metrics",
+    "rollup/l2_state"
+   ]
+  },
+  "resilience/sentinel": {
+   "lines": 297,
+   "units": 1,
+   "origin": "L42998-43246",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/metrics",
+    "kernel/netutil"
+   ]
+  },
+  "rollup/batches": {
+   "lines": 224,
+   "units": 2,
+   "origin": "L24854-24887, L24891-25014",
+   "deps": [
+    "crypto/hashing",
+    "rollup/l2_state"
+   ]
+  },
+  "rollup/compact_codec": {
+   "lines": 207,
+   "units": 4,
+   "origin": "L23312-23348, L23351-23371, L23374-23402, L23405-23437",
+   "deps": []
+  },
+  "rollup/l2_state": {
+   "lines": 694,
+   "units": 6,
+   "origin": "L23441-23576, L23580-23602, L23606-23707, L23725, L23735, L23738-24090",
+   "deps": [
+    "crypto/ecc",
+    "crypto/hashing",
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/metrics",
+    "rollup/compact_codec"
+   ]
+  },
+  "rollup/ledger_sync": {
+   "lines": 247,
+   "units": 5,
+   "origin": "L25065-25066, L25069-25119, L25122-25180, L25183-25227",
+   "deps": [
+    "kernel/logging_setup",
+    "kernel/units",
+    "rollup/batches"
+   ]
+  },
+  "rollup/proofs": {
+   "lines": 770,
+   "units": 12,
+   "origin": "L24166-24172, L24175-24176, L24184-24186, L24189-24217, L24221-24224, L24227-24229, L24233-24293, L24297-24441, L24449-24459, L24463-24692, L24696-24806, L24812-24823",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup"
+   ]
+  },
+  "selfhealing/decision": {
+   "lines": 306,
+   "units": 2,
+   "origin": "L51101-51175, L51178-51371",
+   "deps": [
+    "selfhealing/model"
+   ]
+  },
+  "selfhealing/detection": {
+   "lines": 178,
+   "units": 2,
+   "origin": "L50962-51017, L51020-51094",
+   "deps": [
+    "kernel/logging_setup",
+    "selfhealing/model",
+    "selfhealing/monitors"
+   ]
+  },
+  "selfhealing/docs_text": {
+   "lines": 382,
+   "units": 3,
+   "origin": "L52983-53075, L53082-53225, L53232-53333",
+   "deps": []
+  },
+  "selfhealing/hardening/failure_analysis": {
+   "lines": 129,
+   "units": 1,
+   "origin": "L55103-55199",
+   "deps": []
+  },
+  "selfhealing/hardening/operator_api": {
+   "lines": 160,
+   "units": 1,
+   "origin": "L54967-55096",
+   "deps": [
+    "kernel/logging_setup",
+    "selfhealing/hardening/risk"
+   ]
+  },
+  "selfhealing/hardening/patches": {
+   "lines": 1057,
+   "units": 11,
+   "origin": "L53958-54100, L54103-54159, L54166-54242, L54245-54327, L54330-54353, L54360-54609, L54612-54702, L54705-54752, L54759-54855, L54858-54881, L54888-54964",
+   "deps": [
+    "kernel/logging_setup",
+    "selfhealing/hardening/operator_api",
+    "selfhealing/hardening/risk",
+    "selfhealing/rollback"
+   ]
+  },
+  "selfhealing/hardening/risk": {
+   "lines": 638,
+   "units": 9,
+   "origin": "L53353-53396, L53401-53410, L53413-53546, L53551-53597, L53602-53716, L53721-53735, L53738-53796, L53804-53911, L53916-53951",
+   "deps": []
+  },
+  "selfhealing/healing": {
+   "lines": 598,
+   "units": 5,
+   "origin": "L51830-51902, L51905-51951, L51954-52022, L52025-52069, L52072-52384",
+   "deps": [
+    "kernel/logging_setup",
+    "selfhealing/model",
+    "selfhealing/rollback",
+    "selfhealing/storage_patch"
+   ]
+  },
+  "selfhealing/model": {
+   "lines": 269,
+   "units": 6,
+   "origin": "L50161-50212, L50215-50297, L50304-50326, L50329-50339, L50342-50372, L50375-50384",
+   "deps": []
+  },
+  "selfhealing/monitors": {
+   "lines": 610,
+   "units": 5,
+   "origin": "L50391-50458, L50461-50596, L50599-50696, L50699-50850, L50853-50955",
+   "deps": [
+    "kernel/logging_setup",
+    "selfhealing/model"
+   ]
+  },
+  "selfhealing/orchestrator": {
+   "lines": 332,
+   "units": 1,
+   "origin": "L52592-52866",
+   "deps": [
+    "kernel/logging_setup",
+    "selfhealing/decision",
+    "selfhealing/detection",
+    "selfhealing/healing",
+    "selfhealing/model",
+    "selfhealing/monitors",
+    "selfhealing/rollback",
+    "selfhealing/state_hook",
+    "selfhealing/supply_monitor"
+   ]
+  },
+  "selfhealing/rollback": {
+   "lines": 487,
+   "units": 5,
+   "origin": "L51378-51418, L51421-51460, L51463-51516, L51519-51628, L51631-51823",
+   "deps": [
+    "crypto/ecc",
+    "kernel/logging_setup"
+   ]
+  },
+  "selfhealing/state_hook": {
+   "lines": 114,
+   "units": 1,
+   "origin": "L52506-52585",
+   "deps": [
+    "kernel/logging_setup",
+    "selfhealing/healing"
+   ]
+  },
+  "selfhealing/storage_patch": {
+   "lines": 147,
+   "units": 6,
+   "origin": "L52873-52875, L52884-52914, L52917-52938, L52941-52953, L52956-52976, L53344-53346",
+   "deps": [
+    "kernel/logging_setup"
+   ]
+  },
+  "selfhealing/supply_monitor": {
+   "lines": 147,
+   "units": 1,
+   "origin": "L52391-52499",
+   "deps": [
+    "kernel/logging_setup",
+    "selfhealing/detection",
+    "selfhealing/model"
+   ]
+  },
+  "state/batch_proxy": {
+   "lines": 283,
+   "units": 1,
+   "origin": "L6821-7052",
+   "deps": [
+    "kernel/logging_setup",
+    "kernel/units",
+    "resilience/hardened_core"
+   ]
+  },
+  "state/engine": {
+   "lines": 887,
+   "units": 1,
+   "origin": "L7151-7987",
+   "deps": [
+    "kernel/config",
+    "kernel/events",
+    "kernel/logging_setup",
+    "kernel/messages",
+    "kernel/metrics",
+    "kernel/notifications",
+    "ledger/block",
+    "ledger/transaction"
+   ]
+  },
+  "storage/backends": {
+   "lines": 538,
+   "units": 29,
+   "origin": "L2926-2951, L2954-3147, L3150-3262, L3265-3310, L3313-3364",
+   "deps": [
+    "kernel/compat"
+   ]
+  },
+  "storage/block_database": {
+   "lines": 392,
+   "units": 1,
+   "origin": "L12430-12770",
+   "deps": [
+    "kernel/compat",
+    "kernel/logging_setup"
+   ]
+  },
+  "storage/rolling_window_pruner": {
+   "lines": 429,
+   "units": 1,
+   "origin": "L16635-17017",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/metrics"
+   ]
+  },
+  "storage/snapshot": {
+   "lines": 530,
+   "units": 1,
+   "origin": "L17268-17758",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/metrics"
+   ]
+  },
+  "storage/sqlite_serialized": {
+   "lines": 159,
+   "units": 2,
+   "origin": "L12776-12833, L12836-12902",
+   "deps": []
+  },
+  "storage/state_pruner": {
+   "lines": 138,
+   "units": 1,
+   "origin": "L16498-16593",
+   "deps": [
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/metrics"
+   ]
+  },
+  "storage/storage": {
+   "lines": 3361,
+   "units": 1,
+   "origin": "L12905-16212",
+   "deps": [
+    "crypto/hashing",
+    "kernel/compat",
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/metrics",
+    "kernel/units",
+    "ledger/block",
+    "ledger/transaction",
+    "storage/backends",
+    "storage/block_database",
+    "storage/sqlite_serialized",
+    "vm/naming"
+   ]
+  },
+  "testing/hardened_verification": {
+   "lines": 152,
+   "units": 1,
+   "origin": "L42882-42990",
+   "deps": [
+    "resilience/hardened_core"
+   ]
+  },
+  "testing/sc_name_tests": {
+   "lines": 182,
+   "units": 1,
+   "origin": "L55208-55356",
+   "deps": [
+    "vm/naming"
+   ]
+  },
+  "testing/suite": {
+   "lines": 686,
+   "units": 1,
+   "origin": "L48573-49195",
+   "deps": [
+    "chain/blockchain",
+    "chain/consensus_engine",
+    "crypto/base58",
+    "crypto/ecc",
+    "crypto/hashing",
+    "crypto/keystore",
+    "governance/engine",
+    "governance/versioning",
+    "kernel/compat",
+    "kernel/config",
+    "kernel/events",
+    "ledger/block",
+    "ledger/transaction",
+    "mempool/pool",
+    "network/spv",
+    "network/tls",
+    "state/engine",
+    "storage/storage",
+    "vm/engine",
+    "vm/naming",
+    "wallet/wallet"
+   ]
+  },
+  "vm/abi": {
+   "lines": 209,
+   "units": 2,
+   "origin": "L21782-21877, L21880-21945",
+   "deps": [
+    "crypto/base58",
+    "crypto/hashing"
+   ]
+  },
+  "vm/assembler": {
+   "lines": 531,
+   "units": 2,
+   "origin": "L22142-22156, L22159-22593",
+   "deps": [
+    "kernel/config",
+    "vm/opcodes"
+   ]
+  },
+  "vm/engine": {
+   "lines": 1704,
+   "units": 4,
+   "origin": "L20099-20101, L20106-20153, L20156-20170, L20174-21757",
+   "deps": [
+    "crypto/ecc",
+    "crypto/hashing",
+    "kernel/config",
+    "kernel/logging_setup",
+    "kernel/units",
+    "vm/frame",
+    "vm/opcodes",
+    "vm/precompiles"
+   ]
+  },
+  "vm/event_index": {
+   "lines": 178,
+   "units": 1,
+   "origin": "L21961-22091",
+   "deps": [
+    "kernel/logging_setup"
+   ]
+  },
+  "vm/frame": {
+   "lines": 447,
+   "units": 3,
+   "origin": "L19690-19720, L19723-20056, L20060-20092",
+   "deps": [
+    "crypto/hashing",
+    "kernel/config",
+    "vm/opcodes"
+   ]
+  },
+  "vm/naming": {
+   "lines": 94,
+   "units": 4,
+   "origin": "L10786-10804, L10809, L10812-10840, L21761-21764",
+   "deps": [
+    "crypto/hashing"
+   ]
+  },
+  "vm/opcodes": {
+   "lines": 544,
+   "units": 16,
+   "origin": "L19206-19607, L19611-19670, L19673-19676, L19681, L19684-19687",
+   "deps": []
+  },
+  "vm/precompiles": {
+   "lines": 337,
+   "units": 1,
+   "origin": "L22603-22896",
+   "deps": [
+    "crypto/ecc",
+    "crypto/hashing",
+    "kernel/logging_setup",
+    "rollup/proofs"
+   ]
+  },
+  "vm/static_analyzer": {
+   "lines": 390,
+   "units": 1,
+   "origin": "L22904-23257",
+   "deps": [
+    "vm/opcodes"
+   ]
+  },
+  "wallet/hd": {
+   "lines": 129,
+   "units": 6,
+   "origin": "L11242-11243, L11246-11248, L11251-11261, L11264-11292, L11295-11302",
+   "deps": [
+    "crypto/ecc",
+    "crypto/vrf",
+    "wallet/wallet"
+   ]
+  },
+  "wallet/wallet": {
+   "lines": 161,
+   "units": 1,
+   "origin": "L11308-11418",
+   "deps": [
+    "crypto/ecc",
+    "crypto/keystore",
+    "crypto/mnemonic",
+    "rollup/compact_codec",
+    "rollup/l2_state"
+   ]
+  }
+ },
+ "patches": [
+  [
+   "P1-logic-hash",
+   "open(__file__) hashed the single monolith file; now hashes the package sources.",
+   "kernel/source_identity"
+  ],
+  [
+   "P2-hash-self",
+   "SecurityGate.hash_self() hashed __file__ (the monolith); now hashes the package sources.",
+   "node/security_gate"
+  ],
+  [
+   "P3-block-lookup",
+   "sys.modules[__name__] resolved Block in the monolith namespace; now a normal import.",
+   "network/block_download"
+  ]
+ ],
+ "facade_exports": 502,
+ "guarded": [
+  "_Argon2Type",
+  "_CythonShim",
+  "_asyncpg",
+  "_dev_backend",
+  "_e",
+  "_f",
+  "_h",
+  "_il_util",
+  "_legacy_alias",
+  "_msgpack",
+  "_oc",
+  "_ok",
+  "_p2p_log_env",
+  "_plyvel",
+  "_redis",
+  "_reg_e",
+  "_rocksdb",
+  "_suite",
+  "_sys_main",
+  "_zstd_mod",
+  "hash_secret_raw"
+ ]
+}

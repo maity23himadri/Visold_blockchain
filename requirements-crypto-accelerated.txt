@@ -1,0 +1,5 @@
+# Optional acceleration only.
+# The consensus-safe cryptography/OpenSSL implementation remains mandatory and
+# remains the fallback when this package is absent or fails its self-test.
+# Verify wheel/source provenance in the deployment supply-chain before use.
+coincurve==21.0.0

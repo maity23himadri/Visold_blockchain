@@ -1,0 +1,33 @@
+# Python bytecode and test/cache output
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local databases, wallets, and runtime state
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+wallet.json
+account.json
+
+# Logs and operating-system metadata
+*.log
+.DS_Store
