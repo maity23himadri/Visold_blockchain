@@ -1229,6 +1229,12 @@ class CLI:
         out.append("\033[u\033[?25h")
 
         with self._ui_lock:
+            # The main thread holds this lock for the whole input() wait.  If
+            # shutdown was requested while this worker was collecting data or
+            # waiting for the lock, do not emit a stale frame after the prompt
+            # has returned and the main loop is preparing to dispatch input.
+            if self._refresh_stop.is_set():
+                return
             try:
                 sys.stdout.write("".join(out))
                 sys.stdout.flush()
@@ -1236,18 +1242,45 @@ class CLI:
                 pass   # never crash the UI thread
 
     def _start_refresh_thread(self) -> None:
-        """Launch the background 1-second UI refresh thread."""
+        """Launch one background UI refresh thread, never overlapping generations."""
+        thread = self._refresh_thread
+        if thread is not None:
+            if thread.is_alive():
+                # Do not clear _refresh_stop while an older generation is
+                # still exiting after a timed join.  Doing so could revive it
+                # alongside a newly-created refresh thread.
+                return
+            self._refresh_thread = None
+
         self._refresh_stop.clear()
-        self._refresh_thread = threading.Thread(
+        thread = threading.Thread(
             target=self._refresh_loop, daemon=True, name="visold-ui-refresh"
         )
-        self._refresh_thread.start()
+        self._refresh_thread = thread
+        try:
+            thread.start()
+        except Exception:
+            # Do not leave a failed-to-start Thread object registered as the
+            # active worker.  Preserve the exception for the caller to see.
+            if self._refresh_thread is thread:
+                self._refresh_thread = None
+            self._refresh_stop.set()
+            raise
 
     def _stop_refresh_thread(self) -> None:
-        """Signal the refresh thread to stop and join it (max 2 s)."""
+        """Signal the refresh thread to stop and wait up to two seconds."""
         self._refresh_stop.set()
-        if self._refresh_thread is not None:
-            self._refresh_thread.join(timeout=2.0)
+        thread = self._refresh_thread
+        if thread is None:
+            return
+        if thread is threading.current_thread():
+            # A thread cannot join itself.  Keep the reference so a later
+            # caller can observe its termination.
+            return
+        thread.join(timeout=2.0)
+        # If the join timed out, retain the reference.  The start method will
+        # refuse to create another worker until this one has actually exited.
+        if not thread.is_alive() and self._refresh_thread is thread:
             self._refresh_thread = None
 
     def _refresh_loop(self) -> None:
@@ -1265,6 +1298,11 @@ class CLI:
                            change at block cadence (~tens of seconds), so a
                            10-second poll is sufficient and avoids unnecessary
                            DB reads on every tick.
+
+        The menu's blocking input() call holds _ui_lock, so this worker must
+        not move the terminal cursor while the user is entering a command.
+        Live cursor-based refresh is therefore suspended during that read;
+        the main loop performs a complete fresh render after each command.
 
         Any exception is silently swallowed so a transient node error never
         terminates the UI thread.
@@ -1302,6 +1340,8 @@ class CLI:
                 if self._ansi_ok():
                     try:
                         with self._ui_lock:
+                            if self._refresh_stop.is_set():
+                                return
                             self._full_render()
                     except Exception:
                         pass
@@ -1407,7 +1447,20 @@ class CLI:
                 self._start_refresh_thread()
             while self._running:
                 try:
-                    choice = input(clr("  › ", CYAN)).strip()
+                    # input() uses the terminal's own line editor.  A redraw
+                    # from another thread while that editor is active moves
+                    # the terminal cursor underneath it; on terminal resume
+                    # this can make typed characters appear to move down the
+                    # screen and leave the prompt looking unresponsive.  Hold
+                    # the same lock used by live-frame writes for the entire
+                    # blocking read, not merely for each stdout write.
+                    with self._ui_lock:
+                        choice = input(clr("  › ", CYAN)).strip()
+                        # Signal shutdown before releasing the lock.  A
+                        # refresh worker waiting to write must not slip in
+                        # between input() returning and _stop_refresh_thread()
+                        # being called below.
+                        self._refresh_stop.set()
                 except KeyboardInterrupt:
                     choice = "0"
                 except EOFError:
