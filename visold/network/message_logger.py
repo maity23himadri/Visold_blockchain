@@ -162,11 +162,10 @@ class P2PMessageLogger:
         try:
             log.info(line)
         except Exception:
-            # Last-resort fallback when the logger is not yet initialised.
-            try:
-                print(line)
-            except Exception:
-                pass
+            # Never write directly to stdout from this background/network path:
+            # that bypasses the TUI's queued logger and corrupts active prompts.
+            # Message logging is diagnostic only, so failure is safely ignored.
+            pass
 
     @classmethod
     def _redacted_preview(cls, msg: dict) -> str:

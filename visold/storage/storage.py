@@ -51,7 +51,10 @@ from visold.storage.backends import (
     _u64,
 )
 from visold.storage.block_database import BlockDatabase
-from visold.storage.sqlite_serialized import _SerializedSQLiteConnection
+from visold.storage.sqlite_serialized import (
+    _SerializedSQLiteConnection,
+    _SQLiteConnectionTransactionBusy,
+)
 from visold.vm.naming import normalize_contract_name
 
 
@@ -432,12 +435,34 @@ class Storage:
     def begin_sqlite_atomic_block(self) -> None:
         if self._pgx_enabled:
             return
-        self._sqlite_api_lock.acquire()
-        try:
-            self._conn().begin_atomic()
-        except Exception:
-            self._sqlite_api_lock.release()
-            raise
+
+        # An ordinary Storage write may have executed its DML and released the
+        # per-operation lock just before its separate commit() call. In that
+        # narrow window, the shared SQLite connection is in a transaction, but
+        # no block-level transaction owns it yet. Never commit/rollback that
+        # work on the block thread: release the lock and let the writer finish.
+        # Retry only this specific state; a genuinely active atomic block or
+        # any unrelated error must still fail immediately.
+        timeout = max(0.1, float(Config.SQLITE_BUSY_TIMEOUT_MS) / 1000.0)
+        deadline = time.monotonic() + timeout
+        while True:
+            self._sqlite_api_lock.acquire()
+            try:
+                self._conn().begin_atomic()
+            except _SQLiteConnectionTransactionBusy as exc:
+                self._sqlite_api_lock.release()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "SQLite connection remained in an ordinary transaction "
+                        f"for {timeout:.2f}s; refusing to interfere with the writer"
+                    ) from exc
+                time.sleep(min(0.01, remaining))
+                continue
+            except BaseException:
+                self._sqlite_api_lock.release()
+                raise
+            return
 
     def commit_sqlite_atomic_block(self) -> None:
         if self._pgx_enabled:

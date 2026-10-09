@@ -130,10 +130,12 @@ class DNSSeeder:
             # hostnames, and each IP gets its own reconnect lifecycle.
             for ip, port in (ipv6_ips + ipv4_ips):
                 _family_label = "AF_INET6" if _is_ipv6_address(ip) else "AF_INET"
-                print(
-                    f"[SEED-ATTEMPT] {_family_label} "
-                    f"{_format_peer_addr(ip, port)} via {hostname}",
-                    flush=True,
+                # This runs in the background seeder thread. Route diagnostics
+                # through the queue-backed logger; direct stdout writes corrupt
+                # the interactive TUI and can move a waiting input cursor.
+                log.debug(
+                    "[SEED-ATTEMPT] %s %s via %s",
+                    _family_label, _format_peer_addr(ip, port), hostname,
                 )
                 self._network._try_add_peer(ip, port)
 

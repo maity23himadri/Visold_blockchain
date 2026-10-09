@@ -62,6 +62,7 @@ from visold.resilience.hardened_core import apply_hardened_overlay
 from visold.resilience.panic_breaker import PanicCircuitBreaker
 from visold.resilience.safety_invariants import SafetyInvariantChecker
 from visold.resilience.sentinel import SentinelNode
+from visold.resilience.supply_diagnostics import install_supply_diagnostics
 from visold.rollup.l2_state import L2_BRIDGE_ADDRESS, L2_WITHDRAW_ADDRESS
 from visold.selfhealing.hardening.patches import apply_hardening_patch
 from visold.selfhealing.orchestrator import SelfHealingSystem
@@ -335,6 +336,17 @@ class VisoldNode:
                 f"is still active independently of this). "
                 f"Error: {_hco_err}")
 
+        # Diagnostic-build only: observe every supported balance mutation and
+        # compare held supply with scheduled issuance around each block apply.
+        # The observer never repairs state and its own failures are non-fatal.
+        try:
+            self._supply_diagnostics = install_supply_diagnostics(
+                self.storage, self.blockchain)
+        except Exception as _supply_diag_err:
+            self._supply_diagnostics = None
+            log.warning("[SupplyDiagnostics] Instrumentation unavailable (%s)",
+                        type(_supply_diag_err).__name__)
+
     def _load_or_create_wallet(self) -> 'Wallet':
         # Prefer encrypted keystore; fall back to plaintext wallet only for
         # backward-compatibility migration.
@@ -473,6 +485,40 @@ class VisoldNode:
             secret_path
         )
         return secret
+
+    def _check_legacy_stake_balance_shortfall(self) -> None:
+        """Diagnose a possible old stake-debit shortfall without crediting funds.
+
+        Balance totals are not sufficient proof of which account was modified
+        by an earlier bug.  This method intentionally has no write operations.
+        """
+        try:
+            height = self.blockchain.height()
+            if height <= 0:
+                return
+            total_issued_sat = sum(
+                self.blockchain.compute_reward_sat(h)
+                for h in range(1, height + 1)
+            )
+            total_balances_sat = self.storage.sum_all_balances_satoshi()
+            total_staked_sat = self.storage.sum_all_staked_satoshi()
+            shortfall_sat = total_issued_sat - total_balances_sat
+            if 0 < shortfall_sat <= total_staked_sat:
+                log.critical(
+                    "[StakeOverDebitRepair] Possible legacy stake-related "
+                    "balance shortfall: %.8f VSD (active stake %.8f VSD). "
+                    "No automatic credit was applied: aggregate totals do not "
+                    "prove the cause or the affected accounts. Back up this "
+                    "database and rebuild balances by replaying the verified "
+                    "canonical chain or restore a known-good backup.",
+                    shortfall_sat / Config.SATOSHI_PER_VSD,
+                    total_staked_sat / Config.SATOSHI_PER_VSD,
+                )
+        except Exception as exc:
+            log.warning(
+                "Legacy stake-balance diagnostic failed (no balances changed): %s",
+                exc,
+            )
 
     def start(self):
         # Start StateEngine FIRST — it must be running before network and mining
@@ -657,74 +703,14 @@ class VisoldNode:
         except Exception as _sg_err:
             log.warning(f"[StartupGuard] Non-fatal startup guard error: {_sg_err}")
 
-        # ── StakeOverDebitRepair: restore balances wrongly debited by ──────────
-        # the now-removed StakeDebitRepair block.  Stake is a LOCK in this
-        # protocol — coins remain in balances AND are recorded in roles.stake.
-        # The previous repair incorrectly debited stake from balances, leaving
-        # balance = correct_balance - stake.  Credit back any address whose
-        # balance is now under by exactly its stake amount.
-        try:
-            _startup_height3 = self.blockchain.height()
-            if _startup_height3 > 0:
-                # AUDIT-FIX-O1b: _total_bal3 / _total_staked3 / the per-address
-                # _roles3 list used to come from self.storage._conn() directly --
-                # the aux-SQLite shadow in pgx mode, not Postgres (see
-                # AUDIT-FIX-O1a for why that mirror can drift). Here the
-                # consequence isn't just a wrong log line: an understated
-                # _total_bal3 inflates _under_sat below, which drives a real,
-                # automated self.storage.credit_sat() call -- crediting real
-                # funds for a "shortfall" that may not exist in the actual
-                # primary balance. Bounded by _total_staked3, but still a
-                # real, unauthorized credit issued from a bad read.
-                _pgx3 = self.storage._pgx_enabled
-
-                _total_issued3 = 0
-                for _h3 in range(1, _startup_height3 + 1):
-                    _total_issued3 += self.blockchain.compute_reward_sat(_h3)
-
-                _total_bal3    = self.storage.sum_all_balances_satoshi()
-                _total_staked3 = self.storage.sum_all_staked_satoshi()
-
-                # Correct law: total_balances alone == total_issued (stake is
-                # already inside balances, not additive to it).
-                # If total_balances < total_issued - total_staked, balances were
-                # wrongly debited and need crediting back.
-                _under_sat = _total_issued3 - _total_bal3
-                if 0 < _under_sat <= _total_staked3:
-                    if _pgx3:
-                        _roles3 = self.storage._pg_fetch(
-                            "SELECT address, stake_sat AS stake FROM validators "
-                            "WHERE slashed = FALSE AND stake_sat > 0", [])
-                        _roles3_is_sat = True
-                    else:
-                        _roles3 = self.storage._conn().execute(
-                            "SELECT address, stake FROM roles "
-                            "WHERE slashed=0 AND stake > 0"
-                        ).fetchall()
-                        _roles3_is_sat = False
-                    _credited3 = 0
-                    for _rr3 in _roles3:
-                        _addr3 = _rr3["address"]
-                        if _roles3_is_sat:
-                            _ssat3 = int(_rr3["stake"])
-                            _svsd3 = _ssat3 / Config.SATOSHI_PER_VSD
-                        else:
-                            _svsd3 = float(_rr3["stake"])
-                            _ssat3 = int(round(_svsd3 * Config.SATOSHI_PER_VSD))
-                        if _ssat3 <= 0:
-                            continue
-                        self.storage.credit_sat(_addr3, _ssat3)
-                        _credited3 += 1
-                        log.warning(
-                            f"[StakeOverDebitRepair] Credited back {_svsd3:.8f} VSD "
-                            f"to {_addr3[:16]} — balance was wrongly debited by "
-                            f"a previous repair run.")
-                    if _credited3:
-                        log.info(
-                            f"[StakeOverDebitRepair] Restored {_credited3} address(es). "
-                            f"Balance state is now correct.")
-        except Exception as _sodr_err:
-            log.warning(f"[StakeOverDebitRepair] Non-fatal repair error: {_sodr_err}")
+        # ── Legacy stake-debit recovery: diagnose only, never auto-mint ───────
+        # The prior heuristic credited every active stake whenever the total
+        # shortfall was merely <= total stake.  That does not prove that the
+        # legacy bug ran, nor that the shortfall equals the amount it debited.
+        # It can therefore create an over-issued balance.  We now report the
+        # possible legacy condition without changing balances; recovery must be
+        # performed from a verified canonical-chain replay or known-good backup.
+        self._check_legacy_stake_balance_shortfall()
 
         # ── Fix #12: Run full safety invariant check at startup ───────────────
         # A full scan (all blocks) happens once here; subsequent periodic checks

@@ -27,6 +27,16 @@ import sqlite3
 import threading
 
 
+class _SQLiteConnectionTransactionBusy(RuntimeError):
+    """An unowned implicit SQLite transaction is still pending on the connection.
+
+    The caller may retry after releasing the shared API lock, allowing the
+    thread that owns the ordinary write to finish its commit/rollback. This is
+    deliberately distinct from a Storage-owned atomic transaction, which must
+    never be retried or pre-empted.
+    """
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 6: STORAGE (SQLite — WAL mode + periodic checkpoint)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -149,7 +159,7 @@ class _SerializedSQLiteConnection:
             if self._atomic:
                 raise RuntimeError("SQLite atomic transaction already active")
             if self._conn.in_transaction:
-                raise RuntimeError("SQLite connection already has an active transaction")
+                raise _SQLiteConnectionTransactionBusy("SQLite connection already has an active transaction")
             self._conn.execute("BEGIN IMMEDIATE")
             self._atomic = True
 

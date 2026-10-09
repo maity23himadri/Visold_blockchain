@@ -2473,7 +2473,8 @@ class P2PNetwork:
                 local_height = self.blockchain.height()
                 first_idx = blocks[0].index if blocks else -1
                 last_idx = blocks[-1].index if blocks else -1
-                print(f"[SYNCPLUS-REJECT] {reason}", flush=True)
+                # Do not print from the background peer thread: logger output
+                # is routed into the dashboard activity queue below.
                 log.warning(
                     f"[ChainSync] accept_chain rejected {len(blocks)} "
                     f"block(s) {first_idx}-{last_idx} from "

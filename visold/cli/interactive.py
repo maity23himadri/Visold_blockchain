@@ -23,6 +23,7 @@ Defines: CLI
 Origin: visold_vsd_.py L44937-48568
 """
 
+import codecs
 import getpass
 import json
 import math
@@ -30,6 +31,7 @@ import os
 import random
 import re
 import shutil
+import select
 import signal
 import sys
 import threading
@@ -38,6 +40,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
+from visold.cli.input_diagnostics import INPUT_DIAG
 from visold.cli.terminal import (
     BLUE,
     CYAN,
@@ -83,9 +86,119 @@ from visold.vm.naming import (
 from visold.wallet.hd import derive_wallet_from_secret
 
 
+def _termios_cc_value_like(current, value: int):
+    """Encode VMIN/VTIME in the representation returned by this platform.
+
+    POSIX termios bindings differ by platform/runtime: VMIN/VTIME may be
+    returned as integers or one-byte ``bytes`` values.  Preserving the native
+    representation keeps an already-correct terminal configuration equal to
+    its snapshot, avoiding repeated tcsetattr() calls during every poll.
+    """
+    if isinstance(current, bytes):
+        return bytes((value,))
+    if isinstance(current, bytearray):
+        return bytearray((value,))
+    return int(value)
+
+
+def _input_fd_diagnostics(fd: int) -> dict:
+    """Return non-sensitive terminal and descriptor metadata for a stall."""
+    state = _input_tty_state(fd)
+    try:
+        info = os.fstat(fd)
+        state.update({
+            "stat_dev": int(info.st_dev),
+            "stat_ino": int(info.st_ino),
+            "stat_rdev": int(info.st_rdev),
+            "stat_mode": int(info.st_mode),
+        })
+    except Exception as exc:
+        state["fstat_error"] = type(exc).__name__
+    try:
+        state["tty_name"] = os.ttyname(fd)[:100]
+    except Exception as exc:
+        state["tty_name_error"] = type(exc).__name__
+    try:
+        state["foreground_pgrp"] = int(os.tcgetpgrp(fd))
+    except Exception as exc:
+        state["foreground_pgrp_error"] = type(exc).__name__
+    try:
+        state["process_pgrp"] = int(os.getpgrp())
+        state["session_id"] = int(os.getsid(0))
+    except Exception as exc:
+        state["process_group_error"] = type(exc).__name__
+    try:
+        import fcntl
+        import struct
+        import termios
+        request = getattr(termios, "TIOCGWINSZ", None)
+        if request is not None:
+            raw = fcntl.ioctl(fd, request, b"\x00" * 8)
+            rows, columns, _xp, _yp = struct.unpack("HHHH", raw)
+            state["winsize"] = [int(rows), int(columns)]
+    except Exception as exc:
+        state["winsize_error"] = type(exc).__name__
+    return state
+
+
+def _input_tty_state(fd: int, attrs=None) -> dict:
+    """Return non-sensitive termios/file-status flags for an input diagnostic."""
+    state = {"fd": fd}
+    try:
+        import termios
+        if attrs is None:
+            attrs = termios.tcgetattr(fd)
+        iflag, _oflag, _cflag, lflag, _ispeed, _ospeed, cc = attrs
+        vmin = cc[termios.VMIN]
+        vtime = cc[termios.VTIME]
+        state.update({
+            "icanon": bool(lflag & termios.ICANON),
+            "echo": bool(lflag & termios.ECHO),
+            "isig": bool(lflag & termios.ISIG),
+            "icrnl": bool(iflag & termios.ICRNL),
+            "igncr": bool(iflag & termios.IGNCR),
+            "inlcr": bool(iflag & termios.INLCR),
+            "ixon": bool(iflag & getattr(termios, "IXON", 0)),
+            "vmin": str(vmin),
+            "vtime": str(vtime),
+            "vmin_type": type(vmin).__name__,
+            "vtime_type": type(vtime).__name__,
+        })
+    except Exception as exc:
+        state["termios_error"] = type(exc).__name__
+    try:
+        state["isatty"] = os.isatty(fd)
+        state["nonblocking"] = not os.get_blocking(fd)
+    except Exception as exc:
+        state["fd_state_error"] = type(exc).__name__
+    return state
+
+
+def _input_stdin_state():
+    """Return terminal metadata for stdin without disrupting redirected input."""
+    try:
+        stream = sys.stdin
+        if stream is None or not hasattr(stream, "fileno"):
+            return None
+        fd = stream.fileno()
+        return _input_fd_diagnostics(fd) if os.isatty(fd) else {"fd": fd, "isatty": False}
+    except Exception as exc:
+        return {"error": type(exc).__name__}
+
+
+def _input_kind(prompt: str, *, hidden: bool = False) -> str:
+    """Classify prompts without putting their text into the diagnostics."""
+    if hidden:
+        return "secret"
+    lowered = prompt.lower()
+    if any(word in lowered for word in ("secret", "password", "key", "mnemonic", "seed phrase", "recovery phrase")):
+        return "secret"
+    return "line"
+
+
 class CLI:
     # ── Layout constants: lines ABOVE the › prompt ────────────────────────────
-    # _full_render() prints exactly 50 rows before input() is called.
+    # _full_render() prints exactly 50 rows before _read_input() is called.
     # If you add or remove printed lines in _full_render() you MUST update
     # these offsets, or the live cursor-positioning will land on wrong rows.
     #
@@ -190,6 +303,7 @@ class CLI:
         self._running                               = True
         # Live-UI concurrency state
         self._ui_lock       = threading.Lock()          # serialises stdout writes
+        self._input_pending_bytes = bytearray()          # preserves bytes after pasted multi-line input
         self._refresh_stop  = threading.Event()         # signals refresh thread to exit
         self._refresh_thread: Optional[threading.Thread] = None
         # Dynamic layout state — populated every _full_render().
@@ -295,7 +409,7 @@ class CLI:
               f"{clr('(I have my User ID & Secret Key)', DIM)}")
         print()
         while True:
-            choice = input("  Select [1/2]: ").strip()
+            choice = self._read_input("  Select [1/2]: ").strip()
             if choice == "1":
                 self._create_account()
                 break
@@ -316,7 +430,7 @@ class CLI:
         print(clr("\n  ─── Create New Account ───", CYAN))
         print()
         while True:
-            username = input(
+            username = self._read_input(
                 "  Choose a username (3–32 chars, letters/numbers/_): "
             ).strip()
             if not re.match(r'^[a-zA-Z0-9_]{3,32}$', username):
@@ -348,12 +462,12 @@ class CLI:
                 ))
                 print()
                 self.user_id = user_id
-                input("  Press Enter to continue...")
+                self._read_input("  Press Enter to continue...")
                 break
             else:
                 # user_id field carries the error message on failure
                 print(clr(f"\n  ✗ Account creation failed: {user_id}", RED))
-                input("  Press Enter to retry...")
+                self._read_input("  Press Enter to retry...")
 
     def _recover_account(self) -> bool:
         """
@@ -366,16 +480,16 @@ class CLI:
         print(clr("\n  ─── Restore Existing Account ───", CYAN))
         print("  Enter the credentials you saved when you created your account.\n")
 
-        user_id = input("  User ID   (e.g. HIMADRI#d43e705790): ").strip()
+        user_id = self._read_input("  User ID   (e.g. HIMADRI#d43e705790): ").strip()
         if not user_id:
             print(clr("  Cancelled.", DIM))
             return False
 
-        # getpass hides the key while typing (safe on shared screens)
+        # _read_secret normalizes a resumed PTY before getpass changes echo.
         try:
-            secret = getpass.getpass("  Secret Key: ").strip()
+            secret = self._read_secret("  Secret Key: ").strip()
         except Exception:
-            secret = input("  Secret Key: ").strip()
+            secret = self._read_input("  Secret Key: ").strip()
 
         if not secret:
             print(clr("  Secret Key cannot be empty.", RED))
@@ -383,9 +497,9 @@ class CLI:
 
         # F-15 FIX: Confirm entry by re-prompting
         try:
-            secret2 = getpass.getpass("  Confirm Secret Key: ").strip()
+            secret2 = self._read_secret("  Confirm Secret Key: ").strip()
         except Exception:
-            secret2 = input("  Confirm Secret Key: ").strip()
+            secret2 = self._read_input("  Confirm Secret Key: ").strip()
 
         if secret != secret2:
             print(clr("\n  ✗ Secret keys do not match — please try again.", RED))
@@ -399,7 +513,7 @@ class CLI:
             _w = derive_wallet_from_secret(secret, user_id)
             _derived_addr = _w.address
             print(f"\n  Derived wallet address: {bold(_derived_addr)}")
-            confirm = input(
+            confirm = self._read_input(
                 "  Does this address match your expected address? [y/N]: "
             ).strip().lower()
             if confirm != 'y':
@@ -417,7 +531,7 @@ class CLI:
             print(f"  Logged in as: {bold(user_id)}")
             print()
             self.user_id = user_id
-            input("  Press Enter to continue...")
+            self._read_input("  Press Enter to continue...")
             return True
         else:
             print(clr(f"\n  ✗ {msg}", RED))
@@ -426,8 +540,8 @@ class CLI:
 
     def _sign_in(self):
         print(clr("\n  ═══ SIGN IN ═══", YELLOW))
-        user_id = input("  User ID: ").strip()
-        secret  = getpass.getpass("  Secret Key: ")
+        user_id = self._read_input("  User ID: ").strip()
+        secret  = self._read_secret("  Secret Key: ")
         ok, msg = UserAccount.login(user_id, secret)
         if ok:
             self.user_id = user_id
@@ -1229,7 +1343,7 @@ class CLI:
         out.append("\033[u\033[?25h")
 
         with self._ui_lock:
-            # The main thread holds this lock for the whole input() wait.  If
+            # The main thread holds this lock for the whole line-input wait.  If
             # shutdown was requested while this worker was collecting data or
             # waiting for the lock, do not emit a stale frame after the prompt
             # has returned and the main loop is preparing to dispatch input.
@@ -1299,7 +1413,7 @@ class CLI:
                            10-second poll is sufficient and avoids unnecessary
                            DB reads on every tick.
 
-        The menu's blocking input() call holds _ui_lock, so this worker must
+        The menu's blocking line read holds _ui_lock, so this worker must
         not move the terminal cursor while the user is entering a command.
         Live cursor-based refresh is therefore suspended during that read;
         the main loop performs a complete fresh render after each command.
@@ -1423,6 +1537,435 @@ class CLI:
             pass
         self._alt_screen_on = False
 
+    def _prepare_canonical_stdin(self) -> None:
+        """Restore ordinary line-input terminal flags when stdin is a TTY.
+
+        The full-screen UI can remain blocked in a line read while Android
+        suspends/resumes the terminal app.  A stale noncanonical/no-echo PTY
+        mode can make Enter appear to move the cursor without completing a
+        command.  This UI only needs line input, so normalize those flags before
+        each read.  Non-TTY streams and platforms without termios are untouched.
+        """
+        try:
+            stream = sys.stdin
+            if not stream.isatty():
+                return
+            import termios
+
+            fd = stream.fileno()
+            attrs = termios.tcgetattr(fd)
+            attrs[0] |= termios.ICRNL
+            attrs[3] |= termios.ICANON | termios.ECHO | termios.ISIG
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        except (AttributeError, ImportError, OSError, ValueError):
+            # readline still works on non-POSIX streams and restricted TTYs.
+            return
+
+    def _prepare_raw_tty_input(self, fd: int) -> None:
+        """Keep an interactive TTY in byte-readable mode while a prompt waits."""
+        import termios
+
+        attrs = termios.tcgetattr(fd)
+        original = [attrs[0], attrs[1], attrs[2], attrs[3], attrs[4], attrs[5], list(attrs[6])]
+        attrs[0] &= ~(termios.ICRNL | termios.INLCR | termios.IGNCR)
+        attrs[3] &= ~(termios.ICANON | termios.ECHO | getattr(termios, "ECHONL", 0))
+        attrs[3] |= termios.ISIG
+        attrs[6][termios.VMIN] = _termios_cc_value_like(attrs[6][termios.VMIN], 1)
+        attrs[6][termios.VTIME] = _termios_cc_value_like(attrs[6][termios.VTIME], 0)
+        if attrs != original:
+            before = _input_tty_state(fd, attrs=original)
+            after = {
+                "icanon": bool(attrs[3] & termios.ICANON),
+                "echo": bool(attrs[3] & termios.ECHO),
+                "isig": bool(attrs[3] & termios.ISIG),
+                "icrnl": bool(attrs[0] & termios.ICRNL),
+                "igncr": bool(attrs[0] & termios.IGNCR),
+                "inlcr": bool(attrs[0] & termios.INLCR),
+                "vmin": str(attrs[6][termios.VMIN]),
+                "vtime": str(attrs[6][termios.VTIME]),
+            }
+            rate_key = repr(tuple(sorted((k, v) for k, v in before.items() if k != "fd")))
+            INPUT_DIAG.event_rate_limited(
+                "tty_mode_repair_needed", rate_key, fd=fd, before=before, target=after
+            )
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            INPUT_DIAG.event_rate_limited(
+                "tty_mode_repair_applied", rate_key, fd=fd, after=_input_tty_state(fd)
+            )
+
+    def _restore_tty_line_mode(self, fd: int) -> None:
+        """Restore safe ordinary line-input flags when a TTY prompt ends."""
+        try:
+            import termios
+
+            attrs = termios.tcgetattr(fd)
+            attrs[0] &= ~(termios.IGNCR | termios.INLCR)
+            attrs[0] |= termios.ICRNL
+            attrs[3] |= termios.ICANON | termios.ECHO | termios.ISIG
+            attrs[6][termios.VMIN] = _termios_cc_value_like(attrs[6][termios.VMIN], 1)
+            attrs[6][termios.VTIME] = _termios_cc_value_like(attrs[6][termios.VTIME], 0)
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            INPUT_DIAG.event("tty_line_mode_restored", fd=fd, state=_input_tty_state(fd))
+        except (ImportError, OSError, ValueError, AttributeError) as exc:
+            # The terminal may have been detached while the prompt was active.
+            INPUT_DIAG.event("tty_line_mode_restore_failed", fd=fd, error_type=type(exc).__name__)
+
+    def _read_tty_line(
+        self, fd: int, *, echo_input: bool = True,
+        diag_read_id: Optional[int] = None, diagnostic_kind: str = "line",
+    ) -> str:
+        """Read one editable UTF-8 line and emit privacy-preserving diagnostics."""
+        chars: List[str] = []
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        last_heartbeat = time.monotonic()
+
+        def echo(text: str) -> None:
+            if echo_input and text:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+
+        def finish_partial_codepoint() -> None:
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                chars.extend(tail)
+                echo(tail)
+            decoder.reset()
+
+        INPUT_DIAG.update(
+            diag_read_id, state="tty_reader_started", fd=fd,
+            diagnostic_kind=diagnostic_kind,
+        )
+        INPUT_DIAG.event(
+            "tty_reader_started", read_id=diag_read_id, fd=fd,
+            diagnostic_kind=diagnostic_kind, initial_state=_input_tty_state(fd),
+        )
+        while True:
+            # Record the state BEFORE repairing, so terminal-app resets remain visible.
+            INPUT_DIAG.update(diag_read_id, state="repairing_terminal_mode")
+            self._prepare_raw_tty_input(fd)
+            if self._input_pending_bytes:
+                chunk = bytes(self._input_pending_bytes)
+                self._input_pending_bytes.clear()
+                INPUT_DIAG.event("pending_input_bytes_used", read_id=diag_read_id, count=len(chunk))
+            else:
+                INPUT_DIAG.update(diag_read_id, state="waiting_in_select")
+                try:
+                    ready, _, _ = select.select([fd], [], [], 0.25)
+                except InterruptedError:
+                    continue
+                INPUT_DIAG.count_poll(diag_read_id, ready=bool(ready))
+                if not ready:
+                    now = time.monotonic()
+                    if now - last_heartbeat >= 5.0:
+                        INPUT_DIAG.heartbeat(
+                            diag_read_id, state="select_timeout", fd=fd,
+                            terminal_state=_input_fd_diagnostics(fd),
+                            stdin_state=_input_stdin_state(),
+                            ui_lock_locked=self._ui_lock.locked(),
+                            refresh_thread_alive=bool(self._refresh_thread and self._refresh_thread.is_alive()),
+                            refresh_stop_set=self._refresh_stop.is_set(),
+                        )
+                        last_heartbeat = now
+                    continue
+                INPUT_DIAG.update(diag_read_id, state="select_ready")
+                # Repair once more after readiness. The FD stays nonblocking.
+                self._prepare_raw_tty_input(fd)
+                INPUT_DIAG.update(diag_read_id, state="calling_os_read")
+                try:
+                    chunk = os.read(fd, 4096)
+                except BlockingIOError:
+                    INPUT_DIAG.event("tty_read_would_block", read_id=diag_read_id, fd=fd)
+                    continue
+                except OSError as exc:
+                    INPUT_DIAG.event("tty_read_error", read_id=diag_read_id, fd=fd, error_type=type(exc).__name__)
+                    raise
+                if not chunk:
+                    INPUT_DIAG.event("tty_read_eof", read_id=diag_read_id, fd=fd)
+                    raise EOFError
+                INPUT_DIAG.update(diag_read_id, state="processing_input_bytes")
+                INPUT_DIAG.bytes_received(diag_read_id, chunk)
+
+            i = 0
+            while i < len(chunk):
+                value = chunk[i]
+                if value in (10, 13):  # LF or CR; Android Enter commonly sends CR.
+                    finish_partial_codepoint()
+                    next_i = i + 1
+                    if value == 13 and next_i < len(chunk) and chunk[next_i] == 10:
+                        next_i += 1
+                    self._input_pending_bytes.extend(chunk[next_i:])
+                    delimiter = "CRLF" if value == 13 and next_i == i + 2 else ("CR" if value == 13 else "LF")
+                    INPUT_DIAG.event(
+                        "enter_detected", read_id=diag_read_id, delimiter=delimiter,
+                        trailing_bytes=len(chunk[next_i:]), pending_total=len(self._input_pending_bytes),
+                    )
+                    echo("\n")
+                    INPUT_DIAG.update(diag_read_id, state="line_completed")
+                    INPUT_DIAG.event("tty_line_completed", read_id=diag_read_id, delimiter=delimiter)
+                    return "".join(chars)
+
+                if value in (8, 127):  # Backspace / DEL
+                    decoder.reset()
+                    if chars:
+                        chars.pop()
+                        echo("\b \b")
+                    i += 1
+                    continue
+
+                if value == 4:  # Ctrl-D: EOF on an empty line, submit otherwise.
+                    finish_partial_codepoint()
+                    self._input_pending_bytes.extend(chunk[i + 1:])
+                    if not chars:
+                        INPUT_DIAG.event("ctrl_d_eof_detected", read_id=diag_read_id)
+                        raise EOFError
+                    echo("\n")
+                    INPUT_DIAG.event("ctrl_d_line_submitted", read_id=diag_read_id)
+                    return "".join(chars)
+
+                if value == 21:  # Ctrl-U clears the current line.
+                    decoder.reset()
+                    if chars:
+                        echo("\b \b" * len(chars))
+                        chars.clear()
+                    i += 1
+                    continue
+
+                if value == 27:  # Ignore ESC itself; this reader has no cursor editor.
+                    decoder.reset()
+                    i += 1
+                    continue
+
+                if value == 9 or value >= 32:
+                    piece = decoder.decode(bytes((value,)), final=False)
+                    if piece:
+                        chars.extend(piece)
+                        echo(piece)
+                i += 1
+
+            now = time.monotonic()
+            if now - last_heartbeat >= 5.0:
+                INPUT_DIAG.heartbeat(
+                    diag_read_id, state="input_bytes_processed", fd=fd,
+                    terminal_state=_input_tty_state(fd),
+                    ui_lock_locked=self._ui_lock.locked(),
+                    refresh_thread_alive=bool(self._refresh_thread and self._refresh_thread.is_alive()),
+                    refresh_stop_set=self._refresh_stop.is_set(),
+                )
+                last_heartbeat = now
+
+    def _read_secret(self, prompt: str = "") -> str:
+        """Read a hidden secret; diagnostics deliberately omit content and length."""
+        read_id = INPUT_DIAG.begin_read("secret")
+        status = "error"
+        INPUT_DIAG.update(read_id, state="waiting_ui_lock")
+        try:
+            with self._ui_lock:
+                INPUT_DIAG.update(read_id, state="ui_lock_acquired", lock_wait_ms=0)
+                input_fd = None
+                owned_fd = False
+                original_blocking = None
+                try:
+                    try:
+                        if sys.stdout.isatty():
+                            flags = (os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0))
+                            input_fd = os.open("/dev/tty", flags)
+                            owned_fd = True
+                    except (AttributeError, OSError, ValueError) as exc:
+                        INPUT_DIAG.event("secret_tty_open_failed", read_id=read_id, error_type=type(exc).__name__)
+                        input_fd = None
+
+                    if input_fd is None:
+                        try:
+                            if sys.stdin.isatty():
+                                input_fd = sys.stdin.fileno()
+                        except (AttributeError, OSError, ValueError):
+                            input_fd = None
+
+                    if input_fd is None:
+                        INPUT_DIAG.update(read_id, state="waiting_in_getpass_fallback")
+                        INPUT_DIAG.event("secret_using_getpass_fallback", read_id=read_id)
+                        self._prepare_canonical_stdin()
+                        result = getpass.getpass(prompt)
+                        status = "ok"
+                        INPUT_DIAG.event("secret_read_returned", read_id=read_id, source="getpass_fallback")
+                        return result
+
+                    try:
+                        original_blocking = os.get_blocking(input_fd)
+                        if original_blocking:
+                            os.set_blocking(input_fd, False)
+                    except (AttributeError, OSError, ValueError) as exc:
+                        INPUT_DIAG.event("secret_nonblocking_setup_failed", read_id=read_id, error_type=type(exc).__name__)
+                        if owned_fd:
+                            try:
+                                os.close(input_fd)
+                            except OSError:
+                                pass
+                            owned_fd = False
+                        input_fd = None
+                        INPUT_DIAG.update(read_id, state="waiting_in_getpass_fallback")
+                        self._prepare_canonical_stdin()
+                        result = getpass.getpass(prompt)
+                        status = "ok"
+                        INPUT_DIAG.event("secret_read_returned", read_id=read_id, source="getpass_fallback")
+                        return result
+
+                    if prompt:
+                        sys.stdout.write(prompt)
+                        sys.stdout.flush()
+                    INPUT_DIAG.event("secret_tty_fd_selected", read_id=read_id, fd=input_fd, owned=owned_fd, state=_input_tty_state(input_fd))
+                    try:
+                        secret = self._read_tty_line(input_fd, echo_input=False, diag_read_id=read_id, diagnostic_kind="secret")
+                    finally:
+                        self._restore_tty_line_mode(input_fd)
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    status = "ok"
+                    INPUT_DIAG.event("secret_read_returned", read_id=read_id, source="tty_reader")
+                    return secret
+                finally:
+                    if input_fd is not None and not owned_fd and original_blocking is not None:
+                        try:
+                            os.set_blocking(input_fd, original_blocking)
+                        except (AttributeError, OSError, ValueError):
+                            pass
+                    if owned_fd and input_fd is not None:
+                        try:
+                            os.close(input_fd)
+                        except OSError:
+                            pass
+        except EOFError:
+            status = "eof"
+            raise
+        except BaseException as exc:
+            INPUT_DIAG.event("secret_read_exception", read_id=read_id, error_type=type(exc).__name__)
+            raise
+        finally:
+            INPUT_DIAG.finish_read(read_id, status)
+
+    def _read_input(self, prompt: str = "", *, stop_refresh_after: bool = False) -> str:
+        """Read one CLI line and capture privacy-preserving input diagnostics."""
+        kind = _input_kind(prompt)
+        read_id = INPUT_DIAG.begin_read(kind)
+        line = ""
+        input_fd = None
+        owned_fd = False
+        original_blocking = None
+        status = "error"
+        lock_wait_start = time.monotonic()
+        INPUT_DIAG.update(read_id, state="waiting_ui_lock")
+        try:
+            with self._ui_lock:
+                INPUT_DIAG.update(
+                    read_id, state="ui_lock_acquired",
+                    lock_wait_ms=round((time.monotonic() - lock_wait_start) * 1000, 2),
+                )
+                INPUT_DIAG.event(
+                    "input_ui_lock_acquired", read_id=read_id,
+                    lock_wait_ms=round((time.monotonic() - lock_wait_start) * 1000, 2),
+                    stop_refresh_after=stop_refresh_after,
+                )
+                try:
+                    # Prefer a fresh controlling-terminal FD, but record the actual path.
+                    try:
+                        if sys.stdout.isatty():
+                            flags = (os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0))
+                            input_fd = os.open("/dev/tty", flags)
+                            owned_fd = True
+                    except (AttributeError, OSError, ValueError) as exc:
+                        INPUT_DIAG.event("input_dev_tty_open_failed", read_id=read_id, error_type=type(exc).__name__)
+                        input_fd = None
+
+                    if input_fd is None:
+                        try:
+                            if sys.stdin.isatty():
+                                input_fd = sys.stdin.fileno()
+                        except (AttributeError, OSError, ValueError):
+                            input_fd = None
+
+                    if input_fd is not None:
+                        try:
+                            original_blocking = os.get_blocking(input_fd)
+                            if original_blocking:
+                                os.set_blocking(input_fd, False)
+                        except (AttributeError, OSError, ValueError) as exc:
+                            INPUT_DIAG.event("input_nonblocking_setup_failed", read_id=read_id, error_type=type(exc).__name__)
+                            if owned_fd:
+                                try:
+                                    os.close(input_fd)
+                                except OSError:
+                                    pass
+                                owned_fd = False
+                            input_fd = None
+
+                    if prompt:
+                        sys.stdout.write(prompt)
+                        sys.stdout.flush()
+
+                    if input_fd is not None:
+                        INPUT_DIAG.event(
+                            "input_fd_selected", read_id=read_id, source="controlling_tty" if owned_fd else "stdin_tty",
+                            fd=input_fd, owned=owned_fd,
+                            original_blocking=original_blocking,
+                            terminal_state=_input_fd_diagnostics(input_fd),
+                            stdin_state=_input_stdin_state(),
+                        )
+                        try:
+                            line = self._read_tty_line(
+                                input_fd, diag_read_id=read_id, diagnostic_kind=kind
+                            )
+                        finally:
+                            self._restore_tty_line_mode(input_fd)
+                    else:
+                        INPUT_DIAG.update(read_id, state="waiting_in_stdin_readline")
+                        INPUT_DIAG.event("input_stdin_fallback", read_id=read_id, stdin_isatty=False)
+                        self._prepare_canonical_stdin()
+                        line = sys.stdin.readline()
+                except BaseException as exc:
+                    if stop_refresh_after:
+                        self._refresh_stop.set()
+                    INPUT_DIAG.event("input_reader_exception", read_id=read_id, error_type=type(exc).__name__)
+                    raise
+                else:
+                    if stop_refresh_after and line != "":
+                        self._refresh_stop.set()
+                finally:
+                    if input_fd is not None and not owned_fd and original_blocking is not None:
+                        try:
+                            os.set_blocking(input_fd, original_blocking)
+                        except (AttributeError, OSError, ValueError) as exc:
+                            INPUT_DIAG.event("input_blocking_restore_failed", read_id=read_id, error_type=type(exc).__name__)
+                    if owned_fd and input_fd is not None:
+                        try:
+                            os.close(input_fd)
+                        except OSError as exc:
+                            INPUT_DIAG.event("input_fd_close_failed", read_id=read_id, error_type=type(exc).__name__)
+
+            if input_fd is None:
+                if line == "":
+                    status = "eof"
+                    raise EOFError
+                if line.endswith("\n"):
+                    line = line[:-1]
+                if line.endswith("\r"):
+                    line = line[:-1]
+            status = "ok"
+            INPUT_DIAG.event(
+                "input_line_returned_to_caller", read_id=read_id,
+                source="tty_reader" if input_fd is not None else "stdin_readline",
+                stop_refresh_after=stop_refresh_after,
+            )
+            return line
+        except EOFError:
+            status = "eof"
+            raise
+        except BaseException as exc:
+            status = "error"
+            INPUT_DIAG.event("input_read_failed", read_id=read_id, error_type=type(exc).__name__)
+            raise
+        finally:
+            INPUT_DIAG.finish_read(read_id, status)
+
     def _main_loop(self) -> None:
         """
         Main interactive loop.
@@ -1435,7 +1978,7 @@ class CLI:
                                     layout, and stores per-row offsets that
                                     match THIS terminal's size.
         3. _start_refresh_thread()— daemon refresh (TTY only).
-        4. input("  › ")          — blocks for user input.
+        4. _read_input("  › ")    — blocks for user input.
         5. On a valid choice      — stop refresh → screen-hygiene → dispatch
                                     → re-render → restart refresh.
         6. On exit                — leave alternate-screen buffer.
@@ -1446,21 +1989,15 @@ class CLI:
             if self._ansi_ok():
                 self._start_refresh_thread()
             while self._running:
+                INPUT_DIAG.event("main_menu_wait_start", ui_lock_locked=self._ui_lock.locked(),
+                                 refresh_thread_alive=bool(self._refresh_thread and self._refresh_thread.is_alive()))
                 try:
-                    # input() uses the terminal's own line editor.  A redraw
-                    # from another thread while that editor is active moves
-                    # the terminal cursor underneath it; on terminal resume
-                    # this can make typed characters appear to move down the
-                    # screen and leave the prompt looking unresponsive.  Hold
-                    # the same lock used by live-frame writes for the entire
-                    # blocking read, not merely for each stdout write.
-                    with self._ui_lock:
-                        choice = input(clr("  › ", CYAN)).strip()
-                        # Signal shutdown before releasing the lock.  A
-                        # refresh worker waiting to write must not slip in
-                        # between input() returning and _stop_refresh_thread()
-                        # being called below.
-                        self._refresh_stop.set()
+                    # A concurrent cursor-based redraw can move the terminal
+                    # cursor during a line read.  Hold the UI lock for the read
+                    # and stop the refresh worker before releasing that lock.
+                    choice = self._read_input(
+                        clr("  › ", CYAN), stop_refresh_after=True
+                    ).strip()
                 except KeyboardInterrupt:
                     choice = "0"
                 except EOFError:
@@ -1479,7 +2016,10 @@ class CLI:
                     # permanently-EOF stdin doesn't spin at 100% CPU.
                     time.sleep(1.0)
                     continue
+                INPUT_DIAG.event("main_menu_input_returned", input_length=len(choice),
+                                 refresh_stop_set=self._refresh_stop.is_set())
                 self._stop_refresh_thread()
+                INPUT_DIAG.event("main_menu_dispatch_start", input_length=len(choice))
                 # Terminal hygiene — only emit ANSI if TTY; otherwise just a newline.
                 if self._ansi_ok():
                     sys.stdout.write('\033[?25h\033[0m\033[9999;1H')
@@ -1490,7 +2030,19 @@ class CLI:
                 else:
                     print()
                     _flush_log_queue()
-                self._dispatch(choice)
+                activity_id = INPUT_DIAG.begin_activity("menu_dispatch")
+                INPUT_DIAG.update(activity_id, state="dispatching_menu_action")
+                activity_status = "returned"
+                try:
+                    self._dispatch(choice)
+                except BaseException as exc:
+                    activity_status = "exception"
+                    INPUT_DIAG.event("main_menu_dispatch_exception", activity_id=activity_id,
+                                     error_type=type(exc).__name__)
+                    raise
+                finally:
+                    INPUT_DIAG.finish_activity(activity_id, activity_status, running=self._running)
+                    INPUT_DIAG.event("main_menu_dispatch_finished", running=self._running)
                 if self._running:
                     self._full_render()
                     if self._ansi_ok():
@@ -1732,7 +2284,7 @@ class CLI:
         # dashboard redraws.  _exit() sets self._running = False so we skip.
         if self._running:
             try:
-                input(clr("  Press Enter to return to dashboard...", DIM))
+                self._read_input(clr("  Press Enter to return to dashboard...", DIM))
             except KeyboardInterrupt:
                 self._running = False
             except EOFError:
@@ -1779,7 +2331,7 @@ class CLI:
 
     def _add_peer(self):
         print(clr("\n  ── Add Peer ──", YELLOW))
-        addr = input("  Enter peer IP:port, [ipv6]:port, or user_id: ").strip()
+        addr = self._read_input("  Enter peer IP:port, [ipv6]:port, or user_id: ").strip()
         # Detect whether the input is a network address or a bare user_id.
         #
         # Three valid address forms:
@@ -1825,7 +2377,7 @@ class CLI:
         print(clr("\n  ── Blockchain Explorer ──", YELLOW))
         h = self.node.blockchain.height()
         print(f"  Chain height: {bold(str(h))}")
-        n_str = input(f"  Show last N blocks [default 5]: ").strip() or "5"
+        n_str = self._read_input(f"  Show last N blocks [default 5]: ").strip() or "5"
         try: n = int(n_str)
         except ValueError: n = 5
         blocks = self.node.storage.get_last_n_blocks(n)
@@ -1921,7 +2473,7 @@ class CLI:
                 return
         # [v7.0.0.3 UX] friendly retry on bad numeric input + restored call
         for _try in range(3):
-            s = input("  Stake amount (or blank to cancel): ").strip()
+            s = self._read_input("  Stake amount (or blank to cancel): ").strip()
             if not s:
                 print("  Cancelled."); return
             try:
@@ -1952,13 +2504,13 @@ class CLI:
         bal = self.node.storage.get_balance(self.node.wallet.address)
         print(f"  Your balance: {bal:.8f} VSD")
         print(f"  Minimum stake: {from_satoshi(Config.MIN_MINER_STAKE):.8f} VSD")
-        s = input("  Stake amount: ").strip()
+        s = self._read_input("  Stake amount: ").strip()
         try: stake = float(s)
         except ValueError: print(clr("  Invalid amount.", RED)); return
         ok, msg = self.node.roles.register_miner(stake)
         if ok:
             print(clr(f"  {msg}", GREEN))
-            auto = input("  Start auto mining now? (y/n): ").strip().lower()
+            auto = self._read_input("  Start auto mining now? (y/n): ").strip().lower()
             if auto == 'y':
                 self.node.mining.start()
                 print(clr("  Mining started.", GREEN))
@@ -2268,7 +2820,7 @@ class CLI:
             if page > 0:              nav_parts.append("[P] Prev page")
             if page < pages_total-1:  nav_parts.append("[N] Next page")
             nav_parts.append("[Q] Back")
-            choice = input(f"\n  {' | '.join(nav_parts)}: ").strip().lower()
+            choice = self._read_input(f"\n  {' | '.join(nav_parts)}: ").strip().lower()
             if choice == 'n' and page < pages_total - 1:
                 page += 1
             elif choice == 'p' and page > 0:
@@ -2278,9 +2830,9 @@ class CLI:
 
     def _send_coins(self):
         print(clr("\n  ── Send Coins ──", YELLOW))
-        to   = input("  To (user_id or VSD address): ").strip()
-        amt  = input("  Amount (VSD): ").strip()
-        memo = input("  Memo (optional): ").strip()
+        to   = self._read_input("  To (user_id or VSD address): ").strip()
+        amt  = self._read_input("  Amount (VSD): ").strip()
+        memo = self._read_input("  Memo (optional): ").strip()
         try: amount = float(amt)
         except ValueError: print(clr("  Invalid amount.", RED)); return
         if amount <= 0:
@@ -2289,7 +2841,7 @@ class CLI:
         print(f"  Transaction fee (sender-side): {fee:.8f} VSD")
         print(f"  Total deducted from you     : {amount + fee:.8f} VSD")
         print(f"  Recipient receives           : {amount:.8f} VSD")
-        confirm = input("  Confirm? (y/n): ").strip().lower()
+        confirm = self._read_input("  Confirm? (y/n): ").strip().lower()
         if confirm != 'y':
             print("  Cancelled."); return
         ok, msg = self.node.send_transaction(to, amount, memo)
@@ -2298,16 +2850,16 @@ class CLI:
     def _give_order(self):
         print(clr("\n  ── Give Order ──", YELLOW))
         print(clr("  Leave 'To' blank to broadcast as an open market order.", DIM))
-        to    = input("  To (user_id or VSD address, blank=broadcast): ").strip()
-        amt   = input("  Amount: ").strip()
-        order = input("  Order details/memo: ").strip()
+        to    = self._read_input("  To (user_id or VSD address, blank=broadcast): ").strip()
+        amt   = self._read_input("  Amount: ").strip()
+        order = self._read_input("  Order details/memo: ").strip()
         try: amount = float(amt)
         except ValueError: print(clr("  Invalid amount.", RED)); return
         if not to:
             # Broadcast order — any peer can accept
             fee = round(amount * Config.TX_FEE_RATE, 8)
             print(f"  Broadcast order fee: {fee:.8f} VSD (paid by you)")
-            confirm = input("  Confirm broadcast order? (y/n): ").strip().lower()
+            confirm = self._read_input("  Confirm broadcast order? (y/n): ").strip().lower()
             if confirm != 'y':
                 print("  Cancelled."); return
         ok, msg = self.node.send_transaction(to, amount, f"ORDER:{order}")
@@ -2372,13 +2924,13 @@ class CLI:
 
     def _register_identity(self):
         print(clr("\n  ── Register Identity / Domain ──", YELLOW))
-        uid = input("  Choose username/domain (e.g. alice, alice.nexa): ").strip()
+        uid = self._read_input("  Choose username/domain (e.g. alice, alice.nexa): ").strip()
         ok, msg = self.node.identity.register(uid, "127.0.0.1", self.node.port)
         print(clr(f"  {msg}", GREEN if ok else RED))
 
     def _resolve_user(self):
         print(clr("\n  ── Resolve User ID ──", YELLOW))
-        uid = input("  Enter user_id (e.g. alice#1a2b3c4d5e or alice.nexa): ").strip()
+        uid = self._read_input("  Enter user_id (e.g. alice#1a2b3c4d5e or alice.nexa): ").strip()
         if not uid:
             return
 
@@ -2830,7 +3382,7 @@ class CLI:
         role = self.node.roles.get_my_role()
         if not role or role["role"] == "none":
             print("  No active stake."); return
-        confirm = input(f"  Unstake {role['stake']:.4f} VSD? (y/n): ").strip().lower()
+        confirm = self._read_input(f"  Unstake {role['stake']:.4f} VSD? (y/n): ").strip().lower()
         if confirm != 'y':
             print("  Cancelled."); return
         ok, msg = self.node.roles.unstake()
@@ -2885,14 +3437,14 @@ class CLI:
 
         current_h = self.node.blockchain.height()
         default_start = current_h + 1
-        raw = input(
+        raw = self._read_input(
             f"  Signal start height [default {default_start}]: ").strip()
         try:
             signal_start = int(raw) if raw else default_start
         except ValueError:
             print(clr("  Invalid height.", RED)); return
 
-        raw_thr = input(
+        raw_thr = self._read_input(
             f"  Signal threshold 0.0–1.0 [default {Config.FORK_SIGNAL_THRESHOLD}]: "
         ).strip()
         try:
@@ -2906,7 +3458,7 @@ class CLI:
         print(f"  Proposing upgrade to v{next_ver}")
         print(f"  Signaling starts at block {signal_start}")
         print(f"  Threshold: {threshold*100:.0f}%")
-        confirm = input("  Confirm? (y/n): ").strip().lower()
+        confirm = self._read_input("  Confirm? (y/n): ").strip().lower()
         if confirm != 'y':
             print("  Cancelled."); return
 
@@ -2928,7 +3480,7 @@ class CLI:
         print(clr("  Example init code (stores 42, returns empty runtime):", DIM))
         print(clr("    6042600055600060006000f3", DIM))
         print()
-        bytecode_hex = input("  Bytecode (hex): ").strip()
+        bytecode_hex = self._read_input("  Bytecode (hex): ").strip()
         if not bytecode_hex:
             print(clr("  Cancelled.", RED)); return
         try:
@@ -2940,7 +3492,7 @@ class CLI:
                       f"(max {Config.VVM_MAX_BYTECODE_SIZE}).", RED)); return
 
         # SC-NAME-1: optional contract name
-        raw_cname = input("  Contract name (optional, leave blank for unnamed): ").strip()
+        raw_cname = self._read_input("  Contract name (optional, leave blank for unnamed): ").strip()
         if raw_cname:
             norm_cname = normalize_contract_name(raw_cname)
             ok_cn, reason_cn = validate_contract_name(norm_cname)
@@ -2961,9 +3513,9 @@ class CLI:
         default_gas  = 200_000
         default_gp   = Config.VVM_MIN_GAS_PRICE
         try:
-            gas_raw = input(f"  Gas limit [default {default_gas}]: ").strip()
+            gas_raw = self._read_input(f"  Gas limit [default {default_gas}]: ").strip()
             gas_limit = int(gas_raw) if gas_raw else default_gas
-            gp_raw  = input(f"  Gas price VSD/gas [default {default_gp}]: ").strip()
+            gp_raw  = self._read_input(f"  Gas price VSD/gas [default {default_gp}]: ").strip()
             gas_price = float(gp_raw) if gp_raw else default_gp
         except ValueError:
             print(clr("  Invalid gas parameter.", RED)); return
@@ -2975,7 +3527,7 @@ class CLI:
         if bal < max_gas_fee:
             print(clr("  Insufficient balance for gas.", RED)); return
 
-        confirm = input("  Deploy? (y/n): ").strip().lower()
+        confirm = self._read_input("  Deploy? (y/n): ").strip().lower()
         if confirm != 'y':
             print("  Cancelled."); return
 
@@ -3021,7 +3573,7 @@ class CLI:
         print("  [3] Call contract (on-chain)")
         print("  [4] Simulate call (read-only, no TX)")
         print("  [0] Back")
-        sub = input(clr("  › ", CYAN)).strip()
+        sub = self._read_input(clr("  › ", CYAN)).strip()
 
         if sub == "1":
             # SC-NAME-1: include contract_name; join vvm_receipts for deploy tx_id.
@@ -3053,7 +3605,7 @@ class CLI:
             return
 
         elif sub == "2":
-            addr = input("  Contract address: ").strip()
+            addr = self._read_input("  Contract address: ").strip()
             rec  = self.node.storage.get_contract(addr)
             if not rec:
                 print(clr("  Contract not found.", RED)); return
@@ -3079,20 +3631,20 @@ class CLI:
             return
 
         elif sub == "3":
-            addr = input("  Contract address: ").strip()
+            addr = self._read_input("  Contract address: ").strip()
             if not self.node.storage.get_contract(addr):
                 print(clr("  Contract not found.", RED)); return
-            calldata_hex = input("  Calldata (hex, or empty): ").strip()
+            calldata_hex = self._read_input("  Calldata (hex, or empty): ").strip()
             if calldata_hex:
                 try:
                     bytes.fromhex(calldata_hex)
                 except ValueError:
                     print(clr("  Invalid hex.", RED)); return
             try:
-                gas_limit = int(input(f"  Gas limit [default 100000]: ").strip() or "100000")
-                gas_price = float(input(f"  Gas price [default {Config.VVM_MIN_GAS_PRICE}]: ").strip()
+                gas_limit = int(self._read_input(f"  Gas limit [default 100000]: ").strip() or "100000")
+                gas_price = float(self._read_input(f"  Gas price [default {Config.VVM_MIN_GAS_PRICE}]: ").strip()
                                   or str(Config.VVM_MIN_GAS_PRICE))
-                call_value = float(input("  VSD value to send [default 0]: ").strip() or "0")
+                call_value = float(self._read_input("  VSD value to send [default 0]: ").strip() or "0")
             except ValueError:
                 print(clr("  Invalid parameter.", RED)); return
 
@@ -3124,12 +3676,12 @@ class CLI:
             return
 
         elif sub == "4":
-            addr = input("  Contract address: ").strip()
+            addr = self._read_input("  Contract address: ").strip()
             if not self.node.storage.get_contract(addr):
                 print(clr("  Contract not found.", RED)); return
-            calldata_hex = input("  Calldata (hex, or empty): ").strip()
+            calldata_hex = self._read_input("  Calldata (hex, or empty): ").strip()
             try:
-                gas_limit = int(input("  Gas limit [default 500000]: ").strip() or "500000")
+                gas_limit = int(self._read_input("  Gas limit [default 500000]: ").strip() or "500000")
             except ValueError:
                 print(clr("  Invalid gas limit.", RED)); return
 
@@ -3201,7 +3753,7 @@ class CLI:
                 self._l2_render_panel()
                 self._l2_print_menu()
                 try:
-                    choice = input(clr("  L2 › ", BLUE)).strip()
+                    choice = self._read_input(clr("  L2 › ", BLUE)).strip()
                 except (KeyboardInterrupt, EOFError):
                     # Treat Ctrl-C as "go back" rather than exiting the node.
                     print()
@@ -3223,7 +3775,7 @@ class CLI:
                         print(clr(f"  L2 handler error: {e}", RED))
                 # Pause so the user can read output before the panel redraws.
                 try:
-                    input(clr("  Press Enter to continue...", DIM))
+                    self._read_input(clr("  Press Enter to continue...", DIM))
                 except (KeyboardInterrupt, EOFError):
                     return
             except Exception as e:
@@ -3231,7 +3783,7 @@ class CLI:
                 # node.  Print and continue.
                 print(clr(f"  L2 dashboard error: {e}", RED))
                 try:
-                    input(clr("  Press Enter to continue...", DIM))
+                    self._read_input(clr("  Press Enter to continue...", DIM))
                 except (KeyboardInterrupt, EOFError):
                     return
 
@@ -3415,11 +3967,11 @@ class CLI:
                 "    sequencers refuse to start at all — L2 sends will sit\n"
                 "    indefinitely until a proper SNARK backend is configured.",
                 YELLOW))
-            cont = input("  Continue with deposit anyway? (y/n): ").strip().lower()
+            cont = self._read_input("  Continue with deposit anyway? (y/n): ").strip().lower()
             if cont != 'y':
                 print("  Cancelled."); return
 
-        amt_str = input("  Amount (VSD): ").strip()
+        amt_str = self._read_input("  Amount (VSD): ").strip()
         try:
             amount = float(amt_str)
         except ValueError:
@@ -3443,7 +3995,7 @@ class CLI:
         print(f"  Total deducted   : {amount + fee:.8f} VSD")
         print(clr("  Note: L2 credit appears once the deposit tx is mined "
                   "into a block and apply_block runs the deposit hook.", DIM))
-        confirm = input("  Confirm deposit? (y/n): ").strip().lower()
+        confirm = self._read_input("  Confirm deposit? (y/n): ").strip().lower()
         if confirm != 'y':
             print("  Cancelled."); return
         memo = "L2_DEPOSIT"
@@ -3478,7 +4030,7 @@ class CLI:
         # Match L1: accept user_id OR VSD address.  Resolve user_id via
         # the same identity service that node.send_transaction uses (line
         # 33895 in this file).
-        raw = input("  To (user_id or VSD address): ").strip()
+        raw = self._read_input("  To (user_id or VSD address): ").strip()
         if not raw:
             print(clr("  Recipient required.", RED)); return
         # Bound length defensively before any lookup.
@@ -3516,7 +4068,7 @@ class CLI:
         if to_addr == wallet.address:
             print(clr("  Cannot send to yourself.", RED)); return
 
-        amt_str = input("  Amount (VSD): ").strip()
+        amt_str = self._read_input("  Amount (VSD): ").strip()
         try:
             amount = float(amt_str)
         except ValueError:
@@ -3545,7 +4097,7 @@ class CLI:
         print(f"  Nonce            : {nonce}")
         print(clr("  L2 txs are off-chain until a rollup batch settles. "
                   "Settlement adds the proof to L1.", DIM))
-        confirm = input("  Confirm send? (y/n): ").strip().lower()
+        confirm = self._read_input("  Confirm send? (y/n): ").strip().lower()
         if confirm != 'y':
             print("  Cancelled."); return
 
@@ -3586,7 +4138,7 @@ class CLI:
 
     def _l2_view_account(self) -> None:
         print(clr("\n  ── View L2 Account ──", BLUE))
-        addr = input("  Address (blank = self): ").strip()
+        addr = self._read_input("  Address (blank = self): ").strip()
         if not addr:
             addr = self.node.wallet.address
         if len(addr) > 128:
@@ -3640,7 +4192,7 @@ class CLI:
         print(f"  Your L2 balance  : {l2_bal:,} sat"
               f"  ({from_satoshi(l2_bal):.8f} VSD)")
 
-        amt_str = input("  Amount to withdraw (VSD): ").strip()
+        amt_str = self._read_input("  Amount to withdraw (VSD): ").strip()
         try:
             amount = float(amt_str)
         except ValueError:
@@ -3665,7 +4217,7 @@ class CLI:
                   "into a block (same as deposit). Your L2 balance is debited "
                   "at the same time, inside the block.",
                   DIM))
-        confirm = input("  Confirm withdrawal? (y/n): ").strip().lower()
+        confirm = self._read_input("  Confirm withdrawal? (y/n): ").strip().lower()
         if confirm != 'y':
             print("  Cancelled."); return
 
@@ -3687,7 +4239,7 @@ class CLI:
         except Exception:
             pending = "?"
         print(f"  Current pending L2 txs: {pending}")
-        confirm = input("  Force-seal a batch now? (y/n): ").strip().lower()
+        confirm = self._read_input("  Force-seal a batch now? (y/n): ").strip().lower()
         if confirm != 'y':
             print("  Cancelled."); return
         try:
@@ -3744,18 +4296,18 @@ class CLI:
         print(clr("  +============================+\n", RED))
 
         # ── Prompt for target height ──────────────────────────────────
-        raw = input(clr("  Target height to rollback to: ", CYAN)).strip()
+        raw = self._read_input(clr("  Target height to rollback to: ", CYAN)).strip()
         try:
             target = int(raw)
         except ValueError:
             print(clr("  [X] Invalid input — must be an integer.", RED))
-            input(clr("  Press Enter to return...", DIM))
+            self._read_input(clr("  Press Enter to return...", DIM))
             return
 
         if target < 0 or target >= cur:
             print(clr("  [X] Target must be in range [0, {}].".format(
                 cur - 1), RED))
-            input(clr("  Press Enter to return...", DIM))
+            self._read_input(clr("  Press Enter to return...", DIM))
             return
 
         blocks_to_delete = cur - target
@@ -3766,10 +4318,10 @@ class CLI:
         print(clr("  WARNING: Mining will be paused during the "
                   "operation.\n", RED))
 
-        confirm = input(clr("  Type 'yes' to confirm: ", YELLOW)).strip().lower()
+        confirm = self._read_input(clr("  Type 'yes' to confirm: ", YELLOW)).strip().lower()
         if confirm != "yes":
             print(clr("  Rollback cancelled.", GREEN))
-            input(clr("  Press Enter to return...", DIM))
+            self._read_input(clr("  Press Enter to return...", DIM))
             return
 
         # ── 1. Force-stop mining ──────────────────────────────────────
@@ -3805,7 +4357,7 @@ class CLI:
 
         # ── 4. Optionally restart mining ──────────────────────────────
         if was_mining and ok:
-            restart = input(
+            restart = self._read_input(
                 clr("  Restart mining? (y/N): ", CYAN)).strip().lower()
             if restart == "y":
                 try:
@@ -3814,7 +4366,7 @@ class CLI:
                 except Exception:
                     pass
 
-        input(clr("\n  Press Enter to return to dashboard...", DIM))
+        self._read_input(clr("\n  Press Enter to return to dashboard...", DIM))
 
     def _exit(self):
         # Stop the live refresh thread before tearing down the node so it
