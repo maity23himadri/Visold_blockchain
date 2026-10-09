@@ -1071,10 +1071,11 @@ class CLI:
             self._up_pa      = []
             return
 
-        # ── TTY: clear + re-render current tab ────────────────────────────────
-        sys.stdout.write('\033[?25h\033[0m\033[H\033[2J')
-        sys.stdout.flush()
-
+        # ── TTY: assemble a complete frame and emit it in one write ───────────
+        # Keeping the frame in memory avoids one stdout write per visual row.
+        # That reduces syscall/terminal-emulator overhead on Android while the
+        # live-refresh path below continues to update only changed rows.
+        lines: List[str] = []
         printed = 0
         # Tab renderers write per-row indices into these scratch slots.
         self._row_balance = self._row_height = self._row_peers = -1
@@ -1084,7 +1085,7 @@ class CLI:
 
         def _out(line: str = "") -> None:
             nonlocal printed
-            print(line)
+            lines.append(str(line))
             printed += 1
 
         def _row() -> int:
@@ -1111,9 +1112,9 @@ class CLI:
             self._render_tab_dashboard(_out, _row)
 
         _out()
-        # Menu
-        menu_lines  = self._print_menu()
-        printed    += menu_lines
+        # Menu. Pass the same frame collector so the whole screen can be
+        # written atomically rather than issuing dozens of separate print calls.
+        self._print_menu(emit=_out)
 
         # ── Compute "lines up from prompt" for every recorded dynamic row ──
         def _up(r: int) -> int:
@@ -1125,6 +1126,16 @@ class CLI:
         self._up_role    = _up(self._row_role)
         self._up_notif   = [_up(r) for r in self._rows_notif]
         self._up_pa      = [_up(r) for r in self._rows_pa]
+
+        frame = '\033[?25h\033[0m\033[H\033[2J' + '\n'.join(lines) + '\n'
+        try:
+            sys.stdout.write(frame)
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            # A terminal can disappear while the node is running (for example,
+            # when an Android terminal session is detached). Do not crash the
+            # blockchain because the view could not be repainted.
+            pass
 
     def _redraw_live(self, update_stats: bool = True) -> None:
         """
@@ -1339,6 +1350,8 @@ class CLI:
         # rollup status, etc.).  Selecting "0" inside the L2 dashboard
         # returns here.
         ("26", "L2 Dashboard ▶"),
+        ("H",  "Help & Keyboard Tips"),
+        ("B",  "Detach UI (keep node running)"),
         ("99", "Diagnose Sync (live trace)"),
         # ── MAINTENANCE ─────────────────────────────────────────────────────
         ("R",  "Rollback Chain"),
@@ -1433,7 +1446,7 @@ class CLI:
             self._stop_refresh_thread()
             self._leave_alt_screen()
 
-    def _print_menu(self) -> int:
+    def _print_menu(self, emit=None) -> int:
         """
         Colour-coded menu, grouped by category.  Returns the number of lines
         printed so _full_render can compute prompt offset dynamically.
@@ -1452,7 +1465,11 @@ class CLI:
         printed = 0
         def _emit(line: str = "") -> None:
             nonlocal printed
-            print(line); printed += 1
+            if emit is None:
+                print(line)
+            else:
+                emit(line)
+            printed += 1
 
         def _item(key: str, color: str) -> str:
             return f"  [{clr(key.rjust(2), color)}] {_lookup.get(key, '?')}"
@@ -1511,6 +1528,10 @@ class CLI:
         # section header makes the entry-point obvious to the user.
         _sec("LAYER-2 ROLLUP", BLUE)
         _row1("26", BLUE)
+        _emit()
+
+        _sec("HELP & SESSION", CYAN)
+        _row2("H", CYAN, "B", GREEN)
         _emit()
 
         _sec("MAINTENANCE", RED)
@@ -1632,6 +1653,10 @@ class CLI:
             "24": self._governance_propose,
             "25": self._vvm_inspect,
             "26": self._l2_dashboard,
+            "H":  self._show_tui_help,
+            "h":  self._show_tui_help,
+            "B":  self._detach_tui,
+            "b":  self._detach_tui,
             "99": self._diagnose_sync,
             "R":  self._rollback_chain,
             "r":  self._rollback_chain,
@@ -1665,6 +1690,39 @@ class CLI:
                 pass
 
     # ── Menu handlers ─────────────────────────────────────────────────────────
+
+    def _show_tui_help(self):
+        """Show concise, phone-friendly usage and clipboard guidance."""
+        print(clr("\n  ── Visold TUI Help ──", CYAN))
+        print("  • Type a menu number/letter and press Enter.")
+        print("  • Tabs: F1–F5 or t1–t5; named shortcuts: :dash, :wallet,")
+        print("    :mining, :nodes, :activity.")
+        print("  • Copy/select and paste are provided by your terminal app;")
+        print("    gestures and Ctrl+Shift+C/V support vary by emulator.")
+        print("  • To keep the node running while leaving this screen, use B")
+        print("    inside a tmux session, or start with scripts/visold-termux.sh.")
+        print("  • Ctrl+C exits through the normal shutdown path; B only detaches.")
+
+    def _detach_tui(self):
+        """Detach the current tmux client without shutting down the node."""
+        if not os.environ.get("TMUX"):
+            print(clr("\n  Background detach requires a tmux session.", YELLOW))
+            print("  In Termux, start with: bash scripts/visold-termux.sh start")
+            print("  Then attach and choose B, or press Ctrl+B followed by D.")
+            return
+        try:
+            import subprocess
+            subprocess.run(
+                ["tmux", "detach-client"],
+                check=True,
+                timeout=5,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except Exception as exc:
+            print(clr(f"\n  Could not detach tmux client: {exc}", RED))
+            print("  The node has not been intentionally stopped.")
 
     def _add_peer(self):
         print(clr("\n  ── Add Peer ──", YELLOW))

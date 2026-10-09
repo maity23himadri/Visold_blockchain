@@ -745,15 +745,17 @@ except ImportError:
     pass
 
 
-# Print architecture diagram when imported as main
-if __name__ == "__main__":
-    print(ARCHITECTURE_DIAGRAM)
-    print(INTEGRATION_GUIDE)
-
-# Print on direct execution
+# Dispatch only the requested mode on direct execution.  Printing the large
+# architecture/integration documents unconditionally before `main()` polluted
+# the TUI and made --help/--version unusable as clean, beginner-friendly entry
+# points.  Developers can still request the documents explicitly.
 if __name__ == "__main__":
     import sys as _sys_main
-    if "--verify-hardened" in _sys_main.argv:
+    if "--architecture" in _sys_main.argv:
+        print(ARCHITECTURE_DIAGRAM)
+        print(INTEGRATION_GUIDE)
+        _sys_main.exit(0)
+    elif "--verify-hardened" in _sys_main.argv:
         _suite = HardenedVerificationSuite()
         _ok = _suite.run()
         _sys_main.exit(0 if _ok else 1)

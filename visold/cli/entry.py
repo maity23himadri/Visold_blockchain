@@ -79,6 +79,27 @@ def main():
     except Exception:
         pass
 
+    # ── Friendly top-level help (without intercepting --cli --help) ──────────
+    if "--cli" not in sys.argv and any(arg in ("-h", "--help") for arg in sys.argv[1:]):
+        print("""Visold (VSD) — consumer-node interface
+
+Usage:
+  python visold_vsd_.py                 Start the interactive node and TUI
+  python visold_vsd_.py --version       Show version and chain ID
+  python visold_vsd_.py --test          Run the embedded test suite
+  python visold_vsd_.py --cli --help    Show wallet/RPC command help
+
+Interactive TUI:
+  Enter a menu number and press Enter. Tabs accept F1–F5, t1–t5, or
+  :dash, :wallet, :mining, :nodes, :activity. On Android, the terminal
+  emulator provides text selection and clipboard paste; key gestures vary
+  by emulator. See docs/ANDROID_TERMUX_GUIDE.md for setup and background use.
+
+Safety:
+  Back up your wallet/keystore before changing installations or data folders.
+  Do not share keystore files, recovery secrets, or RPC token files.""")
+        sys.exit(0)
+
     # ── --test / --version flags ──────────────────────────────────────────────
     if "--version" in sys.argv:
         print(f"Visold (VSD) v{Config.VERSION} | Chain: {Config.CHAIN_ID}")
