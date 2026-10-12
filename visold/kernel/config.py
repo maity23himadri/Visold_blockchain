@@ -831,7 +831,7 @@ class Config:
     # the DuckDNS bootstrap path.  The DuckDNS hostname is dual-stack: DNSSeeder
     # uses getaddrinfo(AF_UNSPEC), registers IPv6 results first, and P2PNetwork
     # dials them with AF_INET6.  Override with VISOLD_DNS_SEEDS or config.json.
-    _DEFAULT_DNS_SEEDS = "visoldcrypto2026.duckdns.org"
+    _DEFAULT_DNS_SEEDS = "visold.duckdns.org,visold1.duckdns.org,visold2.duckdns.org"
     DNS_SEEDS = [s.strip() for s in os.environ.get(
         "VISOLD_DNS_SEEDS", _DEFAULT_DNS_SEEDS).split(",") if s.strip()]
     DNS_SEED_PORT = int(os.environ.get("VISOLD_DNS_SEED_PORT", str(DEFAULT_PORT)))

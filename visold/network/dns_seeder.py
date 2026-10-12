@@ -59,8 +59,8 @@ class DNSSeeder:
     manually added peers, so reputation tracking and blacklist checks apply
     automatically.
 
-    Config.DNS_SEEDS is intentionally empty by default; populate it before
-    mainnet launch.
+    Config.DNS_SEEDS contains the built-in bootstrap hostnames by default and
+    can be overridden through configuration or the VISOLD_DNS_SEEDS variable.
     """
 
     def __init__(self, network: 'P2PNetwork'):

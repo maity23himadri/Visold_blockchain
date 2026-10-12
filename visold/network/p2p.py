@@ -1552,7 +1552,7 @@ class P2PNetwork:
         # the only choke point guaranteed to run *after* peer_id is known.
         # The pre-dial guard in _try_add_peer only catches literal loopback
         # IPs, plus an already-known peer_id -- neither applies to a DNS
-        # seed (e.g. visoldcrypto2026.duckdns.org) that currently resolves
+        # seed (e.g. visold.duckdns.org) that currently resolves
         # to our own public IP, so that guard is a no-op for this exact
         # case and the connection previously sailed through a full
         # PoW+TLS+ECDSA handshake before anything noticed. Reject by
