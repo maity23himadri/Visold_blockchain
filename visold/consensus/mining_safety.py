@@ -102,6 +102,11 @@ class MiningSafetyGuard:
         # Watchdog timestamps (set on each event)
         self._mine_started_at: float          = 0.0
         self._block_download_started_at: float= 0.0
+        # VSA-30: state of the current unconverged sync episode (pre_mine_sync_check).
+        self._stall_key = None
+        self._stall_retry_at = 0.0
+        self._stall_episodes = 0
+        self.sync_stalled = False
 
     # ─────────────────────────────────────────────────────────────────────
     # 1. STALE-TIP MINING — pre-mine sync gate
@@ -129,6 +134,13 @@ class MiningSafetyGuard:
         return (best_peer <= local_height + tolerance,
                 local_height, best_peer)
 
+    def _clear_stall(self) -> None:
+        """Leave the stalled state (the node is synced, or the episode is over)."""
+        self._stall_key = None
+        self._stall_retry_at = 0.0
+        self._stall_episodes = 0
+        self.sync_stalled = False
+
     def pre_mine_sync_check(self, stop_event: 'threading.Event'
                              ) -> Tuple[bool, str]:
         """Block (with timed wait) until the node is sufficiently synced
@@ -151,10 +163,25 @@ class MiningSafetyGuard:
         if not Config.MINING_SYNC_REQUIRED_BEFORE_MINE:
             return True, "sync gate disabled"
 
-        deadline = time.time() + float(Config.MINING_SYNC_MAX_WAIT)
         synced, lh, bh = self.is_synced()
         if synced:
+            self._clear_stall()
             return True, "already synced"
+        key = (lh, bh)
+        probe = float(Config.MINING_SYNC_PROBE_INTERVAL)
+        if self._stall_key == key and time.time() < self._stall_retry_at:
+            # VSA-30: this unchanged episode already exhausted its wait cap.  Do not
+            # repeat the full wait; keep observing, so convergence is still seen at once.
+            if stop_event.wait(probe):
+                return False, "stop event"
+            synced, lh, bh = self.is_synced()
+            if synced:
+                self._clear_stall()
+                log.info(f"[MiningSafety] Sync converged - local={lh}, "
+                         f"best_peer={bh}.  Resuming mining.")
+                return True, "synced"
+            return False, "sync stalled; mining withheld until the retry window"
+        deadline = time.time() + float(Config.MINING_SYNC_MAX_WAIT)
 
         # Try to hint at a sync up-front so the caller doesn't wait silently
         gap = max(0, bh - lh)
@@ -190,6 +217,7 @@ class MiningSafetyGuard:
             if synced:
                 log.info(f"[MiningSafety] Sync converged — local={lh}, "
                          f"best_peer={bh}.  Resuming mining.")
+                self._clear_stall()
                 return True, "synced"
             # Re-kick every ~30 seconds while waiting.  This handles the
             # "block download stalled" scenario in the user spec — a peer
@@ -210,16 +238,22 @@ class MiningSafetyGuard:
                         pass
                 last_kick = time.time()
 
-        # Wait cap exceeded — proceed anyway with a warning.  Better to mine
-        # an orphan than to hang silently forever; the orphan will be
-        # discovered and the chain reorganised on the next gossip wave.
+        # VSA-30: the wait cap expired without convergence.  Withhold mining rather than
+        # proceed on an unverified tip; the advertised height is only a hint.  The same
+        # unchanged episode is not waited on again until the retry window has passed.
+        if self._stall_key == key:
+            self._stall_episodes += 1
+        else:
+            self._stall_key = key
+            self._stall_episodes = 1
+        self._stall_retry_at = time.time() + float(Config.MINING_SYNC_MAX_WAIT)
+        self.sync_stalled = True
         log.warning(
-            f"[MiningSafety] Sync wait cap "
-            f"({Config.MINING_SYNC_MAX_WAIT}s) exceeded — proceeding with "
-            f"local height {lh} vs best peer {bh}.  Mined block may be "
-            f"orphaned if the peer height is genuine."
+            f"[MiningSafety] Sync wait cap ({Config.MINING_SYNC_MAX_WAIT}s) exceeded at "
+            f"local height {lh} vs best peer {bh}; mining is withheld until sync "
+            f"converges (stalled episode {self._stall_episodes})."
         )
-        return True, "wait cap exceeded"
+        return False, "sync wait cap exceeded; mining withheld"
 
     # ─────────────────────────────────────────────────────────────────────
     # 2. UNREACHABLE-GAP SYNC

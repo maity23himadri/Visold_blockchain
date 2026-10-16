@@ -26,6 +26,8 @@ Origin: visold_vsd_.py L33451-38510
 
 import hashlib
 import hmac
+import ipaddress
+from visold.kernel.netutil import wildcard_for_family
 import json
 import queue
 import random
@@ -133,6 +135,17 @@ if TYPE_CHECKING:  # annotation-only references (no runtime import, no cycle)
     from visold.mining.engine import MiningEngine
     from visold.state.engine import StateEngine
     from visold.wallet.wallet import Wallet
+
+
+# VSA-18: bounded number of concurrent unauthenticated inbound TLS handshakes.
+_TLS_HANDSHAKE_SLOTS = threading.BoundedSemaphore(Config.P2P_MAX_PENDING_TLS_HANDSHAKES)
+
+
+def _close_quietly(sock) -> None:
+    try:
+        sock.close()
+    except Exception:
+        pass
 
 
 class P2PNetwork:
@@ -259,6 +272,13 @@ class P2PNetwork:
         self._compact_stash_lock = threading.Lock()
         self._CMPCT_STASH_TTL   = 30.0   # seconds before a stale stash entry is dropped
         self._load_peers()
+        # ── Listen-port plan (VSA-13, VSA-14) ─────────────────────────────
+        # The TCP listener and the UDP transport are bound to one port before any
+        # service that advertises a port is built, so self.port is the port both
+        # transports serve and UPnP, ICE and the handshake fields cannot disagree.
+        # Startup fails (RuntimeError) when no candidate port works.
+        self._listen_sock, self._udp = self._open_listen_sockets(port)
+        port = self.port
         # UPnP NAT traversal (background — never blocks startup)
         self._upnp    = UPnPManager(internal_port=port, external_port=port)
         # DNS seed discovery (background — never blocks startup)
@@ -269,10 +289,7 @@ class P2PNetwork:
         # Initialized here; started in start() after TLS certs are ready.
         # Runs PARALLEL to the TCP layer — peers with "udp_port" in their
         # HELLO are contacted via UDP; others fall back to TCP seamlessly.
-        self._udp: 'UDPTransport' = UDPTransport(
-            port=port,
-            bind_addr=Config.BIND_ADDRESS if Config.BIND_ADDRESS else '',
-            max_pending_inbound=Config.MAX_PEERS)
+        # self._udp was bound by _open_listen_sockets, on the same port as TCP.
         # Map: (ip, port) -> UDPPeerConnection  (UDP peers only)
         self._udp_peers: dict = {}
         self._udp_peers_lock = threading.Lock()
@@ -393,13 +410,16 @@ class P2PNetwork:
         cap on simultaneously admitted pre-authentication endpoints.
         """
         ip, _port = addr
+        # VSA-15: one canonical key for the ban lookup and the rate window, so a
+        # mapped spelling cannot bypass either check.
+        ip = _normalize_ip(ip)
         now = time.time()
         if self._is_ip_banned(ip):
             _pa_push("IN", ip, addr[1], "BANNED")
             return False
 
         with self._lock:
-            window = self._conn_rate[ip]
+            window = self._conn_rate[("udp", ip)]
             while window and (now - window[0]) > self._CONN_RATE_WINDOW:
                 window.popleft()
             if len(window) >= self._CONN_RATE_LIMIT:
@@ -573,7 +593,7 @@ class P2PNetwork:
             elif not admission_released:
                 self._udp.release_inbound(addr)
 
-    def _udp_connect_to(self, ip: str, port: int) -> bool:
+    def _udp_connect_to(self, ip: str, port: int, deadline: Optional[float] = None) -> bool:
         """
         Establish an outbound UDP peer connection (handshake initiator role).
         Mirrors connect_to() but uses UDPSession / UDPPeerConnection.
@@ -593,8 +613,14 @@ class P2PNetwork:
         handshake_registered = False
 
         try:
+            # ── VSA-08: open the handshake before waiting for it ───────────
+            # The responder starts its handshake only when a datagram from a new
+            # source reaches it.  Waiting for POW_CHALLENGE first never gets one sent,
+            # so the heartbeat opener goes out first and the wait follows it.
+            sess.send_heartbeat()
             # ── PoW response ──────────────────────────────────────────────
-            pow_challenge_msg = peer.recv_line(timeout=8)
+            pow_challenge_msg = peer.recv_line(
+                timeout=self._budget(self._UDP_CHALLENGE_WAIT_SECS, deadline))
             pow_nonce: Optional[str] = ""
             if (pow_challenge_msg
                     and pow_challenge_msg.get("type") == MSG_POW_CHALLENGE):
@@ -623,7 +649,7 @@ class P2PNetwork:
             peer.send(hello)
 
             # ── ECDSA challenge response ───────────────────────────────────
-            verify_msg = peer.recv_line(timeout=8)
+            verify_msg = peer.recv_line(timeout=self._budget(8, deadline))
             if not verify_msg or verify_msg.get("type") != MSG_VERIFY:
                 peer.close(); return False
 
@@ -634,7 +660,7 @@ class P2PNetwork:
                        "sig": sig_to_hex(sig)})
 
             # ── Read ACCEPT ───────────────────────────────────────────────
-            accept_msg = peer.recv_line(timeout=10)
+            accept_msg = peer.recv_line(timeout=self._budget(10, deadline))
             if not accept_msg or accept_msg.get("type") != MSG_ACCEPT:
                 peer.close(); return False
 
@@ -955,17 +981,90 @@ class P2PNetwork:
                 p.close()
             self.peers.clear()
 
-    def _server_loop(self):
-        srv = _create_dual_stack_server_socket(self.port)
-        try:
+    _LISTEN_PORT_SEARCH = 8
+    # VSA-08: how long an outbound UDP handshake waits for POW_CHALLENGE after the
+    # heartbeat that starts the responder's handshake.
+    _UDP_CHALLENGE_WAIT_SECS = 3.0
+
+    @staticmethod
+    def _budget(wait: float, deadline: Optional[float]) -> float:
+        """Cap one handshake wait so it cannot run past the attempt's deadline (VSA-10)."""
+        if deadline is None:
+            return wait
+        return max(0.1, min(float(wait), deadline - time.monotonic()))
+
+    def _open_listen_sockets(self, base_port: int):
+        """Bind the TCP listener and the UDP transport to one port (VSA-13, VSA-14).
+
+        Candidates are ``base_port`` and the next few ports, excluding the RPC port.
+        A candidate is taken only when both the TCP socket and the UDP socket bind to
+        it, so the port advertised in the handshake, the UPnP mapping and the ICE
+        candidates is one that both transports serve.  Sets ``self.port`` and returns
+        ``(tcp_socket, udp_transport)``.  Raises RuntimeError when no candidate works,
+        so startup fails instead of advertising a port that nothing listens on.
+        """
+        reserved = {base_port + Config.RPC_PORT_OFFSET}
+        candidates = [base_port] + [
+            p for p in range(base_port + 1, base_port + 1 + self._LISTEN_PORT_SEARCH)
+            if p not in reserved]
+        last_error: Optional[BaseException] = None
+        for port in candidates:
+            if port > 65535:
+                break
+            srv = None
+            udp = None
             try:
-                srv.bind((Config.BIND_ADDRESS, self.port))
-            except OSError:
-                self.port += 1
-                srv.bind((Config.BIND_ADDRESS, self.port))
+                srv = _create_dual_stack_server_socket(port)
+                srv.bind((wildcard_for_family(srv.family, Config.BIND_ADDRESS), port))
+                udp = UDPTransport(
+                    port=port,
+                    bind_addr=Config.BIND_ADDRESS if Config.BIND_ADDRESS else '',
+                    max_pending_inbound=Config.MAX_PEERS)
+            except (OSError, ValueError) as exc:
+                last_error = exc
+                if srv is not None:
+                    srv.close()
+                if udp is not None:
+                    udp._sock.close()
+                continue
+            self.port = port
+            return srv, udp
+        raise RuntimeError(
+            f"P2P startup: no free TCP+UDP port from {base_port} "
+            f"(RPC port {base_port + Config.RPC_PORT_OFFSET} reserved); "
+            f"last error: {last_error}")
+
+    def _bind_listener(self, srv, base_port: int) -> bool:
+        """Bind the listener to the first free candidate port (VSA-14).
+
+        Candidates are ``base_port`` and the next few ports, excluding the RPC port
+        (``base_port + RPC_PORT_OFFSET``) so the fallback never collides with the RPC
+        server.  The wildcard is chosen for the socket's own address family (VSA-12).
+        Returns False, without raising, when no candidate can be bound.
+        """
+        reserved = {base_port + Config.RPC_PORT_OFFSET}
+        candidates = [base_port] + [
+            p for p in range(base_port + 1, base_port + 1 + self._LISTEN_PORT_SEARCH)
+            if p not in reserved]
+        for port in candidates:
+            if port > 65535:
+                break
+            try:
+                srv.bind((wildcard_for_family(srv.family, Config.BIND_ADDRESS), port))
+            except (OSError, ValueError):
+                continue
+            self.port = port
+            return True
+        return False
+
+    def _server_loop(self):
+        # The socket was bound in __init__ by _open_listen_sockets (VSA-13, VSA-14),
+        # so the port is known to be free before anything advertises it.
+        srv = self._listen_sock
+        try:
             srv.listen(64)
             srv.settimeout(1.0)
-            log.info(f"P2P server bound to [{Config.BIND_ADDRESS}]:{self.port} "
+            log.info(f"P2P server listening on [{Config.BIND_ADDRESS}]:{self.port} "
                      f"(dual-stack)")
             while self._running:
                 try:
@@ -986,6 +1085,49 @@ class P2PNetwork:
             except Exception:
                 pass
 
+    def _wrap_inbound_tls(self, sock, tls_ctx, client_ip: str):
+        """Wrap an accepted socket for TLS under a bounded handshake (VSA-18).
+
+        The handshake runs under an explicit per-socket timeout, and the number of
+        concurrent unauthenticated handshakes is capped.  Returns the wrapped socket
+        with blocking mode restored, or None after closing ``sock`` when the handshake
+        cannot complete (refused by the cap, stalled, or failed).
+        """
+        if not _TLS_HANDSHAKE_SLOTS.acquire(blocking=False):
+            log.debug(f"TLS wrap refused for {client_ip}: too many pending handshakes")
+            _close_quietly(sock)
+            return None
+        try:
+            sock.settimeout(float(Config.P2P_TLS_HANDSHAKE_TIMEOUT))
+            wrapped = tls_ctx.wrap_socket(sock, server_side=True)
+        except Exception as e:
+            log.debug(f"TLS wrap failed for {client_ip}: {e}")
+            _close_quietly(sock)
+            return None
+        finally:
+            _TLS_HANDSHAKE_SLOTS.release()
+        wrapped.settimeout(None)
+        return wrapped
+
+    def _tcp_admit_inbound(self, client_ip: str) -> bool:
+        """Per-IP inbound TCP admission window (VSA-09).
+
+        Keyed separately from UDP admissions, so UDP attempts never consume the TCP
+        budget.
+        """
+        now = time.time()
+        with self._lock:
+            window = self._conn_rate[("tcp", client_ip)]
+            while window and (now - window[0]) > self._CONN_RATE_WINDOW:
+                window.popleft()
+            if len(window) >= self._CONN_RATE_LIMIT:
+                log.debug(
+                    f"Inbound rate-limit hit for {client_ip} "
+                    f"({len(window)} conns in {self._CONN_RATE_WINDOW}s)")
+                return False
+            window.append(now)
+        return True
+
     def _handle_inbound(self, sock: socket.socket, addr):
         # addr[0] from an AF_INET6 dual-stack socket may arrive as
         # '::ffff:192.168.1.1' for IPv4 clients.  Normalize it immediately
@@ -994,21 +1136,13 @@ class P2PNetwork:
         client_ip = _normalize_ip(addr[0])
 
         # ── Per-IP inbound connection rate limit ──────────────────────────────
-        now = time.time()
-        with self._lock:
-            window = self._conn_rate[client_ip]
-            while window and (now - window[0]) > self._CONN_RATE_WINDOW:
-                window.popleft()
-            if len(window) >= self._CONN_RATE_LIMIT:
-                log.debug(
-                    f"Inbound rate-limit hit for {client_ip} "
-                    f"({len(window)} conns in {self._CONN_RATE_WINDOW}s)")
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-                return
-            window.append(now)
+        # VSA-09: the TCP window is keyed separately from UDP admissions.
+        if not self._tcp_admit_inbound(client_ip):
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return
 
         # ── Soft Ban: IP ban check (v6.0.0) ──────────────────────────────────
         # Reject inbound connections from IPs that earned a strike-3 ban.
@@ -1026,14 +1160,8 @@ class P2PNetwork:
         # ── TLS wrap inbound socket (Problem #1) ─────────────────────────────
         tls_ctx = TLSManager.server_context()
         if tls_ctx:
-            try:
-                sock = tls_ctx.wrap_socket(sock, server_side=True)
-            except ssl.SSLError as e:
-                log.debug(f"TLS wrap failed for {client_ip}: {e}")
-                try:
-                    sock.close()
-                except Exception:
-                    pass
+            sock = self._wrap_inbound_tls(sock, tls_ctx, client_ip)
+            if sock is None:
                 return
 
             # ── TLS FIX v2 (v6.9.7): Inbound TOFU removed ────────────────────
@@ -1892,12 +2020,35 @@ class P2PNetwork:
         absent (the node will not clean them up proactively — they expire on
         the next read, which is fine for a low-volume table).
         """
+        # VSA-15: UDP sources arrive as IPv4-mapped IPv6 on the dual-stack socket
+        # ("::ffff:1.2.3.4") while individual bans are stored as "1.2.3.4".
+        # Compare in canonical form so both spellings hit the same record.
+        ip = _normalize_ip(ip)
         try:
             raw = self.storage.get_meta(f"ip_ban:{ip}")
+            if raw:
+                record = json.loads(raw)
+                if int(time.time()) < record.get("until", 0):
+                    return True
+        except Exception:
+            pass
+        # VSA-15: a subnet ban written for a repeat offender covers every address in
+        # that /24 (IPv4) or /48 (IPv6), not only the address that was banned.
+        return self._is_subnet_banned(ip)
+
+    def _is_subnet_banned(self, ip: str) -> bool:
+        """True while the subnet record covering ``ip`` is active (VSA-15).
+
+        The writer stores ``subnet_ban:<_ip_subnet(ip)>`` with an ``until`` timestamp.
+        The same key function is used here, so both sides agree on the subnet.
+        Malformed or expired records are not enforced.
+        """
+        try:
+            raw = self.storage.get_meta(f"subnet_ban:{self._ip_subnet(ip)}")
             if not raw:
                 return False
             record = json.loads(raw)
-            return int(time.time()) < record.get("until", 0)
+            return int(time.time()) < int(record.get("until", 0))
         except Exception:
             return False
 
@@ -1955,7 +2106,7 @@ class P2PNetwork:
             # Record IP ban in node_meta with TTL
             try:
                 self.storage.set_meta(
-                    f"ip_ban:{peer.ip}",
+                    f"ip_ban:{_normalize_ip(peer.ip)}",
                     json.dumps({
                         "until":     ban_until,
                         "peer_id":   peer.peer_id,
@@ -2012,14 +2163,21 @@ class P2PNetwork:
 
     @staticmethod
     def _ip_subnet(ip: str) -> str:
-        """F-11: Return /24 subnet for IPv4, /48 subnet for IPv6 (for subnet banning)."""
+        """F-11 / VSA-15: /24 subnet for IPv4, /48 subnet for IPv6 (for subnet banning).
+
+        Keys come from canonical address forms, so every textual spelling of an address
+        in the same subnet maps to the same ban record.  IPv4-mapped IPv6 addresses use
+        the IPv4 subnet.
+        """
         try:
-            if ':' in ip:  # IPv6
-                parts = ip.split(':')
-                return ':'.join(parts[:3]) + '::/48'
-            else:           # IPv4
-                parts = ip.split('.')
-                return '.'.join(parts[:3]) + '.0/24'
+            addr = ipaddress.ip_address(ip)
+            if addr.version == 6 and addr.ipv4_mapped is not None:
+                addr = addr.ipv4_mapped
+            if addr.version == 6:
+                groups = addr.exploded.split(":")
+                return ":".join(groups[:3]) + "::/48"
+            octets = str(addr).split(".")
+            return ".".join(octets[:3]) + ".0/24"
         except Exception:
             return ip
 
@@ -4347,7 +4505,9 @@ class P2PNetwork:
             # We attempt UDP first; on any error we fall through to TCP without
             # logging a failure so the user experience is seamless.
             try:
-                _udp_ok = self._udp_connect_to(ip, port)
+                # VSA-10: one budget bounds the UDP stage and the CGNAT retry below.
+                _attempt_deadline = time.monotonic() + Config.P2P_CONNECT_BUDGET_SECS
+                _udp_ok = self._udp_connect_to(ip, port, deadline=_attempt_deadline)
                 if _udp_ok:
                     with self._outbound_fail_lock:
                         self._outbound_fail.pop(ip, None)
@@ -4382,7 +4542,8 @@ class P2PNetwork:
             # operators intentionally forward through their NAT/firewall.
             # We do NOT apply this for IPv6 peers — their ports are routable.
             if (port != Config.DEFAULT_PORT
-                    and not _is_ipv6_address(ip)):
+                    and not _is_ipv6_address(ip)
+                    and time.monotonic() < _attempt_deadline):
                 log.debug(
                     f"[P2P] IPv4 CGNAT fallback: retrying "
                     f"{ip} on DEFAULT_PORT {Config.DEFAULT_PORT}")
@@ -4715,7 +4876,8 @@ class P2PNetwork:
     def _reconnect_loop(self):
         _sync_tick = 0
         while self._running:
-            time.sleep(Config.RECONNECT_INTERVAL)
+            import random as _rnd  # VSA-10: jittered reconnect
+            time.sleep(Config.RECONNECT_INTERVAL * _rnd.uniform(0.75, 1.25))
             count = len(self.active_peer_count())
             if count < Config.MIN_PEERS:
                 log.debug(f"Only {count} peers, reconnecting...")

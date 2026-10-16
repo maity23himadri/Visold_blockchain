@@ -490,9 +490,13 @@ class Block:
         solve time because doing so could regress below the MTP and cause the
         block to fail validate_block()'s timestamp check.
 
-        Timestamp is only advanced — never regressed — during the mining loop.
-        The refresh at TIMESTAMP_REFRESH_INTERVAL increments the timestamp when
-        time has moved forward but never moves it backward.
+        The timestamp is fixed for the lifetime of a candidate (VSA-28).  Its state
+        root was computed at that timestamp, and transaction validity and
+        TIMESTAMP-dependent contract state are judged against it, so the header
+        is never moved during the search.  Validators accept a timestamp that
+        trails the wall clock (only the future-drift and MTP rules apply), and the
+        mining engine's stale-candidate watchdog rebuilds any candidate that runs
+        past MINING_STALE_CANDIDATE_TIMEOUT.
 
         Minimum nonce iterations
         ─────────────────────────
@@ -526,10 +530,9 @@ class Block:
 
             # Advance timestamp when enough nonces have elapsed, but ONLY
             # forward — preserve the MTP-safe floor set at block construction.
+            # VSA-28: no timestamp refresh here.  Moving the header timestamp would
+            # invalidate the state root computed for it (see the docstring above).
             if nonces_since_refresh >= TIMESTAMP_REFRESH_INTERVAL:
-                new_ts = int(time.time())
-                if new_ts > self.timestamp:   # only advance, never regress
-                    self.timestamp = new_ts
                 nonces_since_refresh = 0
 
             self.block_hash = self.compute_hash()

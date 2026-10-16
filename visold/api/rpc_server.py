@@ -38,7 +38,7 @@ from visold.kernel.config import Config
 from visold.kernel.events import Event, EventType
 from visold.kernel.logging_setup import log
 from visold.kernel.metrics import metrics
-from visold.kernel.units import from_satoshi, to_satoshi
+from visold.kernel.units import from_satoshi, gas_fee_to_sat, to_satoshi
 from visold.ledger.transaction import Transaction
 from visold.mempool.mev import _mev_mempool
 from visold.network.capabilities import (
@@ -732,6 +732,14 @@ class RPCServer:
                     pending_cnt = len(node.blockchain.mempool._pending_nonces.get(sender, set()))
                     nonce       = chain_nonce + pending_cnt
                     fee         = round(gas_limit * gas_price, 8)
+                    # VSA-27: server-side spendability check including the gas budget.
+                    _reg, _xfer, _pfee = node.blockchain.mempool.pending_outflow_sat(sender)
+                    _required = to_satoshi(call_value) + gas_fee_to_sat(gas_limit, gas_price)
+                    _spendable = node.storage.get_balance_sat(sender) - _reg - _xfer - _pfee
+                    if _spendable < _required:
+                        raise ValueError(
+                            f"insufficient spendable balance for the gas budget: need "
+                            f"{_required} sat, have {_spendable} sat")
                     tx = Transaction(
                         sender    = sender,
                         receiver  = "",   # empty for deploy
@@ -783,6 +791,14 @@ class RPCServer:
                     pending_cnt = len(node.blockchain.mempool._pending_nonces.get(sender, set()))
                     nonce       = chain_nonce + pending_cnt
                     fee         = round(gas_limit * gas_price, 8)
+                    # VSA-27: server-side spendability check including the gas budget.
+                    _reg, _xfer, _pfee = node.blockchain.mempool.pending_outflow_sat(sender)
+                    _required = to_satoshi(call_value) + gas_fee_to_sat(gas_limit, gas_price)
+                    _spendable = node.storage.get_balance_sat(sender) - _reg - _xfer - _pfee
+                    if _spendable < _required:
+                        raise ValueError(
+                            f"insufficient spendable balance for the gas budget: need "
+                            f"{_required} sat, have {_spendable} sat")
                     tx = Transaction(
                         sender    = sender,
                         receiver  = contract_addr,

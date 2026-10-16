@@ -33,6 +33,12 @@ from typing import Dict
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 1: CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
+# Apply outcome for a block that is already applied (idempotent duplicate).
+# Returned by Blockchain.apply_block(); the hardened apply wrapper must not compare
+# such a block's historical state root against the current tip (VSA-04).
+BLOCK_ALREADY_APPLIED_MSG = "Block already applied (idempotent duplicate)"
+
+
 class Config:
     # Coin
     COIN_NAME           = "Visold"
@@ -575,6 +581,7 @@ class Config:
     PEER_STORAGE        = 1000
     GOSSIP_TTL          = 8
     PEER_TIMEOUT        = 15           # seconds
+    P2P_CONNECT_BUDGET_SECS = 30.0   # VSA-10: total budget for one outbound attempt
     PEER_MAX_FAIL       = 3
     PEER_DECAY_SECS     = 3600
     PEX_INTERVAL        = 60
@@ -673,6 +680,19 @@ class Config:
     # upgrade from retroactively rejecting already-finalized blocks.
     ROLE_STAKE_MIN_ACTIVATION_HEIGHT: int = 0
     VVM_BLOCK_GAS_LIMIT_ACTIVATION_HEIGHT: int = 0
+
+    # VSA-03: legacy empty state_root window.  A block whose declared state_root
+    # is "" (pre-v7.1.9 candidate form) is accepted only when its index is below
+    # this height.  Fresh chains keep 0, so no empty-root block after genesis is
+    # accepted.  A live chain that still contains pre-v7.1.9 blocks must set this
+    # to a coordinated upgrade height BEFORE upgrading, or it will reject them.
+    EMPTY_STATE_ROOT_LEGACY_END_HEIGHT: int = 0
+
+    # VSA-18: inbound TLS handshake bound and concurrency cap.  A handshake that
+    # stalls is closed after this many seconds; at most this many unauthenticated
+    # handshakes run at once.
+    P2P_TLS_HANDSHAKE_TIMEOUT: float = 10.0
+    P2P_MAX_PENDING_TLS_HANDSHAKES: int = 64
 
     # ── v7.1.17 TX-ID V2 ACTIVATION HEIGHT ───────────────────────────────────
     # Blocks at height >= this value use the V2 tx_id rule: sha256(full data)

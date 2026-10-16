@@ -162,6 +162,23 @@ def _create_dual_stack_server_socket(port: int,
         return srv
 
 
+def wildcard_for_family(family: int, requested: Optional[str] = None) -> str:
+    """Return the bind address to use for a socket of ``family`` (VSA-12).
+
+    An unset address, or the IPv6 wildcard "::", means all interfaces for the family:
+    "::" for AF_INET6 and "0.0.0.0" for AF_INET.  A concrete IPv4 literal is returned
+    unchanged for an AF_INET socket.  A concrete IPv6 literal cannot be bound by an
+    AF_INET socket, so that combination is refused explicitly.
+    """
+    if family == socket.AF_INET:
+        if not requested or requested == "::":
+            return "0.0.0.0"
+        if ":" in requested:
+            raise ValueError(f"cannot bind an IPv4 socket to IPv6 address {requested!r}")
+        return requested
+    return requested or "::"
+
+
 def _create_connection_dual_stack(host: str, port: int,
                                    timeout: Optional[float] = None) -> socket.socket:
     """

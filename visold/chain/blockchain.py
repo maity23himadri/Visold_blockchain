@@ -39,7 +39,7 @@ from visold.economics.monitor import EconomicMonitor
 from visold.governance.engine import GovernanceEngine
 from visold.governance.versioning import ProtocolVersionManager
 from visold.kernel.clock import network_clock
-from visold.kernel.config import Config
+from visold.kernel.config import BLOCK_ALREADY_APPLIED_MSG, Config
 from visold.kernel.logging_setup import log
 from visold.kernel.metrics import metrics
 from visold.kernel.units import bft_threshold_met, from_satoshi, gas_fee_to_sat, to_satoshi
@@ -74,6 +74,27 @@ if TYPE_CHECKING:  # annotation-only references (no runtime import, no cycle)
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 8: BLOCKCHAIN (CHAIN MANAGEMENT + REORG + HYBRID DIFFICULTY)
 # ─────────────────────────────────────────────────────────────────────────────
+class CandidateTxRejected(RuntimeError):
+    """A candidate transaction cannot execute at its position in a candidate list.
+
+    Raised by the candidate precheck and by dry_run_state_root() so the candidate
+    builder can identify the exact offending transaction by its position (VSA-19:
+    no parsing of truncated sender strings).  ``index`` is the position in the
+    sequence that was passed in; the coinbase is at index 0.  Subclassing
+    RuntimeError keeps existing ``except RuntimeError`` callers working.
+    """
+
+    def __init__(self, index: int, tx: 'Transaction', reason: str):
+        self.index = int(index)
+        self.tx_id = str(getattr(tx, "tx_id", "") or "")
+        self.sender = str(getattr(tx, "sender", "") or "")
+        self.nonce = getattr(tx, "nonce", None)
+        self.reason = str(reason)
+        super().__init__(
+            f"candidate tx #{self.index} {self.tx_id[:12]} "
+            f"(sender {self.sender[:12]}, nonce {self.nonce}) rejected: {self.reason}")
+
+
 class Blockchain:
     def __init__(self, storage: Storage):
         self.storage        = storage
@@ -82,6 +103,12 @@ class Blockchain:
         # In-memory guard closes the small window between a successful
         # apply_block() return and the caller's durable block_apply marker.
         self._applied_block_hashes: set[str] = set()
+        # VSA-26: a chain whose reorg left it partially mutated refuses writes until
+        # an operator repairs it and clears the persisted marker.
+        self._critical_recovery: Optional[str] = (
+            storage.get_meta("chain_recovery_required") or None)
+        # VSA-24: the tip's applied marker is reconciled once per process, before writes.
+        self._tip_marker_checked = False
         self._genesis_hash  = None
         # AUDIT-FIX (Batch D): incrementally-tracked replacement for the old
         # bounded finality-fence scan in reorg()/accept_chain(). See
@@ -815,117 +842,10 @@ class Blockchain:
             }
             preblock_balances = self.storage.get_balances_sat(sender_addresses)
 
-            # Consensus-level stake lock.  REGISTER mutations are intentionally
-            # applied only after reward distribution, so the stake visible in
-            # the pre-block state remains locked for every transaction in this
-            # block.  Effective positive REGISTER deltas are also reserved:
-            # the stake is not transferred away, but it becomes locked when the
-            # deferred role mutation is applied at the end of the block.
-            #
-            # This shadow state mirrors the exact guards in apply_block:
-            # identity claims have no role effect, opposite roles are ignored,
-            # slashed validators cannot re-register, and "none" clears the
-            # role.  Keeping this simulation here (rather than merely reading
-            # the current stake) prevents a block from spending funds that a
-            # later REGISTER in the same block will lock.
-            locked_stake_reserve: Dict[str, int] = {}
-            role_shadow: Dict[str, Optional[dict]] = {}
-            for tx in block.transactions:
-                if tx.tx_type != Transaction.TYPE_REGISTER or tx.sender == "COINBASE":
-                    continue
-                if Transaction.is_identity_claim(tx):
-                    continue
-                if tx.sender not in role_shadow:
-                    role_shadow[tx.sender] = self.storage.get_role(tx.sender)
-
-            for addr, role_existing in role_shadow.items():
-                if role_existing and role_existing.get("role") in ("miner", "investor"):
-                    locked_stake_reserve[addr] = to_satoshi(
-                        float(role_existing.get("stake", 0.0)))
-                else:
-                    locked_stake_reserve[addr] = 0
-
-            # Start with every currently active role, not only addresses that
-            # submit REGISTER transactions in this block.
-            for existing_role_name in ("miner", "investor"):
-                for r in self.storage.get_all_by_role(existing_role_name):
-                    addr = r.get("address")
-                    if addr:
-                        locked_stake_reserve[addr] = to_satoshi(
-                            float(r.get("stake", 0.0)))
-
-            # Re-simulate only the REGISTER mutations that can actually take
-            # effect at the end of this block and add their positive stake
-            # deltas to the lock reserve.
-            #
-            # A REGISTER that creates or changes into a role is an initial
-            # registration and must carry the role's configured minimum stake.
-            # Once that role is already active, later REGISTERs are additive
-            # top-ups and may be any positive amount.  This check lives here,
-            # with the canonical pre-block/in-block role state, because
-            # Transaction.is_valid() intentionally has no storage context.
-            role_stake_activation = int(getattr(
-                Config, "ROLE_STAKE_MIN_ACTIVATION_HEIGHT", 0))
-            # Preserve the existing same-block UNREGISTER → REGISTER semantics:
-            # an address that already had an active role at block start may
-            # clear it and establish a new same-role stake in this block.  The
-            # legacy tests/protocol deliberately permit that re-registration
-            # amount to be arbitrary positive stake, while a genuinely new
-            # activation is subject to the configured minimum.
-            same_block_reentry: set[str] = set()
-            for tx in block.transactions:
-                if tx.tx_type != Transaction.TYPE_REGISTER or tx.sender == "COINBASE":
-                    continue
-                if Transaction.is_identity_claim(tx):
-                    continue
-                role = (tx.memo or "").strip().lower()
-                if role not in ("miner", "investor", "none"):
-                    role = "none"
-                current = role_shadow.get(tx.sender)
-                if role == "none":
-                    # The previous role's stake becomes spendable again at the
-                    # end of this block. Keep the reserve in lockstep with the
-                    # shadow role state. A slash marker, however, is permanent
-                    # through an ordinary unregister and must survive this
-                    # transition so a later REGISTER cannot self-unslash.
-                    if current and current.get("role") in ("miner", "investor"):
-                        same_block_reentry.add(tx.sender)
-                    locked_stake_reserve[tx.sender] = 0
-                    was_slashed = bool(current and current.get("slashed"))
-                    role_shadow[tx.sender] = {
-                        "role": "none", "stake": 0.0, "slashed": was_slashed
-                    }
-                    continue
-                if current and current.get("role") == "miner" and role == "investor":
-                    continue
-                if current and current.get("role") == "investor" and role == "miner":
-                    continue
-                if current and current.get("slashed"):
-                    continue
-                same_role = bool(current and current.get("role") == role)
-                if (block.index >= role_stake_activation
-                        and not same_role
-                        and tx.sender not in same_block_reentry):
-                    minimum_sat = (
-                        int(Config.MIN_MINER_STAKE)
-                        if role == "miner"
-                        else int(Config.MIN_INVESTOR_STAKE)
-                    )
-                    tx_stake_sat = to_satoshi(float(tx.amount))
-                    if tx_stake_sat < minimum_sat:
-                        return False, (
-                            f"REGISTER({role}) stake below minimum: "
-                            f"{from_satoshi(tx_stake_sat):.8f} VSD "
-                            f"(minimum {from_satoshi(minimum_sat):.8f} VSD)")
-                cur_stake = float(current.get("stake", 0.0)) if same_role else 0.0
-                delta_sat = to_satoshi(float(tx.amount))
-                locked_stake_reserve[tx.sender] = (
-                    locked_stake_reserve.get(tx.sender, 0) + max(0, delta_sat))
-                role_shadow[tx.sender] = {
-                    "role": role,
-                    "stake": cur_stake + float(tx.amount),
-                    "slashed": False,
-                }
+            locked_stake_reserve, _stake_err, _stake_tx = self._compute_block_stake_locks(
+                block.transactions, block.index)
+            if _stake_err is not None:
+                return False, _stake_err
 
             for tx in block.transactions:
                 if tx.sender == "COINBASE":
@@ -1107,6 +1027,252 @@ class Blockchain:
 
             return True, "OK"
 
+    def _compute_block_stake_locks(self, transactions: List['Transaction'],
+                                   block_index: int):
+        """Consensus stake-lock reserve for one block (VSA-20).
+
+        Shared by validate_block() and the candidate precheck, so candidate
+        spendability is computed by exactly the same rules as consensus.
+        Returns ``(locked_stake_reserve, error, offending_tx)``; ``error`` is
+        None when the stake rules hold, otherwise ``offending_tx`` is the
+        REGISTER transaction that violates them.
+
+        REGISTER mutations apply only after reward distribution, so pre-block
+        stake stays locked for every transaction in the block, and effective
+        positive REGISTER deltas are reserved as well.
+        """
+        # Consensus-level stake lock.  REGISTER mutations are intentionally
+        # applied only after reward distribution, so the stake visible in
+        # the pre-block state remains locked for every transaction in this
+        # block.  Effective positive REGISTER deltas are also reserved:
+        # the stake is not transferred away, but it becomes locked when the
+        # deferred role mutation is applied at the end of the block.
+        #
+        # This shadow state mirrors the exact guards in apply_block:
+        # identity claims have no role effect, opposite roles are ignored,
+        # slashed validators cannot re-register, and "none" clears the
+        # role.  Keeping this simulation here (rather than merely reading
+        # the current stake) prevents a block from spending funds that a
+        # later REGISTER in the same block will lock.
+        locked_stake_reserve: Dict[str, int] = {}
+        role_shadow: Dict[str, Optional[dict]] = {}
+        for tx in transactions:
+            if tx.tx_type != Transaction.TYPE_REGISTER or tx.sender == "COINBASE":
+                continue
+            if Transaction.is_identity_claim(tx):
+                continue
+            if tx.sender not in role_shadow:
+                role_shadow[tx.sender] = self.storage.get_role(tx.sender)
+
+        for addr, role_existing in role_shadow.items():
+            if role_existing and role_existing.get("role") in ("miner", "investor"):
+                locked_stake_reserve[addr] = to_satoshi(
+                    float(role_existing.get("stake", 0.0)))
+            else:
+                locked_stake_reserve[addr] = 0
+
+        # Start with every currently active role, not only addresses that
+        # submit REGISTER transactions in this block.
+        for existing_role_name in ("miner", "investor"):
+            for r in self.storage.get_all_by_role(existing_role_name):
+                addr = r.get("address")
+                if addr:
+                    locked_stake_reserve[addr] = to_satoshi(
+                        float(r.get("stake", 0.0)))
+
+        # Re-simulate only the REGISTER mutations that can actually take
+        # effect at the end of this block and add their positive stake
+        # deltas to the lock reserve.
+        #
+        # A REGISTER that creates or changes into a role is an initial
+        # registration and must carry the role's configured minimum stake.
+        # Once that role is already active, later REGISTERs are additive
+        # top-ups and may be any positive amount.  This check lives here,
+        # with the canonical pre-block/in-block role state, because
+        # Transaction.is_valid() intentionally has no storage context.
+        role_stake_activation = int(getattr(
+            Config, "ROLE_STAKE_MIN_ACTIVATION_HEIGHT", 0))
+        # Preserve the existing same-block UNREGISTER → REGISTER semantics:
+        # an address that already had an active role at block start may
+        # clear it and establish a new same-role stake in this block.  The
+        # legacy tests/protocol deliberately permit that re-registration
+        # amount to be arbitrary positive stake, while a genuinely new
+        # activation is subject to the configured minimum.
+        same_block_reentry: set[str] = set()
+        for tx in transactions:
+            if tx.tx_type != Transaction.TYPE_REGISTER or tx.sender == "COINBASE":
+                continue
+            if Transaction.is_identity_claim(tx):
+                continue
+            role = (tx.memo or "").strip().lower()
+            if role not in ("miner", "investor", "none"):
+                role = "none"
+            current = role_shadow.get(tx.sender)
+            if role == "none":
+                # The previous role's stake becomes spendable again at the
+                # end of this block. Keep the reserve in lockstep with the
+                # shadow role state. A slash marker, however, is permanent
+                # through an ordinary unregister and must survive this
+                # transition so a later REGISTER cannot self-unslash.
+                if current and current.get("role") in ("miner", "investor"):
+                    same_block_reentry.add(tx.sender)
+                locked_stake_reserve[tx.sender] = 0
+                was_slashed = bool(current and current.get("slashed"))
+                role_shadow[tx.sender] = {
+                    "role": "none", "stake": 0.0, "slashed": was_slashed
+                }
+                continue
+            if current and current.get("role") == "miner" and role == "investor":
+                continue
+            if current and current.get("role") == "investor" and role == "miner":
+                continue
+            if current and current.get("slashed"):
+                continue
+            same_role = bool(current and current.get("role") == role)
+            if (block_index >= role_stake_activation
+                    and not same_role
+                    and tx.sender not in same_block_reentry):
+                minimum_sat = (
+                    int(Config.MIN_MINER_STAKE)
+                    if role == "miner"
+                    else int(Config.MIN_INVESTOR_STAKE)
+                )
+                tx_stake_sat = to_satoshi(float(tx.amount))
+                if tx_stake_sat < minimum_sat:
+                    _err_msg = (
+                        f"REGISTER({role}) stake below minimum: "
+                        f"{from_satoshi(tx_stake_sat):.8f} VSD "
+                        f"(minimum {from_satoshi(minimum_sat):.8f} VSD)")
+                    return {}, _err_msg, tx
+            cur_stake = float(current.get("stake", 0.0)) if same_role else 0.0
+            delta_sat = to_satoshi(float(tx.amount))
+            locked_stake_reserve[tx.sender] = (
+                locked_stake_reserve.get(tx.sender, 0) + max(0, delta_sat))
+            role_shadow[tx.sender] = {
+                "role": role,
+                "stake": cur_stake + float(tx.amount),
+                "slashed": False,
+            }
+
+        return locked_stake_reserve, None, None
+
+    def _candidate_precheck(self, transactions: List['Transaction'],
+                            block_index: int, block_timestamp: int) -> None:
+        """Raise CandidateTxRejected for the first transaction validate_block() would reject.
+
+        VSA-19 / VSA-20 / VSA-27 / VSA-07 / VSA-01.  A candidate whose root is
+        computed for a transaction that consensus rejects can never be applied, so
+        the candidate builder runs this read-only check before every dry run.  It
+        applies validate_block()'s per-transaction rules in the same order, using
+        the same stake-lock helper, and stops at the first failing transaction.
+
+        Mirrored rules: tx validity at the block timestamp (signatures are assumed
+        verified at mempool admission); no duplicate tx_id; no replay of an applied
+        tx_id; expiry=0 where required; strict per-sender nonce sequencing; the
+        spendable balance (pre-block balance minus earlier pending debits minus
+        active stake locks); REGISTER minimum stake; the aggregate VVM block gas
+        cap; and the L2 withdrawal preconditions that apply_block() enforces, with
+        cumulative L2 and bridge-escrow deltas.  Contract-target existence for CALL
+        transactions is not mirrored here.
+        """
+        if not any(tx.sender != "COINBASE" for tx in transactions):
+            return
+        locked, stake_err, stake_tx = self._compute_block_stake_locks(
+            transactions, block_index)
+        if stake_err is not None:
+            pos = next((i for i, t in enumerate(transactions) if t is stake_tx), 0)
+            raise CandidateTxRejected(pos, stake_tx, stake_err)
+
+        candidates = [tx for tx in transactions if tx.sender != "COINBASE"]
+        preblock = self.storage.get_balances_sat({tx.sender for tx in candidates})
+        applied_ids = self.storage.existing_tx_ids([tx.tx_id for tx in candidates])
+        strict_nonce = block_index >= int(Config.NONCE_STRICT_ACTIVATION_HEIGHT)
+        expiry_required = block_index >= int(Config.EXPIRY_REQUIRED_ACTIVATION_HEIGHT)
+        gas_cap_active = block_index >= int(
+            getattr(Config, "VVM_BLOCK_GAS_LIMIT_ACTIVATION_HEIGHT", 0))
+        gas_cap = int(Config.VVM_BLOCK_GAS_LIMIT)
+
+        pending: Dict[str, int] = {}
+        expected_nonce: Dict[str, int] = {}
+        seen: Set[str] = set()
+        block_gas = 0
+        l2_spent: Dict[str, int] = {}
+        bridge_spent = 0
+
+        for pos, tx in enumerate(transactions):
+            if tx.sender == "COINBASE":
+                continue
+            if tx.tx_id in seen:
+                raise CandidateTxRejected(pos, tx, "duplicate tx_id in candidate")
+            seen.add(tx.tx_id)
+            ok, msg = tx.is_valid(
+                reference_time=block_timestamp,
+                block_height=block_index,
+                signature_already_verified=True,
+            )
+            if not ok:
+                raise CandidateTxRejected(pos, tx, f"invalid transaction: {msg}")
+            if expiry_required and tx.expiry == 0:
+                raise CandidateTxRejected(
+                    pos, tx, "expiry=0 not permitted for non-coinbase transactions")
+            if tx.tx_id in applied_ids:
+                raise CandidateTxRejected(pos, tx, "transaction already applied (double-spend)")
+            if strict_nonce:
+                want = expected_nonce.get(tx.sender)
+                if want is None:
+                    want = self.storage.get_nonce(tx.sender)
+                if tx.nonce != want:
+                    raise CandidateTxRejected(
+                        pos, tx, f"nonce mismatch: has {tx.nonce}, expected {want}")
+                expected_nonce[tx.sender] = want + 1
+
+            already = pending.get(tx.sender, 0)
+            available = preblock.get(tx.sender, 0) - already - locked.get(tx.sender, 0)
+            if tx.tx_type in (Transaction.TYPE_DEPLOY, Transaction.TYPE_CALL):
+                if gas_cap_active:
+                    block_gas += int(tx.gas_limit)
+                    if block_gas > gas_cap:
+                        raise CandidateTxRejected(
+                            pos, tx,
+                            f"block VVM gas limit exceeded: {block_gas} (max {gas_cap})")
+                required = to_satoshi(tx.amount) + gas_fee_to_sat(tx.gas_limit, tx.gas_price)
+                if available < required:
+                    raise CandidateTxRejected(
+                        pos, tx,
+                        f"insufficient spendable balance for VVM tx: need {required} sat, "
+                        f"have {available} sat")
+            elif tx.tx_type == Transaction.TYPE_REGISTER:
+                required = tx.compute_fee_sat()
+                if available < required:
+                    raise CandidateTxRejected(
+                        pos, tx, "insufficient spendable balance for REGISTER fee")
+            else:
+                required = to_satoshi(tx.amount) + tx.compute_fee_sat()
+                if available < required:
+                    raise CandidateTxRejected(
+                        pos, tx,
+                        f"insufficient spendable balance: need {required} sat, "
+                        f"have {available} sat")
+            pending[tx.sender] = already + required
+
+            if tx.tx_type not in (Transaction.TYPE_DEPLOY, Transaction.TYPE_CALL,
+                                  Transaction.TYPE_REGISTER, Transaction.TYPE_ROLLUP):
+                amount_sat = to_satoshi(tx.amount)
+                if amount_sat > 0 and tx.receiver == L2_WITHDRAW_ADDRESS:
+                    layer2 = getattr(self, "layer2", None)
+                    if layer2 is None:
+                        raise CandidateTxRejected(pos, tx, "L2 subsystem not initialised")
+                    l2_free = layer2.get_balance_sat(tx.sender) - l2_spent.get(tx.sender, 0)
+                    if l2_free < amount_sat:
+                        raise CandidateTxRejected(
+                            pos, tx, "insufficient L2 balance for withdrawal")
+                    bridge_free = self.storage.get_balance_sat(L2_BRIDGE_ADDRESS) - bridge_spent
+                    if bridge_free < amount_sat:
+                        raise CandidateTxRejected(
+                            pos, tx, "insufficient L2 bridge escrow for withdrawal")
+                    l2_spent[tx.sender] = l2_spent.get(tx.sender, 0) + amount_sat
+                    bridge_spent += amount_sat
+
     # ── Dry-run state root (v7.1.9 — Option A fix) ────────────────────────────
     def dry_run_state_root(self,
                            transactions: List['Transaction'],
@@ -1261,7 +1427,8 @@ class Blockchain:
 
         try:
             fee_pool_sat = 0
-            for tx in transactions:
+            _l2_spent: Dict[str, int] = {}   # VSA-01: earlier withdrawals per sender
+            for _tx_idx, tx in enumerate(transactions):
                 if tx.sender == "COINBASE":
                     continue
 
@@ -1271,12 +1438,11 @@ class Blockchain:
                     amount_sat      = to_satoshi(tx.amount)
                     total_upfront   = amount_sat + max_gas_fee_sat
 
-                    # Debit upfront (mirrors _apply_vvm_tx step 1).
-                    # If the sender can't afford it, skip this tx — same as
-                    # apply_block does (it debits upfront and returns (0, False)
-                    # on failure without adding to fee_pool).
+                    # Debit upfront (mirrors _apply_vvm_tx step 1).  VSA-01: a candidate
+                    # transaction that cannot pay its upfront cost is rejected, never skipped:
+                    # validate_block() rejects any block that contains it.
                     if not self.storage.debit_sat(tx.sender, total_upfront):
-                        continue
+                        raise CandidateTxRejected(_tx_idx, tx, "insufficient balance for VVM upfront debit")
 
                     # AUDIT-FIX-1 (state_root divergence): SC-NAME-1 gate,
                     # mirrored from _apply_vvm_tx via the shared
@@ -1478,7 +1644,7 @@ class Blockchain:
                                 self.storage.credit_sat(_addr, _delta)
                             else:
                                 if not self.storage.debit_sat(_addr, -_delta):
-                                    raise RuntimeError(
+                                    raise CandidateTxRejected(_tx_idx, tx, 
                                         f"dry-run VVM balance overlay debit failed for {_addr[:16]}")
                             touched.add(_addr)
 
@@ -1489,7 +1655,7 @@ class Blockchain:
                         # beneficiary credit and retained the source balance.
                         for _sd_transfer in result.self_destruct_transfers:
                             if len(_sd_transfer) != 3:
-                                raise RuntimeError(
+                                raise CandidateTxRejected(_tx_idx, tx, 
                                     "SELFDESTRUCT transfer record is missing its source")
                             _source_addr, _beneficiary_addr, _sd_amount = _sd_transfer
                             _sd_amount = int(_sd_amount)
@@ -1498,7 +1664,7 @@ class Blockchain:
                             _snapshot_dry_run_account(_source_addr)
                             _snapshot_dry_run_account(_beneficiary_addr)
                             if not self.storage.debit_sat(_source_addr, _sd_amount):
-                                raise RuntimeError(
+                                raise CandidateTxRejected(_tx_idx, tx, 
                                     f"dry-run SELFDESTRUCT source {_source_addr[:16]} "
                                     f"has insufficient balance for {_sd_amount} sat")
                             self.storage.credit_sat(_beneficiary_addr, _sd_amount)
@@ -1566,7 +1732,7 @@ class Blockchain:
                     fee_sat = tx.compute_fee_sat()
                     if fee_sat > 0:
                         if not self.storage.debit_sat(tx.sender, fee_sat):
-                            raise RuntimeError(
+                            raise CandidateTxRejected(_tx_idx, tx, 
                                 f"dry-run REGISTER fee debit failed "
                                 f"for {tx.sender[:12]}")
                         fee_pool_sat += fee_sat
@@ -1595,7 +1761,7 @@ class Blockchain:
                     fee_sat = tx.compute_fee_sat()  # 0 by validation
                     if fee_sat > 0:
                         if not self.storage.debit_sat(tx.sender, fee_sat):
-                            raise RuntimeError(
+                            raise CandidateTxRejected(_tx_idx, tx, 
                                 f"dry-run ROLLUP fee debit failed "
                                 f"for {tx.sender[:12]}")
                         fee_pool_sat += fee_sat
@@ -1611,7 +1777,7 @@ class Blockchain:
                     # Same balance check that apply_block does — if it would
                     # fail there, it fails here, and the candidate-builder
                     # should drop this tx from the candidate.
-                    raise RuntimeError(f"dry-run debit failed for {tx.sender[:12]}")
+                    raise CandidateTxRejected(_tx_idx, tx, f"dry-run debit failed for {tx.sender[:12]}")
                 # AUDIT-FIX (Batch D): broadcasting to VSD_GLOBAL_MARKET used
                 # to skip crediting the amount anywhere -- destroying it
                 # outright, which get_burned_satoshi()'s own docstring says
@@ -1645,22 +1811,25 @@ class Blockchain:
                 # NOT affect compute_state_root() — only the L1 balance
                 # changes matter here.
                 if tx.receiver == L2_WITHDRAW_ADDRESS and amount_sat > 0:
+                    # VSA-01: a withdrawal apply_block() would reject must reject the candidate
+                    # transaction here as well.  Earlier withdrawals in this list count against
+                    # the sender's L2 balance (_l2_spent).
                     layer2 = getattr(self, "layer2", None)
-                    if layer2 is not None:
-                        l2_bal = layer2.get_balance_sat(tx.sender)
-                        bridge_bal = self.storage.get_balance_sat(
-                            L2_BRIDGE_ADDRESS)
-                        if l2_bal >= amount_sat and bridge_bal >= amount_sat:
-                            # Mirror the escrow debit + sender credit that
-                            # apply_block will execute.  Do NOT touch the L2
-                            # tree here — dry_run must be side-effect-free on
-                            # Layer2State (the finally block only restores
-                            # storage accounts, not L2 tree mutations).
-                            self.storage.debit_sat(L2_BRIDGE_ADDRESS, amount_sat)
-                            self.storage.credit_sat(tx.sender, amount_sat)
-                            # Add L2_BRIDGE_ADDRESS to touched so it's included
-                            # in the snapshot restore at the end of the dry-run.
-                            touched.add(L2_BRIDGE_ADDRESS)
+                    if layer2 is None:
+                        raise CandidateTxRejected(_tx_idx, tx, "L2 subsystem not initialised")
+                    l2_bal = layer2.get_balance_sat(tx.sender) - _l2_spent.get(tx.sender, 0)
+                    bridge_bal = self.storage.get_balance_sat(L2_BRIDGE_ADDRESS)
+                    if l2_bal < amount_sat:
+                        raise CandidateTxRejected(_tx_idx, tx, "insufficient L2 balance for withdrawal")
+                    if bridge_bal < amount_sat:
+                        raise CandidateTxRejected(_tx_idx, tx, "insufficient L2 bridge escrow for withdrawal")
+                    _l2_spent[tx.sender] = _l2_spent.get(tx.sender, 0) + amount_sat
+                    # Mirror the escrow debit and sender credit that apply_block() executes.
+                    # The L2 tree itself is not touched: dry_run must stay side-effect-free on
+                    # Layer2State (the finally block restores only storage accounts).
+                    self.storage.debit_sat(L2_BRIDGE_ADDRESS, amount_sat)
+                    self.storage.credit_sat(tx.sender, amount_sat)
+                    touched.add(L2_BRIDGE_ADDRESS)
                 fee_pool_sat += fee_sat
                 cur_nonce = self.storage.get_nonce(tx.sender)
                 self.storage.set_nonce(tx.sender, max(cur_nonce, tx.nonce + 1))
@@ -2152,29 +2321,58 @@ class Blockchain:
         after that PostgreSQL transaction commits.  Startup reconciliation
         removes RocksDB blocks above the committed PGX tip after a crash.
         """
-        atomic_storage = self.storage
-        if getattr(atomic_storage, "_pgx_enabled", False):
-            with atomic_storage.pgx_atomic_block() as pgx_tx:
-                result = self._apply_block_unwrapped(block)
-                if result[0] and pgx_tx is not None:
-                    pgx_tx["commit"] = True
-            return result
+        # VSA-02 lock order: Blockchain._lock is always acquired BEFORE the SQLite
+        # atomic-block lock (storage._sqlite_api_lock, held from
+        # begin_sqlite_atomic_block() until commit/rollback).  Candidate construction
+        # holds _lock while it reads storage; taking the storage lock first and then
+        # waiting for _lock here formed a circular wait.  The chain lock now spans
+        # the whole atomic apply, from begin through commit.
+        with self._lock:
+            self._reconcile_tip_marker()
+            if self._critical_recovery:
+                return False, (
+                    f"Block rejected: chain requires operator recovery "
+                    f"({self._critical_recovery})")
+            atomic_storage = self.storage
+            if getattr(atomic_storage, "_pgx_enabled", False):
+                with atomic_storage.pgx_atomic_block() as pgx_tx:
+                    result = self._apply_block_unwrapped(block)
+                    if result[0] and pgx_tx is not None:
+                        pgx_tx["commit"] = True
+                if result[0]:
+                    self._applied_block_hashes.add(block.block_hash)
+                return result
 
-        atomic_started = False
-        atomic_storage.begin_sqlite_atomic_block()
-        atomic_started = True
-        try:
-            result = self._apply_block_unwrapped(block)
-        except BaseException:
+            atomic_started = False
+            atomic_storage.begin_sqlite_atomic_block()
+            atomic_started = True
+            try:
+                result = self._apply_block_unwrapped(block)
+            except BaseException:
+                if atomic_started:
+                    atomic_storage.rollback_sqlite_atomic_block()
+                raise
             if atomic_started:
-                atomic_storage.rollback_sqlite_atomic_block()
-            raise
-        if atomic_started:
-            if result[0]:
-                atomic_storage.commit_sqlite_atomic_block()
-            else:
-                atomic_storage.rollback_sqlite_atomic_block()
-        return result
+                if result[0]:
+                    # VSA-06: the in-memory applied marker is recorded only after the
+                    # atomic COMMIT has returned.  If COMMIT raises, the block is not
+                    # marked applied and a retry is applied for real.
+                    # VSA-24: the durable block_apply marker is written inside the same
+                    # atomic transaction as the block and its state changes, so a crash
+                    # cannot leave an applied block without its marker.  A duplicate
+                    # delivery is not re-marked.  If the marker cannot be written the
+                    # whole block is rolled back and the failure is propagated.
+                    try:
+                        if result[1] != BLOCK_ALREADY_APPLIED_MSG:
+                            atomic_storage.record_block_apply_result(block.index, True)
+                    except BaseException:
+                        atomic_storage.rollback_sqlite_atomic_block()
+                        raise
+                    atomic_storage.commit_sqlite_atomic_block()
+                    self._applied_block_hashes.add(block.block_hash)
+                else:
+                    atomic_storage.rollback_sqlite_atomic_block()
+            return result
 
     def _apply_block_unwrapped(self, block: Block) -> Tuple[bool, str]:
         with self._lock:
@@ -2192,7 +2390,7 @@ class Blockchain:
             if (block.block_hash in self._applied_block_hashes
                     or (existing_hash == block.block_hash
                         and applied_marker == "ok")):
-                return True, "Block already applied (idempotent duplicate)"
+                return True, BLOCK_ALREADY_APPLIED_MSG
 
             ok, msg = self.validate_block(block)
             if not ok:
@@ -2759,12 +2957,15 @@ class Blockchain:
                 # any mismatch is treated as a hard reject.
                 # ─────────────────────────────────────────────────────────
                 computed_state_root = self.storage.compute_state_root()
-                if block.state_root == "":
+                _legacy_empty_end = int(Config.EMPTY_STATE_ROOT_LEGACY_END_HEIGHT)
+                if block.state_root == "" and (
+                        block.index == 0 or block.index < _legacy_empty_end):
                     log.warning(
                         f"Block #{block.index} has empty state_root "
-                        f"(pre-v7.1.9 miner?).  Accepting for upgrade "
-                        f"compatibility but this path will be removed.")
-                elif block.state_root != computed_state_root:
+                        f"(pre-v7.1.9 miner?).  Accepting only inside the configured "
+                        f"legacy window (EMPTY_STATE_ROOT_LEGACY_END_HEIGHT="
+                        f"{_legacy_empty_end}).")
+                elif block.state_root == "" or block.state_root != computed_state_root:
                     # CONSENSUS FAILURE: roll back and reject.
                     # AUDIT-FIX (Batch D): restore_all_touched() must run
                     # while self.storage still refers to the proxy, BEFORE
@@ -2788,11 +2989,17 @@ class Blockchain:
                     self._undo_vvm_block_effects(
                         _vvm_undo_log, restore_state_channel_accounts=False)
                     _restore_cumulative_issued_apply()
-                    return False, (
-                        f"state_root mismatch at #{block.index}: "
-                        f"declared={block.state_root[:16]}... "
-                        f"computed={computed_state_root[:16]}... "
-                        f"(Option-A consensus check)")
+                    if block.state_root == "":
+                        _reject_msg = (
+                            f"empty state_root at #{block.index} is not permitted "
+                            f"(legacy window ends at height {_legacy_empty_end}, VSA-03)")
+                    else:
+                        _reject_msg = (
+                            f"state_root mismatch at #{block.index}: "
+                            f"declared={block.state_root[:16]}... "
+                            f"computed={computed_state_root[:16]}... "
+                            f"(Option-A consensus check)")
+                    return False, _reject_msg
                 # Note: we no longer assign block.state_root.  It was
                 # populated by build_candidate_block and sealed by
                 # mine()/seal().  The _SEALED_FIELDS guard would in fact
@@ -2920,7 +3127,6 @@ class Blockchain:
             except Exception as exc:
                 log.debug(f"[RateAudit] cycle skipped: {exc}")
 
-            self._applied_block_hashes.add(block.block_hash)
             return True, "OK"
 
     def _apply_rollup_tx(self, tx: 'Transaction',
@@ -4713,6 +4919,75 @@ class Blockchain:
                     "[ROLLBACK] Could not restore tx %s to mempool: %s",
                     _tx.tx_id[:8], _msg)
 
+    def _reconcile_tip_marker(self) -> None:
+        """VSA-24: repair or fence a tip block committed without its applied marker.
+
+        Before the fix, apply_block() committed the block row and its state, and the
+        block_apply marker was written afterwards, outside that transaction.  A crash in
+        between left a tip with no marker.  Such a tip is restored to 'ok' only when the
+        stored state root equals the block's state root, which proves its state was fully
+        applied.  Otherwise the chain fails closed into the recovery state.  Runs once per
+        process, before the first write.
+        """
+        if self._tip_marker_checked:
+            return
+        self._tip_marker_checked = True
+        tip = self.latest_block()
+        if tip is None or tip.index < 1:
+            return
+        if self.storage.get_meta(f"block_apply:{tip.index}") == "ok":
+            return
+        if self.storage.compute_state_root() == tip.state_root:
+            self.storage.set_meta(f"block_apply:{tip.index}", "ok")
+            log.warning(f"[RECOVERY] tip #{tip.index} had no applied marker; its state root "
+                        "matches the block, so the marker was restored (VSA-24)")
+            return
+        self._mark_critical_recovery(
+            f"tip #{tip.index} has no applied marker and its state root does not match "
+            "the block (VSA-24)")
+
+    def recovery_token(self) -> Optional[str]:
+        """Token an operator presents to clear the current recovery marker (VSA-26).
+
+        Derived from the recorded reason, so clearing requires reading the condition
+        that was recorded.  None when no recovery marker is set.
+        """
+        if not self._critical_recovery:
+            return None
+        return hashlib.sha256(self._critical_recovery.encode("utf-8")).hexdigest()[:12]
+
+    def clear_critical_recovery(self, acknowledgement: str) -> Tuple[bool, str]:
+        """Operator action: clear the critical-recovery marker after a manual repair.
+
+        Refused unless ``acknowledgement`` equals :meth:`recovery_token`.  The cleared
+        state is persisted, so a restart does not re-arm the refusal.
+        """
+        with self._lock:
+            if not self._critical_recovery:
+                return False, "no recovery marker is set"
+            if acknowledgement != self.recovery_token():
+                return False, "acknowledgement does not match the current recovery marker"
+            reason = self._critical_recovery
+            self._critical_recovery = None
+            self.storage.set_meta("chain_recovery_required", "")
+            log.critical(f"[RECOVERY] operator cleared the recovery marker: {reason}")
+            return True, "recovery marker cleared"
+
+    def _mark_critical_recovery(self, reason: str) -> None:
+        """VSA-26: a partially mutated chain is a critical condition, not a rejection.
+
+        The marker is persisted so a restart keeps refusing writes.  Clearing it is an
+        explicit operator action taken after manual repair (delete the node_meta key
+        chain_recovery_required).
+        """
+        self._critical_recovery = reason
+        log.critical(f"[RECOVERY] chain requires operator recovery: {reason}; "
+                     f"acknowledge with token {self.recovery_token()} to clear it")
+        try:
+            self.storage.set_meta("chain_recovery_required", reason)
+        except Exception as exc:
+            log.critical(f"[RECOVERY] could not persist recovery marker: {exc}")
+
     def reorg(self, new_chain: List[Block], *,
               allow_deep_no_investor: bool = False,
               enforce_deep_tiebreak: bool = False) -> Tuple[bool, str]:
@@ -4737,6 +5012,10 @@ class Blockchain:
         with self._lock:
             if not new_chain:
                 return False, "Empty chain"
+            if self._critical_recovery:
+                return False, (
+                    f"Reorg refused: chain requires operator recovery "
+                    f"({self._critical_recovery})")
 
             fork_height = new_chain[0].index
             tip         = self.height()
@@ -4821,6 +5100,16 @@ class Blockchain:
             # the old chain, we must re-apply the saved blocks to restore a
             # consistent state.  Without this the node is left in a half-reorged
             # limbo with neither the old nor the new chain intact.
+            # VSA-25: fail closed before any state mutation.  Rolling the old suffix
+            # back needs its transaction bodies, which pruning may already have removed;
+            # rollback() refuses the same case with the same comparison.
+            _pruned_until = int(self._rolling_pruner.get_pruned_watermark())
+            if _pruned_until and (fork_height - 1) < _pruned_until:
+                return False, (
+                    f"Reorg rejected: fork height {fork_height} is below the "
+                    f"rolling-prune watermark {_pruned_until}; the replaced blocks' "
+                    "transaction bodies are no longer available for an exact rollback.")
+
             _saved_old_blocks = []
             for idx in range(tip, fork_height - 1, -1):
                 blk = self.storage.get_block(idx)
@@ -4873,8 +5162,16 @@ class Blockchain:
                         f"{_old_tip_hash[:16]}")
 
             # Rollback current chain from tip down to fork_height
-            for blk in reversed(_saved_old_blocks):
-                self._rollback_block(blk)
+            try:
+                for blk in reversed(_saved_old_blocks):
+                    self._rollback_block(blk)
+            except Exception as _old_rb_e:
+                self._mark_critical_recovery(
+                    f"rollback of the old suffix failed: {_old_rb_e}")
+                return False, f"Reorg aborted: {self._critical_recovery}"
+            # VSA-21: difficulty entries at or above the fork point were computed on the
+            # abandoned branch.  Drop them before any replacement block is validated.
+            DifficultyEngine.invalidate_cache(from_height=fork_height)
 
             # ── v7.5.0-OPT LAYER-2 REORG HOOK ────────────────────────────────
             # Any RollupSubmission confirmed at an L1 height >= fork_height
@@ -4927,17 +5224,27 @@ class Blockchain:
                         f"Reorg apply failed at block {b.index}: {msg} — "
                         f"restoring {len(_applied)} already-applied blocks "
                         f"and {len(_saved_old_blocks)} old-chain blocks")
-                    # Roll back whatever we managed to apply from new_chain
+                    # Roll back whatever we managed to apply from new_chain.  VSA-26: a
+                    # failed reversal leaves the chain partially mutated, so it is a critical
+                    # recovery condition rather than an ordinary rejection.
+                    _unwind_errors = []
                     for _rb in reversed(_applied):
                         try:
                             self._rollback_block(_rb)
                         except Exception as _rbe:
+                            _unwind_errors.append((_rb.index, str(_rbe)))
                             log.error(f"Restore rollback failed at "
                                       f"block {_rb.index}: {_rbe}")
-                    # Restore the exact L2 state at the fork point before
-                    # replaying the old canonical suffix.  Without this, a
-                    # discarded TYPE_ROLLUP can survive because _rollback_block
-                    # intentionally does not guess its L2 inverse.
+                    if _unwind_errors:
+                        self._mark_critical_recovery(
+                            f"rollback of replacement block {_unwind_errors[0][0]} "
+                            f"failed: {_unwind_errors[0][1]}")
+                        return False, (
+                            f"Reorg apply block {b.index}: {msg}; "
+                            f"{self._critical_recovery}")
+                    # Restore the exact L2 state at the fork point before replaying the old
+                    # canonical suffix.  Without this, a discarded TYPE_ROLLUP can survive
+                    # because _rollback_block intentionally does not guess its L2 inverse.
                     if layer2 is not None and _l2_reorg_base_snap is not None:
                         try:
                             layer2.restore_full(_l2_reorg_base_snap)
@@ -4945,17 +5252,35 @@ class Blockchain:
                             log.error(
                                 f"[L2-REORG] failed to restore fork-point L2 state: "
                                 f"{_l2_restore_e}")
+                            self._mark_critical_recovery(
+                                f"L2 fork-point restore failed: {_l2_restore_e}")
                             return False, (
                                 f"Reorg apply block {b.index}: {msg}; "
                                 f"L2 recovery failed: {_l2_restore_e}")
 
-                    # Re-apply the original chain
+                    # VSA-21: restoration must not validate old-branch blocks against
+                    # difficulty entries computed for the rejected replacement branch.
+                    DifficultyEngine.invalidate_cache(from_height=fork_height)
+
+                    # Re-apply the original chain in ascending order.  VSA-26: every result
+                    # is checked; a partial restore is a critical recovery condition.
+                    _restore_failure = None
                     for _ob in _saved_old_blocks:
                         try:
-                            self.apply_block(_ob)
+                            _r_ok, _r_msg = self.apply_block(_ob)
                         except Exception as _obe:
-                            log.error(f"Restore apply failed at "
-                                      f"block {_ob.index}: {_obe}")
+                            _r_ok, _r_msg = False, f"exception: {_obe}"
+                        if not _r_ok:
+                            _restore_failure = (_ob.index, _r_msg)
+                            break
+                    if _restore_failure is not None:
+                        self._mark_critical_recovery(
+                            f"restoration of the old chain failed at height "
+                            f"{_restore_failure[0]}: {_restore_failure[1]}")
+                        return False, (
+                            f"Reorg apply block {b.index}: {msg}; "
+                            f"{self._critical_recovery}")
+                    DifficultyEngine.invalidate_cache(from_height=fork_height)
                     return False, f"Reorg apply block {b.index}: {msg}"
                 _applied.append(b)
 

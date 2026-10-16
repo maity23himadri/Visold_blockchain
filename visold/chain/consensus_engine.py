@@ -28,7 +28,7 @@ import json
 import time
 from typing import Any, List, Optional, TYPE_CHECKING, Tuple
 
-from visold.chain.blockchain import Blockchain
+from visold.chain.blockchain import Blockchain, CandidateTxRejected
 from visold.consensus.difficulty import DifficultyEngine
 from visold.crypto.ecc import sig_to_hex
 from visold.crypto.vrf import vrf_prove
@@ -206,10 +206,9 @@ class ConsensusEngine:
         # (e.g. sender can't afford it), remove that tx and retry rather than
         # falling back to state_root="" for the entire block.  A block mined
         # with state_root="" is guaranteed to be rejected by all peers — the
-        # retry produces a valid candidate instead.  The fallback to "" is
-        # kept only for truly catastrophic / unrecoverable failures.
+        # retry produces a valid candidate instead.  VSA-03: there is no empty-root
+        # fallback; a root that cannot be computed raises and yields no candidate.
         # ─────────────────────────────────────────────────────────────────────
-        pre_state_root = ""
         _candidate_txs = txs
 
         def _compute_candidate_root(candidate_txs):
@@ -240,45 +239,39 @@ class ConsensusEngine:
                                  ("transactions", "miner_address", "height")}
                 return self.blockchain.dry_run_state_root(**legacy_kwargs)
 
-        _MAX_RETRIES   = 3
-        for _attempt in range(_MAX_RETRIES):
-            try:
-                with self.blockchain._lock:
-                    pre_state_root = _compute_candidate_root(_candidate_txs)
-                break  # dry-run succeeded — use this candidate tx list
-            except RuntimeError as _rte:
-                # dry_run raises RuntimeError when a specific tx can't be
-                # processed (e.g. "dry-run debit failed for <addr>").
-                # Try to identify and remove the offending tx, then retry.
-                err_msg = str(_rte)
-                log.warning(
-                    f"build_candidate_block: dry_run attempt {_attempt + 1} "
-                    f"failed ({err_msg}) — removing offending tx and retrying")
-                removed = False
-                for _tx in _candidate_txs[1:]:   # skip coinbase at index 0
-                    if _tx.sender in err_msg:
-                        _candidate_txs = [t for t in _candidate_txs
-                                          if t is not _tx]
-                        log.info(
-                            f"Removed tx {_tx.tx_id[:8]} from candidate "
-                            f"(sender {_tx.sender[:12]} insufficient balance)")
-                        removed = True
-                        break
-                if not removed:
-                    # Can't isolate the failing tx — fall back to empty root.
+        def _resolve_candidate_root(candidate_txs):
+            """Return ``(executable_txs, state_root)`` for ``candidate_txs``.
+
+            VSA-03: never returns an empty root; if the root cannot be computed the
+            exception propagates and no candidate is produced.
+            VSA-19 / VSA-20 / VSA-27 / VSA-07 / VSA-01: each pass runs the read-only
+            precheck (validate_block()'s rules) and then the dry run.  A rejected
+            transaction is identified by position (CandidateTxRejected), removed with
+            every later transaction from the same sender so no nonce gap is created,
+            and the reduced list is checked again.  The coinbase at index 0 is never
+            removed: a rejection pointing at it is a hard failure.
+            """
+            current = list(candidate_txs)
+            while True:
+                try:
+                    with self.blockchain._lock:
+                        self.blockchain._candidate_precheck(current, height, safe_ts)
+                        return current, _compute_candidate_root(current)
+                except CandidateTxRejected as rejected:
+                    pos = rejected.index
+                    if pos <= 0 or pos >= len(current):
+                        raise RuntimeError(
+                            "build_candidate_block: cannot isolate a rejected candidate "
+                            f"transaction ({rejected}); no candidate produced") from rejected
+                    victim_sender = current[pos].sender
+                    dropped = sum(1 for t in current[pos:] if t.sender == victim_sender)
                     log.warning(
-                        f"build_candidate_block: could not isolate failing tx "
-                        f"after attempt {_attempt + 1}; using empty state_root "
-                        f"(block will be rejected by peers — safety net)")
-                    pre_state_root = ""
-                    break
-            except Exception as _dre:
-                # Unexpected error (storage failure, etc.) — fall back to "".
-                log.warning(
-                    f"build_candidate_block: dry_run_state_root failed "
-                    f"({_dre}); falling back to empty state_root")
-                pre_state_root = ""
-                break
+                        f"build_candidate_block: excluding {dropped} transaction(s) from "
+                        f"sender {victim_sender[:12]}: {rejected.reason}")
+                    current = (current[:pos]
+                               + [t for t in current[pos:] if t.sender != victim_sender])
+
+        _candidate_txs, pre_state_root = _resolve_candidate_root(_candidate_txs)
 
         # The tx-byte budget above intentionally governs local packing policy,
         # but the consensus limit applies to the COMPLETE serialized block.
@@ -310,9 +303,11 @@ class ConsensusEngine:
                     f"the mandatory coinbase/header block ({candidate.size()} bytes)"
                 )
 
-            _candidate_txs = _candidate_txs[:-1]
-            with self.blockchain._lock:
-                pre_state_root = _compute_candidate_root(_candidate_txs)
+            _candidate_txs, pre_state_root = _resolve_candidate_root(_candidate_txs[:-1])
+
+    def _is_canonical(self, block: Block) -> bool:
+        """True when this block is the canonical block stored at its height (VSA-22)."""
+        return self.blockchain.storage.get_block_hash(block.index) == block.block_hash
 
     def validate_and_finalize(self, block: Block) -> Tuple[bool, str]:
         """
@@ -347,9 +342,27 @@ class ConsensusEngine:
         pending (finalized=False) but is NOT rejected.  It will be promoted to
         BFT-finalized once enough validator votes arrive over the network.
         """
-        ok, msg = self.blockchain.validate_block(block)
-        if not ok:
-            return False, msg
+        # VSA-22: validation is a pre-application step only.  Once the block is the
+        # canonical block at its height, state-dependent checks would run against the
+        # post-application state (its own transactions already consumed, nonces
+        # advanced, the next-height difficulty evaluated at the new tip), so a committed
+        # block goes straight to finalization.
+        if not self._is_canonical(block):
+            ok, msg = self.blockchain.validate_block(block)
+            if not ok:
+                return False, msg
+            return True, "validated; finalization deferred until the block is applied"
+        return self.finalize_applied_block(block)
+
+    def finalize_applied_block(self, block: Block) -> Tuple[bool, str]:
+        """Post-application finalization of a canonical block (VSA-22).
+
+        Performs no state-dependent re-validation: the block was validated before it
+        was committed.  Only a block that is canonical at its height is eligible for a
+        validator vote.
+        """
+        if not self._is_canonical(block):
+            return False, "block is not canonical; no finalization"
 
         # ── Detect consensus mode based on live validator set ─────────────────
         validators      = self.blockchain.storage.get_all_by_role("investor")

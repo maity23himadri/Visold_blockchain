@@ -164,6 +164,11 @@ def test_candidate_builder_never_returns_block_above_hard_consensus_cap():
         def dry_run_state_root(self, transactions, miner_address, height):
             return "a" * 64
 
+        def _candidate_precheck(self, transactions, block_index, block_timestamp):
+            # This double models only the hard block-size cap under test, not the
+            # balance/nonce rules, so the candidate precheck accepts every list.
+            return None
+
     miner = Wallet.generate()
     large_tx = Transaction(
         sender=miner.address,

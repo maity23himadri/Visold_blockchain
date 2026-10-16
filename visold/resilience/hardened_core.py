@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from visold.kernel.compat import _NTPLIB_AVAILABLE, _ntplib
 from visold.kernel.logging_setup import log
+from visold.kernel.config import BLOCK_ALREADY_APPLIED_MSG
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,6 +199,7 @@ class _HardenedCBSingleton:
                 # events within the active window.  Replaces the bare counter
                 # so stale events age out and don't cause spurious shutdown.
                 inst._corruption_timestamps: List[float] = []  # type: ignore[misc]
+                inst._read_only_since: float = 0.0  # type: ignore[misc]
                 cls._instance = inst
             return cls._instance
 
@@ -209,6 +211,8 @@ class _HardenedCBSingleton:
         return self._mode == _HardenedSystemMode.NORMAL
 
     def assert_writable(self, context: str = "") -> None:
+        with self._mode_lock:
+            self._maybe_half_open_locked(require_delay=True)
         if self._mode != _HardenedSystemMode.NORMAL:
             raise ImmediateAbort(
                 f"[HCB] Write rejected — system is in {self._mode.value} mode. "
@@ -298,6 +302,38 @@ class _HardenedCBSingleton:
                             f"auto-recovery: all subsystems clear after "
                             f"{elapsed:.0f}s half-open delay")
 
+    def _maybe_half_open_locked(self, require_delay: bool = True) -> None:
+        """VSA-05: half-open recovery that does not require a successful apply.
+
+        READ_ONLY rejects every apply at Gate 0, so the only recovery trigger that
+        existed (a successful apply) could never fire.  After the trip delay, with
+        no corruption event inside the rolling window, writes are permitted again.
+        Over-threshold subsystem counters drop to threshold-1, so a single further
+        failure re-trips immediately (half-open behaviour).  SAFE_SHUTDOWN is never
+        auto-recovered.  The caller must hold _mode_lock.
+        """
+        if self._mode != _HardenedSystemMode.READ_ONLY:
+            return
+        now_mt = time.monotonic()
+        self._corruption_timestamps = [
+            t for t in self._corruption_timestamps
+            if now_mt - t <= _HC_CORRUPTION_WINDOW_SEC
+        ]
+        self._corruption_count = len(self._corruption_timestamps)
+        if self._corruption_count != 0:
+            return
+        if self._read_only_since <= 0.0:
+            return
+        if require_delay and now_mt - self._read_only_since < _HC_CB_HALF_OPEN_DELAY_SEC:
+            return
+        for rec in self._subsystems.values():
+            if rec.failure_count >= _HC_CB_FAILURE_THRESHOLD:
+                rec.failure_count = _HC_CB_FAILURE_THRESHOLD - 1
+        self._transition(
+            _HardenedSystemMode.NORMAL,
+            "half-open: no corruption in window and trip delay elapsed; "
+            "trial writes permitted")
+
     def reset_subsystem(self, subsystem: str) -> None:
         with self._mode_lock:
             self._subsystems.pop(subsystem, None)
@@ -313,8 +349,7 @@ class _HardenedCBSingleton:
             if (self._mode == _HardenedSystemMode.READ_ONLY and
                     not any(r.failure_count >= _HC_CB_FAILURE_THRESHOLD
                             for r in self._subsystems.values())):
-                log.warning("[HCB] All subsystems clean — half-open; "
-                            "next successful block apply restores NORMAL.")
+                self._maybe_half_open_locked(require_delay=False)
 
     def force_shutdown(self, reason: str = "operator request") -> None:
         with self._mode_lock:
@@ -328,6 +363,8 @@ class _HardenedCBSingleton:
             return
         old_mode = self._mode
         self._mode = new_mode
+        if new_mode == _HardenedSystemMode.READ_ONLY:
+            self._read_only_since = time.monotonic()
         log.critical("[HCB] MODE CHANGE: %s → %s | %s",
                      old_mode.value, new_mode.value, reason)
         # Write flag file for external watchdogs
@@ -842,6 +879,7 @@ def _make_hardened_apply_block(original_apply_block):
         # Gate 1: Resource check
         ResourceCap.check_memory_pressure()
 
+        _local_state_check = False
         # Gate 2: Block pre-conditions (all checked before any write)
         try:
             # Timestamp drift check — only for genuinely live blocks.
@@ -885,6 +923,7 @@ def _make_hardened_apply_block(original_apply_block):
                 _hc_inv.assert_tx_id_length(
                     tx.tx_id,
                     context=f"block={block.index} tx={tx.tx_id[:16]}")
+            _local_state_check = True
             for tx in block.transactions:
                 if getattr(tx, 'sender', '') == "COINBASE":
                     continue
@@ -893,11 +932,22 @@ def _make_hardened_apply_block(original_apply_block):
                     tx.sender, sender_sat,
                     context=f"pre-apply tx={tx.tx_id[:16]}")
         except (ImmediateAbort, InvariantViolation) as pre_err:
+            if not _local_state_check:
+                # VSA-05: rejection of peer-supplied block content (timestamp, tx count,
+                # tx-id length) is an ordinary consensus outcome.  It must not feed the
+                # panic breaker: five such blocks previously forced READ_ONLY.
+                log.warning("[HAB] block %d rejected by peer-input pre-check: %s",
+                            block.index, pre_err)
+                return False, f"Pre-condition violated: {pre_err}"
             log.error("[HAB] PRE-CONDITION FAILURE for block %d: %s",
                       block.index, pre_err)
             _hc_panic_cb.record_failure("apply_block_pre", pre_err,
                                         corruption_level=False)
             return False, f"Pre-condition violated: {pre_err}"
+
+        # VSA-05: a passing precheck clears only its own failure counter, so valid
+        # blocks interleaved with rejected ones cannot leave the counter armed.
+        _hc_panic_cb.record_success("apply_block_pre")
 
         # Gate 3: Delegate to original implementation
         try:
@@ -922,6 +972,10 @@ def _make_hardened_apply_block(original_apply_block):
             computed_root = (self_bc.storage.compute_state_root()
                              if hasattr(self_bc.storage, 'compute_state_root') else "")
             expected_root = getattr(block, "state_root", "")
+            if msg == BLOCK_ALREADY_APPLIED_MSG:
+                # VSA-04: an idempotent duplicate applied nothing new; its historical
+                # root is not comparable with the current tip.
+                expected_root = ""
             if expected_root and computed_root:
                 _hc_inv.assert_state_root_matches(
                     expected_root, computed_root, block.index)

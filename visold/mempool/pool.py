@@ -33,7 +33,7 @@ from typing import Dict, Iterable, List, Optional, TYPE_CHECKING, Tuple
 from visold.kernel.config import Config
 from visold.kernel.logging_setup import log
 from visold.kernel.metrics import metrics
-from visold.kernel.units import VSD_GLOBAL_MARKET, from_satoshi, to_satoshi
+from visold.kernel.units import VSD_GLOBAL_MARKET, from_satoshi, gas_fee_to_sat, to_satoshi
 from visold.ledger.transaction import Transaction
 from visold.rollup.batches import RollupSubmission
 from visold.storage.storage import Storage
@@ -872,10 +872,15 @@ class Mempool:
             for tx in self.storage.mempool_all():
                 if getattr(tx, "sender", "") != sender:
                     continue
-                try:
-                    tx_fee_sat = tx.compute_fee_sat()
-                except Exception:
-                    tx_fee_sat = to_satoshi(getattr(tx, "fee", 0.0) or 0.0)
+                if tx.tx_type in (Transaction.TYPE_DEPLOY, Transaction.TYPE_CALL):
+                    # VSA-27: a VVM transaction's consensus debit is amount + gas_limit x
+                    # gas_price (see the candidate precheck), so the gas budget is reserved.
+                    tx_fee_sat = gas_fee_to_sat(int(tx.gas_limit), float(tx.gas_price))
+                else:
+                    try:
+                        tx_fee_sat = tx.compute_fee_sat()
+                    except Exception:
+                        tx_fee_sat = to_satoshi(getattr(tx, "fee", 0.0) or 0.0)
                 fee_sat += int(tx_fee_sat)
                 if tx.tx_type == Transaction.TYPE_REGISTER:
                     # REGISTER txs don't debit the stake at apply time, but they

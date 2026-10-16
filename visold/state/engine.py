@@ -224,32 +224,65 @@ class StateEngine:
             return False
 
 
-    def post_sync(self, event: Event,
-                  timeout: Optional[float] = None) -> Tuple[bool, str]:
-        """
-        Post an event and BLOCK until it is processed.
-        Returns (ok, message) from the handler.
-        Used by CLI and RPC for synchronous responses.
+    def _record_apply_outcome(self, block, ok: bool) -> None:
+        """Record block_apply:<height> without poisoning an applied block (VSA-04).
 
-        If the StateEngine is not running (e.g. during test setup), falls back
-        to direct synchronous execution.
+        A failed outcome must not overwrite an ok marker for the very block already
+        stored at this height: that result reflects a duplicate or late delivery,
+        not a failed application of the stored block.
+        """
+        if not ok:
+            stored_hash = self._storage.get_block_hash(block.index)
+            if (stored_hash == block.block_hash
+                    and self._storage.get_meta(f"block_apply:{block.index}") == "ok"):
+                return
+        self._storage.record_block_apply_result(block.index, ok)
+
+    def post_sync_detailed(self, event: Event,
+                           timeout: Optional[float] = None):
+        """Post an event and wait up to ``timeout`` seconds for its outcome.
+
+        Returns ``(status, ok, msg, future)``:
+
+        * ``"done"``       the handler finished; ``ok``/``msg`` are its result.
+        * ``"pending"``    the wait timed out.  The event stays queued and may still
+                           complete, so the outcome is UNKNOWN, not a failure (VSA-23).
+                           ``future`` lets the caller correlate the eventual result.
+        * ``"not_queued"`` the event never entered the queue and cannot apply.
         """
         if not self._running:
             # Fallback: direct execution for tests / pre-start scenarios
-            return self._dispatch_direct(event)
+            ok, msg = self._dispatch_direct(event)
+            return "done", bool(ok), msg, None
 
         t = timeout if timeout is not None else Config.STATE_ENGINE_SYNC_TIMEOUT
         fut: _futures.Future = _futures.Future()
         event.future = fut
         if not self.post(event, timeout=t):
-            return False, "StateEngine queue full — try again later"
+            return "not_queued", False, "StateEngine queue full — try again later", None
         try:
             result = fut.result(timeout=t)
-            return result
         except _futures.TimeoutError:
-            return False, "StateEngine timeout — node may be under heavy load"
+            if fut.done():
+                # The handler itself raised TimeoutError: a completed failure, not a wait.
+                return "done", False, "StateEngine error: handler raised TimeoutError", fut
+            return ("pending", False,
+                    "StateEngine timeout — node may be under heavy load", fut)
         except Exception as e:
-            return False, f"StateEngine error: {e}"
+            return "done", False, f"StateEngine error: {e}", fut
+        ok, msg = result
+        return "done", bool(ok), msg, fut
+
+    def post_sync(self, event: Event,
+                  timeout: Optional[float] = None) -> Tuple[bool, str]:
+        """Post an event and wait for its handler's ``(ok, msg)`` result.
+
+        A timeout is reported here as a failure, which is the long-standing contract
+        for boolean callers.  Callers that must distinguish an unknown outcome use
+        :meth:`post_sync_detailed`.
+        """
+        _status, ok, msg, _future = self.post_sync_detailed(event, timeout)
+        return ok, msg
 
     def _dispatch_direct(self, event: Event) -> Tuple[bool, str]:
         """Synchronous fallback for tests / pre-start scenarios."""
@@ -528,7 +561,7 @@ class StateEngine:
                 log.warning(w)
 
             ok, msg = self._blockchain.apply_block(block)
-            self._storage.record_block_apply_result(block.index, ok)
+            self._record_apply_outcome(block, ok)
 
             # ── v7.1.8 Bug 2 fix: treat "Previous block not found" as a gap
             # rather than a hard reject.  Stash in orphan pool and request

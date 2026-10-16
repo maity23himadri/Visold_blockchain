@@ -25,6 +25,7 @@ Origin: visold_vsd_.py L2551-2674, L2690-2878
 
 import json
 import socket
+from visold.kernel.netutil import wildcard_for_family
 import threading
 import time
 from typing import Callable, Dict, Optional
@@ -81,14 +82,14 @@ class UDPTransport:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
-            s.bind((self._bind_addr or '::', self._port))
+            s.bind((wildcard_for_family(socket.AF_INET6, self._bind_addr), self._port))
         except OSError:
             # Fallback: IPv4-only
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
-            s.bind((self._bind_addr or '0.0.0.0', self._port))  # nosec B104 – intentional P2P bind-all
+            s.bind((wildcard_for_family(socket.AF_INET, self._bind_addr), self._port))  # nosec B104 – intentional P2P bind-all
         return s
 
     def start(self, on_new_peer=None, inbound_admission=None):

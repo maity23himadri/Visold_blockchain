@@ -196,6 +196,13 @@ class MiningEngine:
         """Inject StateEngine after both objects are created."""
         self._state_engine = engine
 
+    def _live_mining_threads(self):
+        """Mining-side threads that are still running (VSA-31)."""
+        threads = (getattr(self, "_thread", None),
+                   getattr(self, "_prewarm_thread", None),
+                   getattr(self, "_hr_report_thread", None))
+        return [t for t in threads if t is not None and t.is_alive()]
+
     def start(self):
         # AUDIT-FIX-20 (Batch F, Finding 3): start()/stop() used to mutate
         # self._running plus every per-subsystem Event/Thread field with no
@@ -215,6 +222,11 @@ class MiningEngine:
                 return False, "Investors cannot mine"
             if self._running:
                 return False, "Already mining"
+            # VSA-31: re-enabling the shared running flag while a previous loop (or
+            # its helper thread) is still alive would resume that old loop.  Refuse
+            # until every previous thread has actually exited.
+            if self._live_mining_threads():
+                return False, "Previous mining loop is still stopping; try again shortly"
             self._running = True
             self._paused  = False
             self._stop_evt.clear()
@@ -253,6 +265,13 @@ class MiningEngine:
                 self._hr_report_thread.join(timeout=3)
             if self._thread:
                 self._thread.join(timeout=5)
+            # VSA-31: a thread that outlives its bounded join is still running.  Say so,
+            # and let start() refuse until it has exited.
+            still_alive = self._live_mining_threads()
+            if still_alive:
+                log.warning(f"Mining stop incomplete: {len(still_alive)} thread(s) still "
+                            "alive; a new start is refused until they exit")
+                return False, "Mining is still stopping; try again shortly"
             log.info("Mining stopped")
             return True, "Mining stopped"
 
@@ -457,20 +476,74 @@ class MiningEngine:
             return None
         if blk.index != tip_height + 1:
             return None
-        # The prewarm is valid.  Refresh its timestamp to "now" bounded below
-        # by the MTP+1 rule (build_candidate_block set it; we just advance it
-        # if wall-clock has moved forward since then).  We do NOT touch any
-        # other field — state_root, merkle_root, vrf, tx list are all fixed.
-        try:
-            now_ts = int(time.time())
-            if now_ts > blk.timestamp:
-                blk.timestamp = now_ts
-                # nonce is reset to 0 so the PoW starts fresh on the new
-                # header (timestamp change invalidates any partial work).
-                blk.nonce = 0
-        except Exception:
-            pass
+        # VSA-28: the prewarmed candidate keeps the timestamp its state root was
+        # computed for and is used as built.  The header is never moved.
         return blk
+
+    def _submit_mined_block(self, block: Block) -> Optional[bool]:
+        """Hand a mined block to the StateEngine, or apply it directly.
+
+        Returns True when the block was applied, False when it was rejected, and None
+        when the outcome is still pending because the StateEngine did not answer within
+        the wait.  A pending outcome is not a failure (VSA-23): the queued MINE_RESULT
+        keeps running and may still commit the block, so its eventual result is logged
+        against the block hash.  Nothing is retried, so the block cannot be applied twice.
+        """
+        if self._state_engine is not None:
+            evt = Event(
+                EventType.MINE_RESULT,
+                {"block": block, "consensus": self.consensus},
+            )
+            status, ok, msg, fut = self._state_engine.post_sync_detailed(evt, timeout=15.0)
+            if status == "pending":
+                log.warning(
+                    f"[MINE] apply outcome pending for #{block.index} "
+                    f"{block.block_hash[:16]}: StateEngine did not answer within 15s; "
+                    "the queued event is still active and reports its own result")
+                if fut is not None:
+                    fut.add_done_callback(
+                        lambda done_fut, _blk=block: self._report_late_submission(_blk, done_fut))
+                return None
+            # BELT-AND-SUSPENDERS: if StateEngine accepted the block but
+            # broadcast did not fire for any reason (race, swallowed exc),
+            # force a second broadcast here. Receivers dedup via _seen_msgs.
+            if ok and self.network is not None:
+                try:
+                    self.network.broadcast_block(block)
+                except Exception as _bbe:
+                    log.error(f"[BROADCAST-BACKUP] failed for #{block.index}: {_bbe}")
+        else:
+            ok, msg = self.blockchain.apply_block(block)
+            if ok:
+                self.network.broadcast_block(block)
+                self.consensus.validate_and_finalize(block)
+
+        if not ok:
+            log.warning(f"Block apply failed: {msg}")
+        return bool(ok)
+
+    def _report_late_submission(self, block: Block, fut) -> None:
+        """Report the eventual outcome of a submission that timed out (VSA-23).
+
+        Runs once, when the queued event completes.  A late success is backed up by a
+        broadcast (receivers dedup) and wakes the prewarm loop, because the tip moved.
+        """
+        try:
+            ok, msg = fut.result()
+        except Exception as exc:
+            ok, msg = False, f"error: {exc}"
+        if ok:
+            log.info(f"[MINE] late outcome for #{block.index} "
+                     f"{block.block_hash[:16]}: applied ({msg})")
+            if self.network is not None:
+                try:
+                    self.network.broadcast_block(block)
+                except Exception as _lbe:
+                    log.error(f"[BROADCAST-BACKUP] failed for #{block.index}: {_lbe}")
+            self.wake_prewarm()
+        else:
+            log.warning(f"[MINE] late outcome for #{block.index} "
+                        f"{block.block_hash[:16]}: rejected ({msg})")
 
     def _mine_one(self):
         # ── v7.6.0 Pre-mine sync gate ─────────────────────────────────────
@@ -643,14 +716,10 @@ class MiningEngine:
         if recent_ts:
             mtp = DifficultyEngine.compute_mtp(recent_ts)
             if block.timestamp <= mtp:
-                block.timestamp = mtp + 1
-                block.nonce     = 0
-                # Re-mine without throttle for this small adjustment — the
-                # MTP fix-up usually finds a new nonce in microseconds and
-                # we don't want the throttle to delay an already-mined block.
-                if not self._parallel.mine(block, stop_event=self._stop_evt,
-                                            max_hps=0.0):
-                    return   # aborted — do not submit
+                # VSA-28: changing the timestamp here would invalidate the state
+                # root computed for this candidate, so drop the attempt.  A rebuilt
+                # candidate takes safe_ts = max(now, MTP + 1) and its own root.
+                return
 
         # SECURITY: Seal the block after all mining and MTP adjustments are
         # complete.  This locks the consensus-critical fields (transactions,
@@ -685,27 +754,11 @@ class MiningEngine:
         )
 
         # ── Post MINE_RESULT to StateEngine (single-writer principle) ──────────
-        if self._state_engine is not None:
-            evt = Event(
-                EventType.MINE_RESULT,
-                {"block": block, "consensus": self.consensus},
-            )
-            ok, msg = self._state_engine.post_sync(evt, timeout=15.0)
-            # BELT-AND-SUSPENDERS: if StateEngine accepted the block but
-            # broadcast did not fire for any reason (race, swallowed exc),
-            # force a second broadcast here. Receivers dedup via _seen_msgs.
-            if ok and self.network is not None:
-                try:
-                    self.network.broadcast_block(block)
-                except Exception as _bbe:
-                    log.error(f"[BROADCAST-BACKUP] failed for #{block.index}: {_bbe}")
-        else:
-            ok, msg = self.blockchain.apply_block(block)
-            if ok:
-                self.network.broadcast_block(block)
-                self.consensus.validate_and_finalize(block)
-
-        if ok:
+        applied = self._submit_mined_block(block)
+        if applied is None:
+            # VSA-23: the outcome is pending.  The submission reports its own late result.
+            return
+        if applied:
             self.blocks_found += 1
             hr = self.hashes_done / max(time.time() - self.start_time, 1)
             metrics.set_gauge("hashrate", hr)
@@ -714,5 +767,3 @@ class MiningEngine:
             # is now stale.  Signal the prewarm loop to rebuild against the
             # new tip immediately so we're ready for the next block.
             self.wake_prewarm()
-        else:
-            log.warning(f"Block apply failed: {msg}")

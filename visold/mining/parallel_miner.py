@@ -38,6 +38,9 @@ if TYPE_CHECKING:  # annotation-only references (no runtime import, no cycle)
     from visold.ledger.block import Block
 
 
+# VSA-29: flip to True only after the GPU known-answer tests pass on real devices.
+GPU_KERNELS_VERIFIED = False
+
 class ParallelMiner:
     """
     Unified parallel mining front-end.
@@ -99,7 +102,14 @@ class ParallelMiner:
         with self._lock:
             if self._initialized:
                 return self._backend
-            if Config.MINING_GPU_ENABLED:
+            # VSA-29: the GPU kernels write past their padding buffer and hash a
+            # non-canonical preimage, so no GPU backend is initialised until the
+            # kernels are repaired and proven against the CPU miner on real hardware.
+            if Config.MINING_GPU_ENABLED and not GPU_KERNELS_VERIFIED:
+                log.warning(
+                    "GPU mining requested (VISOLD_MINING_GPU=1) but the GPU kernels "
+                    "are not verified (VSA-29); using CPU multi-thread mining.")
+            elif Config.MINING_GPU_ENABLED:
                 if _CUDA_AVAILABLE and self._try_init_cuda():
                     self._backend = "cuda"
                 elif _OPENCL_AVAILABLE and self._try_init_opencl():
@@ -425,14 +435,8 @@ class ParallelMiner:
                 else:
                     nonce_base = np.uint64(int(nonce_base) + BTCH)
 
-                # Refresh timestamp in header for next batch
-                new_ts = int(time.time())
-                if new_ts > block.timestamp:
-                    block.timestamp = new_ts
-                    hdr_np = np.frombuffer(
-                        self._build_binary_header(block,
-                                                  nonce=int(nonce_base)),
-                        dtype=np.uint8).copy()
+                # VSA-28: the header timestamp is fixed for this candidate (see
+                # Block.mine); the engine's watchdog rebuilds stale candidates.
 
         except Exception as exc:
             log.error(f"CUDA mining error ({exc}) — falling back to CPU.")
@@ -508,17 +512,8 @@ class ParallelMiner:
                 else:
                     nonce_base = np.uint64(int(nonce_base) + BTCH)
 
-                new_ts = int(time.time())
-                if new_ts > block.timestamp:
-                    block.timestamp = new_ts
-                    hdr_np = np.frombuffer(
-                        self._build_binary_header(block,
-                                                  nonce=int(nonce_base)),
-                        dtype=np.uint8).copy()
-                    hdr_buf = cl.Buffer(
-                        ctx,
-                        cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-                        hostbuf=hdr_np)
+                # VSA-28: the header timestamp is fixed for this candidate (see the
+                # CUDA path above).
 
         except Exception as exc:
             log.error(f"OpenCL mining error ({exc}) — falling back to CPU.")

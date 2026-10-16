@@ -3201,15 +3201,23 @@ class Storage:
                        ip=EXCLUDED.ip, port=EXCLUDED.port,
                        last_seen=EXCLUDED.last_seen,
                        reputation=EXCLUDED.reputation,
-                       fail_count=0, blacklisted=FALSE,
+                       fail_count=0,
                        updated_at=now()""",
                 peer_id, ip, int(port), ts, float(reputation))
             self._mirror_peer_to_aux(peer_id, ip, port, ts, reputation)
             return
         self._conn().execute(
-            """INSERT OR REPLACE INTO peers
+            # VSA-16: upsert only the columns a registration owns.  INSERT OR REPLACE
+            # rewrote the whole row, erasing tls_fp and ban_score and clearing the
+            # blacklist flag.
+            """INSERT INTO peers
                    (peer_id,ip,port,last_seen,reputation,fail_count,blacklisted)
-               VALUES (?,?,?,?,?,0,0)""",
+               VALUES (?,?,?,?,?,0,0)
+               ON CONFLICT(peer_id) DO UPDATE SET
+                   ip=excluded.ip, port=excluded.port,
+                   last_seen=excluded.last_seen,
+                   reputation=excluded.reputation,
+                   fail_count=0""",
             (peer_id, ip, port, ts, reputation))
         self._conn().commit()
 
@@ -3240,27 +3248,34 @@ class Storage:
         return [dict(r) for r in rows]
 
     def mark_peer_fail(self, peer_id: str):
+        """Record a failed or disconnected session for ``peer_id``.
+
+        VSA-17: a blacklist is a security sanction.  A routine failure or disconnect
+        update never clears it.  Only an explicit unban may.  Reputation above 0.5
+        resets the failure counter and leaves the blacklist flag alone.
+        """
         if self._pgx_enabled:
             row = self._pg_fetchrow(
-                "SELECT fail_count, reputation FROM peers WHERE peer_id=$1", peer_id)
+                "SELECT fail_count, reputation, blacklisted FROM peers WHERE peer_id=$1",
+                peer_id)
             if not row:
                 return
             if float(row["reputation"] or 0.0) > 0.5:
                 self._pg_exec(
-                    """UPDATE peers SET fail_count=0, blacklisted=FALSE,
-                                        updated_at=now() WHERE peer_id=$1""",
+                    """UPDATE peers SET fail_count=0, updated_at=now()
+                       WHERE peer_id=$1""",
                     peer_id)
                 try:
                     with self._aux_lock:
                         self._conn().execute(
-                            "UPDATE peers SET fail_count=0, blacklisted=0 WHERE peer_id=?",
+                            "UPDATE peers SET fail_count=0 WHERE peer_id=?",
                             (peer_id,))
                         self._conn().commit()
                 except Exception:
                     pass
                 return
             new_fail = int(row["fail_count"] or 0) + 1
-            bl = new_fail >= Config.PEER_MAX_FAIL
+            bl = bool(row["blacklisted"]) or new_fail >= Config.PEER_MAX_FAIL
             self._pg_exec(
                 """UPDATE peers SET fail_count=$2, blacklisted=$3,
                                     updated_at=now() WHERE peer_id=$1""",
@@ -3275,18 +3290,18 @@ class Storage:
                 pass
             return
         row = self._conn().execute(
-            "SELECT fail_count, reputation FROM peers WHERE peer_id=?",
+            "SELECT fail_count, reputation, blacklisted FROM peers WHERE peer_id=?",
             (peer_id,)).fetchone()
         if not row:
             return
         if row["reputation"] > 0.5:
             self._conn().execute(
-                "UPDATE peers SET fail_count=0, blacklisted=0 WHERE peer_id=?",
+                "UPDATE peers SET fail_count=0 WHERE peer_id=?",
                 (peer_id,))
             self._conn().commit()
             return
         new_fail = row["fail_count"] + 1
-        blacklisted = 1 if new_fail >= Config.PEER_MAX_FAIL else 0
+        blacklisted = 1 if (row["blacklisted"] or new_fail >= Config.PEER_MAX_FAIL) else 0
         self._conn().execute(
             "UPDATE peers SET fail_count=?,blacklisted=? WHERE peer_id=?",
             (new_fail, blacklisted, peer_id))

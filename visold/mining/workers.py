@@ -189,11 +189,10 @@ def _cy_mine_worker(fmt_template: str,
 
     while not stop_flag.is_set():
 
-        # ── Timestamp refresh (only advance forward, never regress MTP) ───
+        # ── VSA-28: the candidate timestamp is fixed ──────────────────────
+        # The state root was computed at initial_ts, so the header timestamp must
+        # not move during the search.  Stale candidates are rebuilt by the engine.
         if tick >= REFRESH:
-            new_ts = cython.cast(cython.ulonglong, int(_t.time()))
-            if new_ts > local_ts:
-                local_ts = new_ts
             tick = 0
 
         # ── Hash  (GIL is released inside hashlib's C implementation) ────
@@ -289,11 +288,8 @@ def _cpu_mine_thread(header_base: dict,
     tick     = 0
 
     while not stop_flag.is_set():
-        # ── Advance timestamp (never regress below MTP floor) ─────────────
+        # ── VSA-28: the candidate timestamp is fixed (see _cy_mine_worker) ──
         if tick >= REFRESH:
-            new_ts = int(_t.time())
-            if new_ts > local_ts:
-                local_ts = new_ts
             tick = 0
 
         h['nonce']     = nonce
