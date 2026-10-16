@@ -53,4 +53,4 @@ background reliability should be measured on each supported Android device. A
 
 For easy setup, use our [Android APK](https://github.com/maity23himadri/Visold_APK).
 
-**Network status:** The latest Android APK is currently on testnet.
+Network status: The latest Android APK, and this blockchain is currently on testnet.
