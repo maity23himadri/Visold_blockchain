@@ -49,6 +49,6 @@ changing dashboard rows are still updated incrementally. Actual responsiveness a
 background reliability should be measured on each supported Android device. A
 `tmux` session does not override Android's process-killing or power-management rules.
 
-## Android APK and testnet status
+## Android APK
 
-The latest Android APK is [v1.1.2](https://github.com/maity23himadri/Visold_APK/blob/main/releases/Visold-Android-v1.1%282%29.apk) and is currently on **testnet**. It includes a consensus change compared with previous builds; review compatibility before installing. See [ANDROID_APK_TESTNET_STATUS.md](ANDROID_APK_TESTNET_STATUS.md) for the release details and checksum.
+For easy setup, use our [Android APK](https://github.com/maity23himadri/Visold_APK).
