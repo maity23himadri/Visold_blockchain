@@ -29,6 +29,8 @@ import threading
 from typing import Optional, TYPE_CHECKING
 
 from visold.kernel.config import Config
+from visold.crypto.hashing import sha256
+from visold.ledger.transaction import Transaction
 from visold.kernel.logging_setup import log
 from visold.kernel.metrics import metrics
 
@@ -76,6 +78,44 @@ class RollingWindowPruner:
     locks (_commit_lock, _aux_lock).  maybe_prune() is re-entrant; a second
     call while a prune pass is running is a no-op.
     """
+
+    @staticmethod
+    def _merkle_proof_for_index(tx_ids, target_index: int, block_height: int):
+        """Return a V1/V2-compatible Merkle proof for one retained tx id."""
+        hashes = [str(x) for x in tx_ids]
+        if not hashes or target_index < 0 or target_index >= len(hashes):
+            return None
+        idx = int(target_index)
+        proof = []
+        v2 = int(block_height) >= int(Config.MERKLE_V2_ACTIVATION_HEIGHT)
+        if v2:
+            odd_tag = "|odd|"
+            while len(hashes) > 1:
+                pairs = len(hashes) // 2
+                paired = pairs * 2
+                if idx < paired:
+                    sib = idx ^ 1
+                    proof.append({"hash": hashes[sib],
+                                  "side": "R" if idx % 2 == 0 else "L"})
+                else:
+                    proof.append({"hash": "", "side": "ODD"})
+                nxt = [sha256((hashes[2*i] + hashes[2*i+1]).encode())
+                       for i in range(pairs)]
+                if len(hashes) % 2:
+                    nxt.append(sha256((odd_tag + hashes[-1]).encode()))
+                idx = idx // 2 if idx < paired else len(nxt) - 1
+                hashes = nxt
+            return proof
+        while len(hashes) > 1:
+            if len(hashes) % 2:
+                hashes.append(hashes[-1])
+            sib = idx ^ 1
+            proof.append({"hash": hashes[sib],
+                          "side": "R" if idx % 2 == 0 else "L"})
+            hashes = [sha256((hashes[i] + hashes[i+1]).encode())
+                      for i in range(0, len(hashes), 2)]
+            idx //= 2
+        return proof
 
     def __init__(self, storage: 'Storage'):
         self._storage       = storage
@@ -290,6 +330,30 @@ class RollingWindowPruner:
                     # De-duplicate while preserving deterministic order.
                     pgx_tx_ids = list(dict.fromkeys(pgx_tx_ids))
 
+                # Preserve an authenticated bootstrap commitment even after
+                # the containing block body is pruned.  We retain only the
+                # coinbase transaction plus its Merkle co-path; a newcomer can
+                # verify inclusion against the permanent block-header
+                # merkle_root without retaining any other transaction body.
+                _bootstrap_meta = None
+                _full_txs = list(full.get("transactions", []) or [])
+                if _full_txs and isinstance(_full_txs[0], dict):
+                    _cb = _full_txs[0]
+                    _commit = Transaction.parse_bootstrap_commitment(
+                        str(_cb.get("memo", "")))
+                    if _commit is not None and _cb.get("tx_id"):
+                        _txids = [str(t.get("tx_id", ""))
+                                  for t in _full_txs if isinstance(t, dict)]
+                        if len(_txids) == len(_full_txs) and all(_txids):
+                            _proof = self._merkle_proof_for_index(_txids, 0, idx)
+                            if _proof is not None:
+                                _bootstrap_meta = {
+                                    "snapshot_height": int(_commit[0]),
+                                    "digest": str(_commit[1]),
+                                    "coinbase": dict(_cb),
+                                    "merkle_proof": _proof,
+                                }
+
                 header = {
                     "version": full.get("version", 1),
                     "protocol_version": full.get(
@@ -311,6 +375,8 @@ class RollingWindowPruner:
                     "pruned": True,
                     "transactions": [],
                 }
+                if _bootstrap_meta is not None:
+                    header["bootstrap_commitment"] = _bootstrap_meta
 
                 # ── Archive before any irreversible transaction deletion ────
                 # For PGX/KV the archive lives in auxiliary SQLite, while the

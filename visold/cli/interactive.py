@@ -1504,6 +1504,7 @@ class CLI:
         # rollup status, etc.).  Selecting "0" inside the L2 dashboard
         # returns here.
         ("26", "L2 Dashboard ▶"),
+        ("27", "MEV protection: OFF"),
         ("H",  "Help & Keyboard Tips"),
         ("B",  "Detach UI (keep node running)"),
         ("99", "Diagnose Sync (live trace)"),
@@ -2066,6 +2067,7 @@ class CLI:
         col       = max(28, (W - 4) // 2)
 
         _lookup: dict = {k: v for k, v in self.MENU}
+        _lookup["27"] = self._mev_menu_label()
 
         printed = 0
         def _emit(line: str = "") -> None:
@@ -2135,6 +2137,9 @@ class CLI:
         _row1("26", BLUE)
         _emit()
 
+        _sec("PRIVACY", YELLOW)
+        _row1("27", YELLOW)
+        _emit()
         _sec("HELP & SESSION", CYAN)
         _row2("H", CYAN, "B", GREEN)
         _emit()
@@ -2258,6 +2263,7 @@ class CLI:
             "24": self._governance_propose,
             "25": self._vvm_inspect,
             "26": self._l2_dashboard,
+            "27": self._toggle_mev_protection,
             "H":  self._show_tui_help,
             "h":  self._show_tui_help,
             "B":  self._detach_tui,
@@ -2295,6 +2301,39 @@ class CLI:
                 pass
 
     # ── Menu handlers ─────────────────────────────────────────────────────────
+
+    def _mev_menu_label(self) -> str:
+        """Menu label for item 27, showing the node's current MEV protection setting."""
+        from visold.mempool import mev as _mev
+        try:
+            on = _mev.protection_default(self.node.storage)
+        except Exception:
+            return "MEV protection"
+        return f"MEV protection: {'ON' if on else 'OFF'}"
+
+    def _toggle_mev_protection(self):
+        """Switch MEV protection on or off for this node's own transfers.
+
+        The choice is stored on the node, so it survives a restart. It does not change
+        a transfer that is already in progress.
+        """
+        from visold.mempool import mev as _mev
+        storage = self.node.storage
+        current = _mev.protection_default(storage)
+        target = not current
+        print(clr("\n  ── MEV protection ──", YELLOW))
+        print(f"  Currently: {'ON' if current else 'OFF'}")
+        print("  When ON, each transfer you send goes out in two steps. The first step")
+        print("  records a sealed commitment on the chain. About 3 blocks later (roughly")
+        print("  3 minutes) the transfer itself goes out. Until it has gone out, this")
+        print("  wallet cannot send anything else.")
+        answer = self._read_input(
+            f"  Turn MEV protection {'ON' if target else 'OFF'}? (y/n): ").strip().lower()
+        if answer not in ("y", "yes"):
+            print(clr("  No change.", DIM))
+            return
+        _mev.set_protection_default(storage, target)
+        print(clr(f"  MEV protection is now {'ON' if target else 'OFF'}.", GREEN))
 
     def _show_tui_help(self):
         """Show concise, phone-friendly usage and clipboard guidance."""
@@ -2841,6 +2880,12 @@ class CLI:
         print(f"  Transaction fee (sender-side): {fee:.8f} VSD")
         print(f"  Total deducted from you     : {amount + fee:.8f} VSD")
         print(f"  Recipient receives           : {amount:.8f} VSD")
+        from visold.mempool import mev as _mev
+        if _mev.protection_default(self.node.storage):
+            print(clr("  MEV protection is on: this transfer is committed first and is "
+                      f"broadcast {Config.COMMIT_REVEAL_DELAY_BLOCKS} blocks later. "
+                      "Its contents stay hidden until then. After it is broadcast, "
+                      "validators and bots can see it.", YELLOW))
         confirm = self._read_input("  Confirm? (y/n): ").strip().lower()
         if confirm != 'y':
             print("  Cancelled."); return

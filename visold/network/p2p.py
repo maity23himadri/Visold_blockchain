@@ -77,6 +77,10 @@ from visold.kernel.messages import (
     MSG_PONG,
     MSG_POW_CHALLENGE,
     MSG_RATE_DEFECTION_EVIDENCE,
+    MSG_RECEIPT_ACK,
+    MSG_RECEIPT_PUT,
+    MSG_RECEIPT_QUERY,
+    MSG_RECEIPT_RESPONSE,
     MSG_REJECT,
     MSG_RESOLVE,
     MSG_RESOLVE_RESP,
@@ -123,6 +127,7 @@ from visold.network.message_logger import P2PMessageLogger
 from visold.network.nat.ice import ICEManager, _pow_check, _pow_solve
 from visold.network.nat.upnp import UPnPManager
 from visold.network.peer_connection import PeerConnection
+from visold.network.receipt_relay import ReceiptRelayManager
 from visold.network.tls import TLSManager
 from visold.network.udp.latency import LatencyTracker
 from visold.network.udp.transport import UDPPeerConnection, UDPTransport
@@ -198,6 +203,12 @@ class P2PNetwork:
         # spamming reports is harmless (governor's per-peer key dedupes them)
         # but still consumes bandwidth, so we cap.
         "HASHRATE_REPORT":   30,
+        # VARR temporary mailbox. PUT/ACK are bounded because each canonical
+        # transfer is replicated to a small fixed number of deterministic slots.
+        "RECEIPT_PUT":       240,
+        "RECEIPT_QUERY":      80,
+        "RECEIPT_RESPONSE":   80,
+        "RECEIPT_ACK":       240,
 
         # ── v7.7.0 Rate defection evidence ───────────────────────────────────
         # Audit cycles run every RATE_AUDIT_CADENCE (50) blocks, at most one
@@ -218,6 +229,10 @@ class P2PNetwork:
         self.port        = port
         self.node_id     = node_id or sha256(wallet.pub_hex.encode())
         self.router      = KademliaRouter(self.node_id)
+        self._receipt_relay = ReceiptRelayManager(
+            blockchain, storage, wallet, self.node_id)
+        self._receipt_ack_sent = LRUCache(8192, ttl=3600)
+        self._receipt_repair_slot = 0
         self.peers: Dict[str, PeerConnection] = {}
         self._lock       = threading.Lock()
         self._block_serve_cache = LRUCache(5, ttl=60.0) 
@@ -339,6 +354,9 @@ class P2PNetwork:
         threading.Thread(target=self._ban_score_decay_loop, daemon=True).start()
         # v7.5.0: compact-block stash GC thread
         threading.Thread(target=self._cmpct_stash_gc_loop, daemon=True).start()
+        if Config.RECEIPT_RELAY_ENABLED:
+            threading.Thread(target=self._receipt_maintenance_loop, daemon=True,
+                             name="varr-maint").start()
         log.info(f"P2P dual-stack node starting on port {self.port} "
                  f"(bind={Config.BIND_ADDRESS}) | node_id={self.node_id[:16]}...")
         threading.Thread(target=self._bootstrap, daemon=True).start()
@@ -2721,6 +2739,12 @@ class P2PNetwork:
             # Adding to skip set lets the same evidence reach all nodes
             # quickly; the auditor's own dedup prevents duplicate slashing.
             MSG_RATE_DEFECTION_EVIDENCE,
+            # VARR messages are routed point-to-point.  Their own receipt_id /
+            # request path / ACK signature provides dedup semantics.
+            MSG_RECEIPT_PUT,
+            MSG_RECEIPT_QUERY,
+            MSG_RECEIPT_RESPONSE,
+            MSG_RECEIPT_ACK,
         })
 
         if mtype not in _GOSSIP_DEDUP_SKIP:
@@ -3748,6 +3772,18 @@ class P2PNetwork:
                 pass
 
         elif mtype == MSG_CHAIN:
+            # Authenticated fresh-node bootstrap uses MSG_GET_CHAIN as a
+            # header transport.  Route those explicitly-correlated responses
+            # to its private queue before normal full-block sync tries to apply
+            # intentionally-pruned records.
+            _bootstrap_q = getattr(peer, "_bootstrap_header_queue", None)
+            if _bootstrap_q is not None:
+                try:
+                    _bootstrap_q.put(msg, timeout=1)
+                except Exception:
+                    pass
+                return
+
             # ── Route through StateEngine (single-writer) ─────────────────────
             #
             # v6.9.9.7 improvements:
@@ -4038,6 +4074,18 @@ class P2PNetwork:
                 # so this code path is consistent and never blocks.
                 threading.Thread(target=_apply_chain_direct,
                                  daemon=True).start()
+
+        elif mtype == MSG_RECEIPT_PUT:
+            self._handle_receipt_put(peer, msg)
+
+        elif mtype == MSG_RECEIPT_QUERY:
+            self._handle_receipt_query(peer, msg)
+
+        elif mtype == MSG_RECEIPT_RESPONSE:
+            self._handle_receipt_response(peer, msg)
+
+        elif mtype == MSG_RECEIPT_ACK:
+            self._handle_receipt_ack(peer, msg)
 
         elif mtype == MSG_VALIDATOR_SIG:
             # ── Route through StateEngine (single-writer) ─────────────────────
@@ -4643,6 +4691,309 @@ class P2PNetwork:
                     target=_fanout_send, args=(p, msg, _pri), daemon=True
                 ).start()
 
+    # ── VARR authenticated temporary receipt mailbox ─────────────────────
+    def _receipt_distance(self, node_id: str, route_key: str) -> int:
+        try:
+            return (self.router._to_160bit_int(node_id)
+                    ^ self.router._to_160bit_int(route_key))
+        except Exception:
+            return (1 << Config.KAD_BITS)
+
+    def _receipt_forward_closer(self, msg: dict, route_key: str,
+                                *, exclude: str = "") -> bool:
+        """Route a VARR message toward ``route_key`` over the connected mesh.
+
+        The preferred path strictly decreases XOR distance.  On sparse/tree
+        meshes a bounded fallback may probe an unvisited farther neighbour to
+        escape a local minimum.  The return value is deliberately True only
+        when a *strictly closer* hop was taken.  A fallback probe returns False
+        after sending, so the current local minimum also stores/responds/ACKs
+        instead of abandoning a valid custodian while exploring another path.
+        ``path`` plus the hop/fallback budgets bound loops and amplification.
+        """
+        hops = int(msg.get("hops", 0))
+        if hops <= 0:
+            return False
+        path = list(msg.get("path", [])) if isinstance(msg.get("path", []), list) else []
+        if len(path) > int(Config.RECEIPT_ROUTE_HOPS) + 2:
+            return False
+        visited = {str(x) for x in path}
+        local_d = self._receipt_distance(self.node_id, route_key)
+        with self._lock:
+            candidates = [p for pid, p in self.peers.items()
+                          if p.connected and pid != exclude and pid not in visited]
+        candidates.sort(key=lambda p: self._receipt_distance(p.peer_id, route_key))
+        closer = [p for p in candidates
+                  if self._receipt_distance(p.peer_id, route_key) < local_d]
+        fallback = max(0, int(msg.get(
+            "fallback", getattr(Config, "RECEIPT_ROUTE_FALLBACK_HOPS", 0))))
+        chosen = closer[:max(1, int(Config.RECEIPT_ROUTE_FANOUT))]
+        used_fallback = False
+        if not chosen and candidates and fallback > 0:
+            # Sparse/tree meshes can contain a local XOR minimum: the only path
+            # to a much closer node may begin with one temporarily farther hop.
+            # Explore a tightly bounded number of unvisited alternatives.
+            chosen = candidates[:max(1, int(Config.RECEIPT_ROUTE_FANOUT))]
+            used_fallback = True
+        sent = False
+        for p in chosen:
+            out = dict(msg)
+            out["hops"] = hops - 1
+            out["fallback"] = fallback - 1 if used_fallback else fallback
+            out["path"] = path
+            try:
+                p.send(out)
+                sent = True
+            except Exception:
+                continue
+        # If we only used a bounded fallback, the caller must also act locally.
+        # This avoids losing the closest-known replica/query result merely
+        # because a farther exploratory branch exists.
+        return bool(sent and not used_fallback)
+
+    def _receipt_route_put(self, receipt: dict, slot: int) -> None:
+        try:
+            summary = self._receipt_relay.receipt_summary(receipt)
+            receiver = summary["receiver"]
+            route_key = self._receipt_relay.mailbox_key(receiver, int(slot))
+            msg = {
+                "type": MSG_RECEIPT_PUT,
+                "receiver": receiver,
+                "slot": int(slot),
+                "route_key": route_key,
+                "receipt": receipt,
+                "hops": int(Config.RECEIPT_ROUTE_HOPS),
+                "fallback": int(Config.RECEIPT_ROUTE_FALLBACK_HOPS),
+                "path": [self.node_id],
+            }
+            if not self._receipt_forward_closer(msg, route_key):
+                self._receipt_relay.store_relay_receipt(receipt, int(slot))
+        except Exception as exc:
+            log.debug("[VARR] route PUT failed: %s", exc)
+
+    def _receipt_route_ack(self, ack: dict, slot: int) -> None:
+        try:
+            receiver = str(ack.get("receiver", ""))
+            route_key = self._receipt_relay.mailbox_key(receiver, int(slot))
+            msg = {
+                "type": MSG_RECEIPT_ACK,
+                "receiver": receiver,
+                "slot": int(slot),
+                "route_key": route_key,
+                "ack": ack,
+                "hops": int(Config.RECEIPT_ROUTE_HOPS),
+                "fallback": int(Config.RECEIPT_ROUTE_FALLBACK_HOPS),
+                "path": [self.node_id],
+            }
+            if not self._receipt_forward_closer(msg, route_key):
+                self._receipt_relay.accept_ack(ack)
+        except Exception as exc:
+            log.debug("[VARR] route ACK failed: %s", exc)
+
+    def _receipt_query_slot(self, slot: int) -> None:
+        receiver = self.wallet.address
+        route_key = self._receipt_relay.mailbox_key(receiver, int(slot))
+        request_id = secrets.token_hex(16)
+        msg = {
+            "type": MSG_RECEIPT_QUERY,
+            "receiver": receiver,
+            "slot": int(slot),
+            "route_key": route_key,
+            "request_id": request_id,
+            "hops": int(Config.RECEIPT_ROUTE_HOPS),
+            "path": [self.node_id],
+        }
+        if not self._receipt_forward_closer(msg, route_key):
+            # We are the current custodian for this slot; consume locally.
+            receipts = self._receipt_relay.get_mailbox(receiver, int(slot))
+            self._consume_receipt_response(receipts)
+
+    def query_receipt_mailbox(self) -> None:
+        """Query all deterministic mailbox replicas through any connected peer."""
+        if not Config.RECEIPT_RELAY_ENABLED:
+            return
+        for slot in self._receipt_relay.slots():
+            self._receipt_query_slot(slot)
+
+    def publish_receipts_for_block(self, block: Block) -> int:
+        """Publish proof-carrying receipts for a newly canonical full block.
+
+        To avoid O(nodes × txs) duplicate publication, the miner and the actual
+        transaction sender publish.  A sparse deterministic backup witness is
+        also selected (~1/4096 nodes per tx) so a vanished miner/sender is not
+        the only possible publisher on a large network.  Every custodian still
+        verifies the canonical Merkle proof independently before storing.
+        """
+        if not Config.RECEIPT_RELAY_ENABLED or getattr(block, "is_pruned", False):
+            return 0
+        published = 0
+        for tx in list(block.transactions):
+            if tx.sender == "COINBASE" or not tx.receiver:
+                continue
+            receipt = self._receipt_relay.build_receipt(block, tx)
+            if receipt is None:
+                continue
+            summary = self._receipt_relay.receipt_summary(receipt)
+            if summary["receiver"] == self.wallet.address:
+                ok, _ = self._receipt_relay.deliver_to_local_wallet(receipt)
+                if ok:
+                    ack = self._receipt_relay.make_ack(receipt["receipt_id"])
+                    for slot in self._receipt_relay.slots():
+                        self._receipt_route_ack(ack, slot)
+                continue
+            # Miner + original sender are natural publishers.  Deterministic
+            # sparse witnesses add availability without every node republishing.
+            witness = (int(sha256(f"{tx.tx_id}|{self.node_id}".encode())[:8], 16)
+                       % 4096 == 0)
+            if not (self.wallet.address == block.miner_address
+                    or self.wallet.address == tx.sender or witness):
+                continue
+            for slot in self._receipt_relay.slots():
+                self._receipt_route_put(receipt, slot)
+            published += 1
+        return published
+
+    def _handle_receipt_put(self, peer: PeerConnection, msg: dict) -> None:
+        try:
+            receiver = str(msg.get("receiver", ""))
+            slot = int(msg.get("slot", -1))
+            if slot not in self._receipt_relay.slots():
+                return
+            route_key = self._receipt_relay.mailbox_key(receiver, slot)
+            if msg.get("route_key") != route_key:
+                return
+            receipt = msg.get("receipt")
+            if not isinstance(receipt, dict):
+                return
+            # Verify before forwarding so malformed/forged receipts cannot use
+            # honest nodes as an amplification network.
+            ok, reason = self._receipt_relay.verify_receipt(receipt, require_canonical=True)
+            if not ok:
+                log.debug("[VARR] rejected receipt PUT: %s", reason)
+                return
+            summary = self._receipt_relay.receipt_summary(receipt)
+            if summary["receiver"] != receiver:
+                return
+            path = list(msg.get("path", [])) if isinstance(msg.get("path", []), list) else []
+            if self.node_id in path:
+                return
+            path.append(self.node_id)
+            routed = dict(msg); routed["path"] = path
+            if not self._receipt_forward_closer(routed, route_key, exclude=peer.peer_id):
+                self._receipt_relay.store_relay_receipt(receipt, slot)
+        except Exception as exc:
+            log.debug("[VARR] PUT handler error: %s", exc)
+
+    def _receipt_send_response_back(self, msg: dict) -> None:
+        path_back = list(msg.get("path_back", [])) if isinstance(msg.get("path_back", []), list) else []
+        if not path_back:
+            self._consume_receipt_response(msg.get("receipts", []))
+            return
+        next_id = str(path_back.pop(0))
+        with self._lock:
+            p = self.peers.get(next_id)
+        if p is None or not p.connected:
+            return
+        out = dict(msg); out["path_back"] = path_back
+        try: p.send(out)
+        except Exception: pass
+
+    def _handle_receipt_query(self, peer: PeerConnection, msg: dict) -> None:
+        try:
+            receiver = str(msg.get("receiver", ""))
+            slot = int(msg.get("slot", -1))
+            if slot not in self._receipt_relay.slots():
+                return
+            route_key = self._receipt_relay.mailbox_key(receiver, slot)
+            if msg.get("route_key") != route_key:
+                return
+            path = list(msg.get("path", [])) if isinstance(msg.get("path", []), list) else []
+            if self.node_id in path:
+                return
+            path.append(self.node_id)
+            routed = dict(msg); routed["path"] = path
+            if self._receipt_forward_closer(routed, route_key, exclude=peer.peer_id):
+                return
+            receipts = self._receipt_relay.get_mailbox(receiver, slot)
+            resp = {
+                "type": MSG_RECEIPT_RESPONSE,
+                "request_id": str(msg.get("request_id", "")),
+                "receiver": receiver,
+                "slot": slot,
+                "receipts": receipts,
+                "path_back": list(reversed(path[:-1])),
+            }
+            self._receipt_send_response_back(resp)
+        except Exception as exc:
+            log.debug("[VARR] QUERY handler error: %s", exc)
+
+    def _consume_receipt_response(self, receipts) -> None:
+        if not isinstance(receipts, list):
+            return
+        for receipt in receipts[:int(Config.RECEIPT_QUERY_LIMIT)]:
+            if not isinstance(receipt, dict):
+                continue
+            ok, _ = self._receipt_relay.deliver_to_local_wallet(receipt)
+            if not ok:
+                continue
+            rid = receipt.get("receipt_id", "")
+            if self._receipt_ack_sent.get(rid):
+                continue
+            ack = self._receipt_relay.make_ack(rid)
+            for slot in self._receipt_relay.slots():
+                self._receipt_route_ack(ack, slot)
+            self._receipt_ack_sent.put(rid, True)
+
+    def _handle_receipt_response(self, peer: PeerConnection, msg: dict) -> None:
+        # Responses follow the query's reverse peer path.  No sender is trusted;
+        # every receipt is re-verified against our canonical header on delivery.
+        self._receipt_send_response_back(msg)
+
+    def _handle_receipt_ack(self, peer: PeerConnection, msg: dict) -> None:
+        try:
+            receiver = str(msg.get("receiver", ""))
+            slot = int(msg.get("slot", -1))
+            if slot not in self._receipt_relay.slots():
+                return
+            route_key = self._receipt_relay.mailbox_key(receiver, slot)
+            if msg.get("route_key") != route_key:
+                return
+            ack = msg.get("ack")
+            ok, _ = self._receipt_relay.verify_ack(ack)
+            if not ok or str(ack.get("receiver", "")) != receiver:
+                return
+            path = list(msg.get("path", [])) if isinstance(msg.get("path", []), list) else []
+            if self.node_id in path:
+                return
+            path.append(self.node_id)
+            routed = dict(msg); routed["path"] = path
+            if not self._receipt_forward_closer(routed, route_key, exclude=peer.peer_id):
+                self._receipt_relay.accept_ack(ack)
+        except Exception as exc:
+            log.debug("[VARR] ACK handler error: %s", exc)
+
+    def _receipt_maintenance_loop(self) -> None:
+        # Startup delay lets chain sync/header bootstrap settle before mailbox
+        # proofs are queried.  Invalid/unavailable headers simply cause a later retry.
+        time.sleep(5)
+        tick = 0
+        while self._running:
+            try:
+                self._receipt_relay.gc_delivered()
+                # Query the local wallet on every pass.  Direct connectivity to
+                # custodians is not required; the request is routed over peers.
+                self.query_receipt_mailbox()
+                # Self-healing: every surviving custodian republishes one slot
+                # per held receipt per pass.  Across RECEIPT_REPLICA_SLOTS passes
+                # a single surviving copy can reconstruct the complete replica set.
+                slot = self._receipt_repair_slot % int(Config.RECEIPT_REPLICA_SLOTS)
+                self._receipt_repair_slot += 1
+                for _held_slot, receipt in self._receipt_relay.held_receipts(limit=128):
+                    self._receipt_route_put(receipt, slot)
+            except Exception as exc:
+                log.debug("[VARR] maintenance error: %s", exc)
+            time.sleep(max(5, int(Config.RECEIPT_REPAIR_INTERVAL_SECS)))
+
     def broadcast_tx(self, tx: Transaction):
         msg = {"type": MSG_TX, "tx": tx.to_dict(), "ttl": Config.GOSSIP_TTL}
         self._gossip(msg)
@@ -5028,6 +5379,11 @@ class P2PNetwork:
         local_h = self.blockchain.height()
         if local_h > Config.SNAPSHOT_FAST_SYNC_MIN_HEIGHT:
             return False
+        # Fresh nodes need the authenticated header+snapshot path.  The
+        # parallel chunk path below intentionally remains for nodes that
+        # already possess the canonical anchor locally.
+        if local_h == 0:
+            return self._fast_sync_legacy(peer)
 
         import queue as _queue_mod
 
@@ -5454,6 +5810,166 @@ class P2PNetwork:
 
         return True
 
+    def _authenticated_bootstrap_from_manifest(self, peer: 'PeerConnection',
+                                              manifest: list, resp_q,
+                                              snapshot_timeout: float = 60) -> bool:
+        """Bootstrap a fresh or stale-prefix node although peers prune bodies.
+
+        Security boundary: peer manifest data is untrusted.  We download and
+        verify the PoW header chain from the locally-known genesis through the
+        commitment block H+1, authenticate the snapshot digest via the
+        coinbase Merkle commitment, and only then install snapshot H.
+        """
+        import queue as _queue_mod
+        import uuid as _uuid
+        from visold.network.bootstrap_sync import verify_bootstrap_header_chain
+
+        local_height = int(self.blockchain.height())
+        genesis_hash = self.storage.get_meta("genesis_hash")
+        if not genesis_hash:
+            g = self.blockchain.get_block(0)
+            genesis_hash = getattr(g, "block_hash", "") if g else ""
+        if not genesis_hash:
+            log.warning("[BootstrapSync] Local genesis trust anchor unavailable")
+            return False
+
+        # Newest advertised complete-format snapshot first.  At a chain tip
+        # exactly on boundary H, snapshot H is not committed until H+1 exists;
+        # verification therefore naturally falls through to the previous one.
+        candidates = []
+        for e in manifest if isinstance(manifest, list) else []:
+            try:
+                h = int(e.get("height", -1))
+            except Exception:
+                continue
+            if h > local_height and e.get("bootstrap_digest"):
+                candidates.append((h, e))
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        if not candidates:
+            log.info("[BootstrapSync] Peer has no consensus-authenticated snapshot")
+            return False
+
+        header_q = _queue_mod.Queue(maxsize=8)
+        peer._bootstrap_header_queue = header_q
+        try:
+            for snap_h, entry in candidates:
+                target = snap_h + 1
+                headers = []
+                failed = False
+                start = 0
+                while start <= target and peer.connected:
+                    end = min(target, start + int(Config.BOOTSTRAP_HEADER_PAGE_SIZE) - 1)
+                    req_id = "bootsnap-" + _uuid.uuid4().hex
+                    try:
+                        peer.send({
+                            "type": MSG_GET_CHAIN,
+                            "from_idx": start,
+                            "to_idx": end,
+                            "request_id": req_id,
+                        })
+                        msg = header_q.get(timeout=30)
+                    except (_queue_mod.Empty, Exception) as exc:
+                        log.warning("[BootstrapSync] Header page %d-%d failed: %s",
+                                    start, end, exc)
+                        failed = True
+                        break
+                    if msg.get("type") != MSG_CHAIN:
+                        failed = True
+                        break
+                    page = msg.get("blocks") or []
+                    if not page:
+                        failed = True
+                        break
+                    headers.extend(page)
+                    try:
+                        last = int(page[-1].get("index", -1))
+                    except Exception:
+                        failed = True
+                        break
+                    if last < start:
+                        failed = True
+                        break
+                    start = last + 1
+                if failed or start <= target:
+                    continue
+
+                ok, why, verified, committed_digest = verify_bootstrap_header_chain(
+                    headers, str(genesis_hash), snap_h)
+                if not ok or not committed_digest:
+                    log.warning("[BootstrapSync] Header authentication failed for h=%d: %s",
+                                snap_h, why)
+                    continue
+                advertised = str(entry.get("bootstrap_digest", ""))
+                if advertised and advertised != committed_digest:
+                    log.warning("[BootstrapSync] Manifest digest disagrees with PoW commitment at h=%d",
+                                snap_h)
+                    continue
+
+                # Snapshot response queue is already installed by the legacy
+                # fast-sync caller.  Drain stale responses before requesting H.
+                try:
+                    while True:
+                        resp_q.get_nowait()
+                except _queue_mod.Empty:
+                    pass
+                peer.send({"type": MSG_GET_SNAPSHOT, "height": snap_h})
+                try:
+                    data_msg = resp_q.get(timeout=snapshot_timeout)
+                except _queue_mod.Empty:
+                    log.warning("[BootstrapSync] Snapshot h=%d timed out", snap_h)
+                    continue
+                if data_msg.get("type") != MSG_SNAPSHOT_DATA or data_msg.get("error"):
+                    continue
+                try:
+                    blob = bytes.fromhex(data_msg.get("data_hex", ""))
+                except Exception:
+                    continue
+                if not blob:
+                    continue
+
+                ok, err = self.blockchain._snapshot_engine.restore_authenticated_bootstrap(
+                    blob, committed_digest, verified)
+                if not ok:
+                    log.warning("[BootstrapSync] Authenticated restore h=%d failed: %s",
+                                snap_h, err)
+                    continue
+
+                # Refresh in-memory L2 state from the authenticated payload.
+                try:
+                    self.blockchain.layer2._try_restore_from_storage()
+                    # Fresh Blockchain() constructed GovernanceEngine before the
+                    # authenticated snapshot existed; reload its now-restored
+                    # deterministic proposal lifecycle state.
+                    self.blockchain._governance._proposals.clear()
+                    self.blockchain._governance._blacklist.clear()
+                    self.blockchain._governance._load_persisted_proposals()
+                except Exception as exc:
+                    log.warning("[BootstrapSync] consensus-state reload failed after restore: %s", exc)
+                    return False
+
+                # Drop stale difficulty cache entries calculated while the
+                # local canonical chain was still only genesis.
+                try:
+                    from visold.consensus.difficulty import DifficultyEngine
+                    DifficultyEngine.invalidate_cache()
+                except Exception:
+                    pass
+
+                log.info(
+                    "[BootstrapSync] Authenticated snapshot h=%d installed; "
+                    "continuing ordinary full-block sync at h=%d",
+                    snap_h, snap_h + 1)
+                try:
+                    self._sync_request(
+                        peer, snap_h + 1, snap_h + 200,
+                        kind="bootstrap-post-snapshot", force=True)
+                except Exception as exc:
+                    log.warning("[BootstrapSync] Post-snapshot sync request failed: %s", exc)
+                return True
+            return False
+        finally:
+            peer._bootstrap_header_queue = None
+
     def _fast_sync_legacy(self, peer: 'PeerConnection') -> bool:
         """
         Legacy single-peer snapshot verification path.
@@ -5504,9 +6020,16 @@ class P2PNetwork:
             snap_size       = best.get("size", 0)
             snap_anchor_hash = best.get("anchor_block_hash", "")
             if self.blockchain.height() != snap_height:
+                if self.blockchain.height() < snap_height:
+                    # Safe for both fresh and stale nodes: the authenticated
+                    # path independently verifies the PoW header chain and then
+                    # requires the entire existing local chain to be an exact
+                    # canonical prefix before installing any snapshot state.
+                    return self._authenticated_bootstrap_from_manifest(
+                        peer, manifest, resp_q, SNAP_TIMEOUT)
                 log.info(
-                    "[FastSync/Legacy] Snapshot h=%d cannot safely replace local "
-                    "h=%d; falling back to ordinary block sync.",
+                    "[FastSync/Legacy] Peer snapshot h=%d is not ahead of local h=%d; "
+                    "falling back to ordinary block sync.",
                     snap_height, self.blockchain.height())
                 return False
             log.info(

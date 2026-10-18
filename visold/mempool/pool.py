@@ -35,11 +35,11 @@ from visold.kernel.logging_setup import log
 from visold.kernel.metrics import metrics
 from visold.kernel.units import VSD_GLOBAL_MARKET, from_satoshi, gas_fee_to_sat, to_satoshi
 from visold.ledger.transaction import Transaction
+from visold.mempool.mev import check_reveal, is_protected_reveal
 from visold.rollup.batches import RollupSubmission
 from visold.storage.storage import Storage
 
 if TYPE_CHECKING:  # annotation-only references (no runtime import, no cycle)
-    from visold.mempool.mev import CommitRevealMempool
     from visold.rollup.l2_state import Layer2State
 
 
@@ -203,12 +203,6 @@ class Mempool:
         # SAFE — node-local check; never relaxes consensus.  A node without
         # this reference falls through to the apply-time check as before.
         self._layer2_ref: Optional['Layer2State'] = None
-        # ── AUDIT-FIX (Batch E): MEV commit-reveal ref ────────────────────────
-        # Set once at node startup via set_mev_ref(). When present and MEV
-        # protection is enabled, add() requires a valid, sufficiently-aged
-        # reveal before admitting a transaction (see add()'s MEV gate and
-        # set_mev_ref()'s docstring for why this wiring was needed).
-        self._mev_ref: Optional['CommitRevealMempool'] = None
         # ── v7.5.0-OPT Pre-Validation Pipeline ───────────────────────────────
         # Tracks tx_ids whose full cryptographic signature check has already
         # passed.  Populated by add() at gossip-arrival time; consulted by
@@ -293,23 +287,6 @@ class Mempool:
         """
         self._layer2_ref = layer2
 
-    def set_mev_ref(self, mev_mempool: 'CommitRevealMempool') -> None:
-        """Wire the commit-reveal MEV-protection reference.
-
-        AUDIT-FIX (Batch E): CommitRevealMempool.verify_reveal() existed
-        but had no caller anywhere in the codebase, so enabling MEV
-        protection (Config.MEV_PROTECTION_ENABLED / VISOLD_MEV_PROTECT=1)
-        made getmevstatus report "enabled": true while gating nothing —
-        a transaction was admitted the same whether or not a commitment
-        had ever been submitted for it. Call this once at node startup
-        with the module-level _mev_mempool singleton so add() can
-        actually enforce the reveal check. A Mempool with no ref wired
-        (e.g. a standalone Mempool(storage) built outside normal node
-        startup) simply skips the check, same as before this fix.
-        Idempotent — calling with the same ref twice is harmless.
-        """
-        self._mev_ref = mev_mempool
-
     def add(self, tx: Transaction) -> Tuple[bool, str]:
         with self._lock:
             # ── Expiry check ──────────────────────────────────────────────────
@@ -359,19 +336,14 @@ class Mempool:
                         "Insufficient balance for identity claim fee: "
                         f"need {from_satoshi(tx.compute_fee_sat()):.8f} VSD")
 
-            # ── AUDIT-FIX (Batch E): MEV commit-reveal enforcement ─────────────
-            # CommitRevealMempool.verify_reveal() previously had no caller
-            # anywhere in the codebase, so Config.MEV_PROTECTION_ENABLED
-            # made getmevstatus report protection as active while it
-            # gated nothing — a transaction was admitted the same whether
-            # or not a commitment had ever been submitted for it. When no
-            # ref is wired (set_mev_ref() never called) or MEV protection
-            # is disabled, verify_reveal() itself short-circuits to
-            # (True, ...), so this is a no-op for nodes that don't opt
-            # in — existing behavior is unchanged for them.
-            if tx.sender != "COINBASE" and self._mev_ref is not None:
-                current_height = max(0, self.storage.chain_height())
-                mev_ok, mev_msg = self._mev_ref.verify_reveal(tx, current_height)
+            # ── MEV protected transfers (see visold/mempool/mev.py) ───────────────
+            # A reveal is admitted only when its commitment is on-chain, from the same
+            # sender, and COMMIT_REVEAL_DELAY_BLOCKS..MEV_COMMIT_MAX_AGE_BLOCKS blocks old
+            # at the height it would be mined in (the next block).  Consensus repeats
+            # this check in validate_block.
+            if is_protected_reveal(tx):
+                mev_ok, mev_msg = check_reveal(
+                    self.storage, tx, max(0, self.storage.chain_height()) + 1)
                 if not mev_ok:
                     return False, f"MEV protection: {mev_msg}"
 
@@ -388,6 +360,8 @@ class Mempool:
             # fee=0, economic backing is the L1 fee on the wrapping tx
             # and the proof verification cost in gas at apply time.
             is_rollup_tx   = tx.tx_type == Transaction.TYPE_ROLLUP
+            is_mev_commit_tx = (tx.tx_type == Transaction.TYPE_TRANSFER and
+                                str(tx.data).startswith(Config.MEV_COMMIT_PREFIX))
             # ── MEMPOOL-1 FIX: stale rollup pre-validation ────────────────────
             # Rejects TYPE_ROLLUP submissions whose previous_l2_root no longer
             # matches the current layer2 root.  Without this gate, a stale
@@ -426,6 +400,7 @@ class Mempool:
             # v7.2.0: REGISTER txs have amount == stake (may be 0 for unstake);
             # skip the dust threshold for them.
             if (not is_vvm_tx and not is_register_tx and not is_rollup_tx
+                    and not is_mev_commit_tx
                     and to_satoshi(tx.amount) < dust_sat):
                 return False, f"Amount below dust threshold ({self.DUST_THRESHOLD} VSD)"
 

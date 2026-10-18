@@ -324,6 +324,8 @@ class StateEngine:
                 if event.future is not None and not event.future.done():
                     event.future.set_result(result)
                 self._queue.task_done()
+            if event.etype == EventType.NEW_BLOCK:
+                self._release_protected_transfer()
 
     def _handle(self, event: Event) -> Tuple[bool, str]:
         """Dispatch a single event. Called only from the engine thread."""
@@ -368,6 +370,136 @@ class StateEngine:
 
     # ── Event handlers — all run on the engine thread, no concurrent writes ──
 
+    def _start_protected_transfer(self, commit_tx: Transaction,
+                                  flight_req: dict) -> Tuple[bool, str]:
+        """Start a protected transfer: record its contents, then admit the commitment.
+
+        Runs on the engine thread, so only one protected transfer is in flight. The
+        reveal is built later, once the commitment is on-chain, because it carries
+        the commitment's merkle path (see _release_protected_transfer).
+        """
+        from visold.mempool import mev
+        if mev.load_flight(self._storage) is not None:
+            return False, ("A protected transfer is still in progress. Wait until it "
+                           "is broadcast, then send again.")
+        mev.save_flight(self._storage, {
+            "phase": "commit",
+            "sender": commit_tx.sender,
+            "commit_txid": commit_tx.tx_id,
+            "commit_height": -1,
+            "started_height": int(self._blockchain.height()),
+            "core": flight_req["core"],
+            "salt": flight_req["salt"],
+            "reveal_tx": None,
+            "reveal_txid": "",
+        })
+        ok, msg = self._handle_new_tx({"tx": commit_tx}, "")
+        if not ok:
+            mev.save_flight(self._storage, None)
+            return False, msg
+        log.info(f"MEV: commitment {commit_tx.tx_id[:16]}... submitted; the protected "
+                 f"transfer is broadcast {Config.COMMIT_REVEAL_DELAY_BLOCKS} blocks "
+                 f"after the commitment is mined")
+        return True, (f"Protected transfer started. Its commitment {commit_tx.tx_id[:16]}... "
+                      f"is being mined; the transfer is broadcast once the commitment is "
+                      f"{Config.COMMIT_REVEAL_DELAY_BLOCKS} blocks deep.")
+
+    def _release_protected_transfer(self) -> None:
+        """Advance the protected transfer in flight (engine thread only).
+
+        Commit phase: wait until the commitment is mined, then record its height.
+        Reveal phase: once the commitment is COMMIT_REVEAL_DELAY_BLOCKS deep, build
+        the reveal (it carries the commitment's merkle path) and broadcast it.
+        Anything that makes the transfer impossible cancels it, and says why.
+        """
+        from visold.mempool import mev
+        try:
+            flight = mev.load_flight(self._storage)
+            if not flight:
+                return
+            tip = int(self._blockchain.height())
+            if flight.get("phase") == "commit":
+                commit_txid = flight["commit_txid"]
+                if commit_txid in self._blockchain.mempool._pending_tx_ids:
+                    if tip - int(flight["started_height"]) > mev.MAX_WAIT_BLOCKS:
+                        mev.save_flight(self._storage, None)
+                        log.warning(f"MEV: the commitment was not mined within "
+                                    f"{mev.MAX_WAIT_BLOCKS} blocks; the protected "
+                                    f"transfer was cancelled")
+                    return
+                found = mev.find_tx_height(self._storage, commit_txid,
+                                           int(flight["started_height"]), tip)
+                if found is None:
+                    mev.save_flight(self._storage, None)
+                    log.warning("MEV: the commitment left the mempool without being "
+                                "mined; the protected transfer was cancelled")
+                    return
+                flight["phase"] = "reveal"
+                flight["commit_height"] = int(found)
+                mev.save_flight(self._storage, flight)
+            commit_height = int(flight["commit_height"])
+            delay = int(Config.COMMIT_REVEAL_DELAY_BLOCKS)
+            max_age = int(Config.MEV_COMMIT_MAX_AGE_BLOCKS)
+            if tip - commit_height < delay:
+                return
+            if tip + 1 - commit_height > max_age:
+                mev.save_flight(self._storage, None)
+                log.warning("MEV: the reveal missed its window; the protected transfer "
+                            "was cancelled")
+                return
+            if flight.get("reveal_tx") is None:
+                wallet = getattr(self, "_mev_wallet", None)
+                if wallet is None:
+                    log.error("MEV: the state engine has no wallet; the protected "
+                              "transfer waits")
+                    return
+                try:
+                    reveal = mev.build_reveal_for_flight(self._storage, wallet, flight,
+                                                         commit_height)
+                except LookupError as exc:
+                    log.debug(f"MEV: reveal not buildable yet: {exc}")
+                    return
+                except ValueError as exc:
+                    mev.save_flight(self._storage, None)
+                    log.error(f"MEV: protected transfer cancelled: {exc}")
+                    return
+                flight["reveal_tx"] = reveal.to_dict()
+                flight["reveal_txid"] = reveal.tx_id
+                mev.save_flight(self._storage, flight)
+            ok, msg = self._handle_new_tx({"tx": flight["reveal_tx"]}, "")
+            if ok or "Already in" in (msg or ""):
+                mev.save_flight(self._storage, None)
+                log.info(f"MEV: protected transfer {flight['reveal_txid'][:16]}... broadcast")
+                return
+            if mev.is_transient_rejection(msg):
+                return
+            mev.save_flight(self._storage, None)
+            log.warning(f"MEV: the protected transfer was rejected and cancelled: {msg}")
+        except Exception as exc:
+            log.error(f"MEV: protected transfer update failed: {exc}", exc_info=True)
+
+    def _purge_stale_protected_reveals(self) -> None:
+        """Drop admitted reveals whose commitment can no longer be used (engine thread).
+
+        A reveal in the mempool was checked when it was admitted. If its commitment
+        has since aged out, or the block that held it was reorganised away, no block
+        can include it, so it is removed rather than left to expire.
+        """
+        from visold.mempool import mev
+        try:
+            mempool = self._blockchain.mempool
+            tip = int(self._blockchain.height())
+            for tx in mempool.get_top(mempool.size()):
+                if not mev.is_protected_reveal(tx):
+                    continue
+                ok, msg = mev.check_reveal(self._storage, tx, tip + 1)
+                if not ok and "is unavailable" not in msg and "is too recent" not in msg:
+                    mempool.remove(tx.tx_id)
+                    log.warning(f"MEV: removed reveal {tx.tx_id[:16]}...: {msg}")
+        except Exception as exc:
+            log.debug(f"MEV: stale-reveal purge skipped: {exc}")
+
+
     def _handle_new_tx(self, payload: dict,
                        source_peer: str) -> Tuple[bool, str]:
         """
@@ -384,6 +516,9 @@ class StateEngine:
             else:
                 tx = tx_data  # already a Transaction
 
+            flight_req = payload.get("mev_flight")
+            if flight_req is not None and not source_peer:
+                return self._start_protected_transfer(tx, flight_req)
             ok, msg = self._blockchain.mempool.add(tx)
             if ok and self._network and not source_peer:
                 # Only broadcast if transaction originated locally
@@ -581,6 +716,15 @@ class StateEngine:
                 return False, f"Stashed as orphan: {msg}"
 
             if ok:
+                # VARR: create/route compact authenticated wallet receipts while
+                # the full canonical transaction bodies are still available.
+                if self._network:
+                    try:
+                        self._network.publish_receipts_for_block(block)
+                    except Exception as _varr_err:
+                        # Receipts are non-consensus metadata; never turn a valid
+                        # block into an apply failure because relay service failed.
+                        log.warning(f"[VARR] receipt publication failed for #{block.index}: {_varr_err}")
                 # Drive governance state machine
                 self._governance.on_block_applied(block)
                 # BFT-FIX: received blocks must trigger this node's local
@@ -668,6 +812,11 @@ class StateEngine:
             self._storage.record_block_apply_result(block.index, ok)
 
             if ok:
+                if self._network:
+                    try:
+                        self._network.publish_receipts_for_block(block)
+                    except Exception as _varr_err:
+                        log.warning(f"[VARR] receipt publication failed for mined #{block.index}: {_varr_err}")
                 self._governance.on_block_applied(block)
                 metrics.inc("blocks_mined")
                 # BROADCAST-FIX: loud logging + guard against silent failure
@@ -894,6 +1043,9 @@ class StateEngine:
         on the last 200 blocks every timer tick.  Full scan only at startup.
         """
         try:
+            # MEV: advance the protected transfer in flight; drop stale reveals.
+            self._release_protected_transfer()
+            self._purge_stale_protected_reveals()
             # Prune expired mempool transactions
             with self._blockchain.mempool._lock:
                 self._blockchain.mempool._purge_expired()

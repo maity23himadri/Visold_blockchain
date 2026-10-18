@@ -352,7 +352,7 @@ from visold.storage.snapshot import StateSnapshotEngine
 # noqa: F401 - re-exported for backward compatibility
 from visold.mempool.pool import Mempool, _MempoolHeap
 # noqa: F401 - re-exported for backward compatibility
-from visold.mempool.mev import CommitRevealMempool, _mev_mempool
+from visold.mempool.mev import check_reveal  # noqa: F401 - re-exported
 # noqa: F401 - re-exported for backward compatibility
 from visold.consensus.slashing import SlashingEvidenceProtocol
 # noqa: F401 - re-exported for backward compatibility

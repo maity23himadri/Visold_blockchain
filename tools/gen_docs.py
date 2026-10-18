@@ -103,7 +103,7 @@ for name, m in mods.items():
     for d in m["defs"]:
         idx.setdefault(d.rstrip("()"), name)
 KEY = ["Config", "Transaction", "Block", "Wallet", "Blockchain", "ConsensusEngine", "RoleManager", "Sequencer",
-       "DifficultyEngine", "Storage", "BlockDatabase", "StateSnapshotEngine", "Mempool", "CommitRevealMempool",
+       "DifficultyEngine", "Storage", "BlockDatabase", "StateSnapshotEngine", "Mempool", "check_reveal",
        "StateEngine", "VVMEngine", "VVMAssembler", "Layer2State", "ProofRegistry", "GovernanceEngine", "P2PNetwork",
        "UDPTransport", "TLSManager", "ICEManager", "SPVClient", "ParallelMiner", "MiningEngine", "RPCServer",
        "IdentitySystem", "VisoldNode", "UserAccount", "SecurityGate", "SentinelNode", "CLI", "CLIHandler", "main",

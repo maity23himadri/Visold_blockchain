@@ -432,13 +432,19 @@ Maximal extractable value, usually shortened to MEV, is profit that a block prod
 
 ### 13.3 The commit-reveal scheme
 
-Visold includes an optional commit-reveal scheme. In the commit phase, the sender publishes only a hash that binds the transaction identifier, the sender and a nonce. Nobody can see the amount, the receiver or the memo. After a delay, which is three blocks in the current configuration, the sender reveals the full transaction. Nodes check the revealed transaction against the earlier commitment before accepting it. Because the details stayed hidden until the commitment was already on the chain, outside bots cannot front-run them.
+Visold includes an optional commit-reveal scheme, enforced by consensus. A protected transfer is two ordinary transfers from the same wallet.
 
-The scheme is off by default. An operator enables it by setting the environment variable VISOLD\_MEV\_PROTECT to 1. RPC methods report the scheme's status and accept commitments. The module's header describes the reveal as taking place in the next block, but the configuration sets a delay of three blocks, and this paper follows the configuration.
+The first is the commitment. It is a transfer from the sender to its own address for zero value, with no memo. Its data field carries a salted hash of the real transfer's contents, and its fee is the network minimum. It is mined like any other transaction, so observers can see only the hash.
+
+The second is the reveal. It is the real transfer. Its data field carries the salt, the height of the block that contains the commitment, and a merkle path that links the commitment to that block's merkle root. Validators rebuild the commitment from the reveal's own fields and check the path against the block header. They accept the reveal only when the commitment is at least three blocks older than the block that includes the reveal, and no more than twenty blocks older.
+
+Because the check uses only block headers, every node gives the same answer. That includes nodes that have pruned old block bodies, and nodes that bootstrap from an authenticated snapshot, which keep headers but not bodies below the snapshot.
+
+A node sends one protected transfer at a time. It submits the commitment, and once the commitment is three blocks deep it builds the reveal and broadcasts it. The transfer in flight is kept on the node, so a restart does not lose it. Protection is off by default. A node can turn it on with VISOLD\_MEV\_PROTECT set to 1, or from its terminal menu (item 27), and the node remembers the choice. The validation rules apply to every node.
 
 ### 13.4 What the scheme does not protect against
 
-The project's own documentation is explicit about the limit, and this paper repeats it. The scheme protects against outside bots only. It does not protect against a malicious validator. A validator receives the full revealed transaction before it builds its block proposal, and it can still place a front-running transaction ahead of the revealed one. Full protection against validators would require threshold encryption, so that no single validator can read a transaction until after it has been included. The notes list this as a research-track item tied to a planned ZK-proof integration phase in the first quarter of 2027. Users should understand this limit before relying on the feature.
+The scheme hides a transfer's contents until its commitment is on-chain. It does not fix the order in which transfers execute. Once the reveal is broadcast it is visible in the mempool like any other transfer, so a bot that can act on it before it is mined can still do so. Validators see every transfer in the clear. Protecting the order of execution would need a transfer's effect to be fixed at commit time, and protecting against validators would need threshold encryption, which is still research.
 
 ## 14. Self-healing, resilience and monitoring
 
@@ -575,7 +581,7 @@ The server exposes 59 methods, grouped in the table below.
 | Network and peers | 5 | getpeerinfo, findpeerswith, getpeerreputation, getcapabilities, getsentinelstatus |
 | Governance and protocol | 7 | getprotocolversion, getchaininfo, getupgradestatus, proposeupgrade, emergencydisable, forkchoice |
 | Diagnostics and safety | 7 | getmetrics, checkinvariants, getdbsizes, getcircuitbreaker, resetcircuitbreaker, getstatepruneinfo |
-| MEV protection | 2 | mevcommit, getmevstatus |
+| MEV protection | 1 | getmevstatus |
 | Slashing evidence | 1 | submitslashingevidence |
 | Smart contracts | 11 | deploycontract, callcontract, simulatecall, estimategas, getcontract, getcontractevents, analyzecontract |
 | Self-healing controls | 9 | shbs\_status, shbs\_log, shbs\_vote, shbs\_unfreeze, shbs\_rollback\_dry\_run |
@@ -623,7 +629,7 @@ The table sets out the main threats, the defenses in the code, and the concerns 
 | Miners exceeding hashrate caps | Local cap plus consensus-level audit | Automatic slashing is off by default |
 | Malformed or oversized messages | Size limits, invalid-message scoring and bans | Depends on the limits being set correctly |
 | Mempool flooding | Capacity cap, minimum fee, expiry | Pressure remains possible during bursts |
-| Front-running by outside bots | Optional commit-reveal scheme | Off by default |
+| Front-running by outside bots | Commit-reveal hides contents until committed; execution order is not protected | Optional, per node |
 | Front-running by validators | Not mitigated | Needs threshold encryption, which is still research |
 | Contract exploits | Sandbox, static analysis, typed values, time-locks, staged transfers | Pattern-based analysis, and no third-party VM audit |
 | Key theft | Encrypted keystore, Argon2id option, offline backup phrase | No recovery if the phrase is lost |
@@ -663,7 +669,7 @@ The table summarizes the main limitations and why each one matters.
 | Supply | No cap; 0.1 VSD per block after about 17.5 years | Long-run supply grows every year |
 | Finality | With three equal-stake validators, all three votes are needed | One offline validator stops BFT finality |
 | Layer 2 | No proof backend configured by default | Batches are not proven valid in the default setup |
-| MEV | Commit-reveal is off by default and does not stop validators | Front-running by validators remains possible |
+| MEV | Commit-reveal hides contents until committed; it does not fix execution order or stop validators | Front-running of reveals in the mempool, and by validators, remains possible |
 | Hashrate | Automatic slashing for throttling is off by default | Defection is observed but not penalized until enabled |
 | Sentinel | Alerts a human and does not take over signing | Failover depends on operator response |
 | Freezes | Local to each node | Nodes can disagree about frozen accounts |

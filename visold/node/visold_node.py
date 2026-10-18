@@ -52,7 +52,8 @@ from visold.kernel.logging_setup import log
 from visold.kernel.netutil import _write_node_status
 from visold.kernel.units import VSD_GLOBAL_MARKET, from_satoshi, to_satoshi
 from visold.ledger.transaction import Transaction
-from visold.mempool.mev import _mev_mempool
+from visold.mempool.mev import (build_commitment_tx, core_transfer, load_flight,
+                               new_salt, protection_default)
 from visold.mining.engine import MiningEngine
 from visold.network.capabilities import CapabilityRouter
 from visold.network.p2p import P2PNetwork
@@ -123,6 +124,7 @@ class VisoldNode:
             governance  = self.blockchain._governance,
             storage     = self.storage,
         )
+        self.state_engine._mev_wallet = self.wallet
 
         # ── Network — StateEngine injected after construction ──────────────────
         self.network = P2PNetwork(
@@ -243,13 +245,6 @@ class VisoldNode:
         self.blockchain._slash_evidence = self.slash_evidence
         self.network._slash_evidence    = self.slash_evidence
 
-        # ── AUDIT-FIX (Batch E): wire the MEV commit-reveal ref ───────────────
-        # Without this, CommitRevealMempool.verify_reveal() was never
-        # called by anything (see Mempool.set_mev_ref()'s docstring) and
-        # MEV protection was decorative — enabled in config/status but not
-        # actually gating admission. _mev_mempool is the module-level
-        # singleton also used by the mevcommit/getmevstatus RPC handlers.
-        self.blockchain.mempool.set_mev_ref(_mev_mempool)
 
         # ── v7.7.0: Rate Defection Auditor ───────────────────────────────────
         # Statistical detection of miners ignoring the hashrate throttle.
@@ -743,7 +738,7 @@ class VisoldNode:
                  f"| StateEngine active"
                  f"| compression={'ON' if Config.COMPRESSION_ENABLED else 'OFF'}"
                  f"| sentinel={'STANDBY' if Config.SENTINEL_MODE else 'OFF'}"
-                 f"| mev_protect={'ON' if Config.MEV_PROTECTION_ENABLED else 'OFF'}")
+                 f"| mev_protect={'ON' if protection_default(self.storage) else 'OFF'}")
 
     def stop(self):
         self.mining.stop()
@@ -768,7 +763,12 @@ class VisoldNode:
 
 
     def send_transaction(self, to_user_or_addr: str, amount: float,
-                         memo: str = "") -> Tuple[bool, str]:
+                         memo: str = "", protected=None) -> Tuple[bool, str]:
+        if not amount > 0:
+            return False, "Amount must be positive"
+        if load_flight(self.storage) is not None:
+            return False, ("A protected transfer is still in progress. Wait until it "
+                           "is broadcast, then send again.")
         # Broadcast order: empty recipient → VSD_GLOBAL_MARKET
         addr: str
         if not to_user_or_addr or to_user_or_addr == VSD_GLOBAL_MARKET:
@@ -841,6 +841,29 @@ class VisoldNode:
         chain_nonce   = self.storage.get_nonce(sender)
         pending_count = len(self.blockchain.mempool._pending_nonces.get(sender, set()))
         nonce         = chain_nonce + pending_count
+
+        # ── MEV protection: the commitment goes on-chain first; the transfer follows ──
+        use_protection = (protection_default(self.storage) if protected is None
+                          else bool(protected))
+        if use_protection:
+            commit_fee = from_satoshi(int(getattr(Config, "MIN_TX_FEE_SAT", 1000)))
+            if spendable < round(amount + fee + commit_fee, 8):
+                return False, (f"Insufficient spendable balance: a protected transfer needs "
+                               f"{amount + fee + commit_fee:.8f} VSD, including the "
+                               f"{commit_fee:.8f} VSD commitment fee")
+            ts = int(time.time())
+            salt = new_salt()
+            core = core_transfer(sender, addr, amount, fee, memo, nonce + 1, ts)
+            commit_tx = build_commitment_tx(self.wallet, nonce + 1, ts, core.mev_commitment(salt))
+            return self.state_engine.post_sync(Event(EventType.NEW_TX, {
+                "tx": commit_tx,
+                "mev_flight": {
+                    "core": {"receiver": addr, "amount_sat": to_satoshi(amount),
+                             "fee_sat": to_satoshi(fee), "memo": memo,
+                             "nonce": nonce + 1, "timestamp": ts},
+                    "salt": salt,
+                },
+            }))
 
         # BUG-FIX: fee was computed above but never forwarded to Transaction,
         # leaving tx.fee=0.0.  Mempool.add() enforces tx.fee >= amount*MIN_FEE_RATE

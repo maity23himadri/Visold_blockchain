@@ -48,9 +48,3 @@ The TUI's full-screen frame is buffered and written in one operation; frequently
 changing dashboard rows are still updated incrementally. Actual responsiveness and
 background reliability should be measured on each supported Android device. A
 `tmux` session does not override Android's process-killing or power-management rules.
-
-## Android APK
-
-For easy setup, use our [Android APK](https://github.com/maity23himadri/Visold_APK).
-
-Network status: The latest Android APK, and this blockchain is currently on testnet.

@@ -66,9 +66,20 @@ class StateSnapshotEngine:
         Called after every apply_block.  Spawns a snapshot daemon thread when
         height is a multiple of SNAPSHOT_INTERVAL.
         """
-        if not Config.SNAPSHOT_ENABLED:
-            return
-        if height <= 0 or (height % Config.SNAPSHOT_INTERVAL) != 0:
+        bootstrap_anchor = (
+            int(height) > 0
+            and int(height) % int(Config.BOOTSTRAP_SNAPSHOT_INTERVAL) == 0
+        )
+        regular_anchor = (
+            bool(Config.SNAPSHOT_ENABLED)
+            and int(height) > 0
+            and int(height) % int(Config.SNAPSHOT_INTERVAL) == 0
+        )
+        # When rolling pruning is enabled, consensus bootstrap anchors must be
+        # generated even if the optional general-purpose snapshot feature was
+        # disabled by an operator.  Otherwise that node could prune history it
+        # can no longer help newcomers replace.
+        if not regular_anchor and not (Config.ROLLING_PRUNE_ENABLED and bootstrap_anchor):
             return
         if height == self._last_snap_h:
             return
@@ -115,7 +126,8 @@ class StateSnapshotEngine:
                 self._last_snap_h = height
                 header = self._storage.get_block_header(height) or {}
                 self._update_manifest(
-                    height, state_root, len(blob), str(header.get("block_hash", ""))
+                    height, state_root, len(blob), str(header.get("block_hash", "")),
+                    bootstrap_digest=hashlib.sha256(raw).hexdigest(),
                 )
                 self._evict_old_snapshots(height)
                 log.info(
@@ -306,8 +318,58 @@ class StateSnapshotEngine:
                 for r in channel_rows if r["channel_id"]
             }
 
+            # Permanent replay protection is consensus-relevant after a
+            # snapshot jump.  Without it, a fresh node could accept and apply a
+            # transaction that was already confirmed before the snapshot.
+            if pgx:
+                replay_rows = self._storage._pg_fetch(
+                    "SELECT tx_id FROM tx_replay_guard ORDER BY convert_to(tx_id, 'UTF8') ASC", [])
+                replay_guard = [str(r["tx_id"]) for r in replay_rows if r.get("tx_id")]
+            else:
+                replay_rows = self._storage._conn().execute(
+                    "SELECT tx_id FROM tx_replay_guard ORDER BY CAST(tx_id AS BLOB) ASC"
+                ).fetchall()
+                replay_guard = [str(r["tx_id"]) for r in replay_rows if r["tx_id"]]
+
+            # Layer-2 current state is future-consensus-relevant but is stored
+            # in node_meta rather than the L1 state-root.  Commit the current
+            # tree and last accepted batch id, not the rollback history (which
+            # is local recovery metadata and can legitimately differ).
+            try:
+                l2_tree = json.loads(self._storage.get_meta("l2_tree") or "{}")
+            except Exception:
+                l2_tree = {}
+            try:
+                l2_last_batch_id = int(self._storage.get_meta("l2_last_batch_id") or -1)
+            except Exception:
+                l2_last_batch_id = -1
+
+            # Governance proposal state can change future block-version
+            # validity.  Commit only deterministic lifecycle fields; wall-clock
+            # created_at/updated_at values are intentionally excluded.
+            governance_proposals = []
+            for _row in self._storage.get_all_upgrade_proposals():
+                governance_proposals.append({
+                    "version": int(_row.get("version", 0)),
+                    "phase": str(_row.get("phase", "DORMANT")),
+                    "signal_start_height": int(_row.get("signal_start_height", 0)),
+                    "signal_end_height": int(_row.get("signal_end_height", 0)),
+                    "lock_in_height": int(_row.get("lock_in_height", 0)),
+                    "activation_height": int(_row.get("activation_height", 0)),
+                    # Decimal string avoids backend/JSON float formatting being
+                    # part of the consensus commitment. Restore converts it back.
+                    "threshold": format(float(_row.get("threshold", 0.75)), ".17g"),
+                    "rollback_window": int(_row.get("rollback_window", 0)),
+                    "disabled": 1 if bool(_row.get("disabled", 0)) else 0,
+                })
+            governance_proposals.sort(key=lambda x: x["version"])
+
+            # Cumulative new issuance is used by the monetary-supply rules and
+            # must survive a history-skipping bootstrap exactly.
+            cumulative_issued_sat = int(self._storage.get_cumulative_issued_sat())
+
             payload = {
-                "version": 3,
+                "version": 4,
                 "height": height,
                 "anchor_block_hash": anchor_hash,
                 "state_root": state_root,
@@ -320,7 +382,15 @@ class StateSnapshotEngine:
                 "roles": roles,
                 "name_claims": name_claims,
                 "state_channels": state_channels,
+                "tx_replay_guard": replay_guard,
+                "l2_tree": l2_tree,
+                "l2_last_batch_id": l2_last_batch_id,
+                "cumulative_issued_sat": cumulative_issued_sat,
+                "governance_proposals": governance_proposals,
             }
+            # Canonical JSON bytes are the object committed by the next
+            # bootstrap-commitment block.  sort_keys + compact separators make
+            # the digest independent of database row iteration order.
             raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
             if len(raw) > Config.SNAPSHOT_MAX_UNCOMPRESSED_BYTES:
                 raise ValueError(
@@ -331,9 +401,51 @@ class StateSnapshotEngine:
             log.warning("StateSnapshotEngine: serialise error: %s", e)
             return None
 
+    def compute_bootstrap_digest(self, height: int, state_root: str) -> Tuple[Optional[str], Optional[bytes], str]:
+        """Return the deterministic complete-state digest for ``height``.
+
+        The digest is SHA-256 over the *uncompressed canonical JSON bytes* so
+        it is independent of zlib implementation/version.  This function has
+        no persistent side effects and is therefore safe to call from block
+        validation: every honest validator recomputes the same value from its
+        canonical pre-block state.
+        """
+        raw = self._serialise_state(int(height), str(state_root), compress=False)
+        if raw is None:
+            return None, None, "unable to serialise deterministic bootstrap state"
+        return hashlib.sha256(raw).hexdigest(), raw, "OK"
+
+    def ensure_bootstrap_snapshot(self, height: int, state_root: str) -> Tuple[Optional[str], str]:
+        """Synchronously ensure an authenticated bootstrap snapshot is stored.
+
+        Candidate construction calls this at consensus snapshot boundaries.
+        The snapshot is persisted before the following block commits to its
+        digest, preventing a node from mining an otherwise-valid commitment
+        and then being unable to serve the corresponding state to newcomers.
+        """
+        digest, raw, err = self.compute_bootstrap_digest(height, state_root)
+        if digest is None or raw is None:
+            return None, err
+        try:
+            blob = zlib.compress(raw, level=9)
+            with self._snap_lock:
+                self._storage.set_meta(f"{self._KEY_PREFIX}{int(height)}", blob.hex())
+                header = self._storage.get_block_header(int(height)) or {}
+                self._update_manifest(
+                    int(height), str(state_root), len(blob),
+                    str(header.get("block_hash", "")),
+                    bootstrap_digest=digest,
+                )
+                self._last_snap_h = int(height)
+                self._evict_old_snapshots(int(height))
+            return digest, "OK"
+        except Exception as exc:
+            return None, f"failed to persist bootstrap snapshot: {exc}"
+
     # ── Manifest helpers ──────────────────────────────────────────────────────
     def _update_manifest(self, height: int, state_root: str, size: int,
-                         anchor_block_hash: str = ""):
+                         anchor_block_hash: str = "",
+                         bootstrap_digest: str = ""):
         """Maintain a JSON list of available snapshots in node_meta."""
         try:
             raw = self._storage.get_meta(self._MANIFEST)
@@ -342,10 +454,13 @@ class StateSnapshotEngine:
             manifest = []
         # Remove any existing entry for this height
         manifest = [e for e in manifest if e.get("height") != height]
-        manifest.append({
+        entry = {
             "height": height, "state_root": state_root, "size": size,
             "anchor_block_hash": anchor_block_hash,
-        })
+        }
+        if bootstrap_digest:
+            entry["bootstrap_digest"] = bootstrap_digest
+        manifest.append(entry)
         manifest.sort(key=lambda e: e["height"])
         self._storage.set_meta(self._MANIFEST, json.dumps(manifest))
 
@@ -358,17 +473,27 @@ class StateSnapshotEngine:
             manifest = json.loads(raw)
         except Exception:
             return
-        if len(manifest) <= Config.SNAPSHOT_KEEP:
+        # A tip exactly on a snapshot boundary has not yet mined the NEXT
+        # block that commits that snapshot digest.  Keep at least two snapshots
+        # while rolling pruning is enabled so the previous, already-committed
+        # anchor remains available to a fresh bootstrapper.
+        keep = int(Config.SNAPSHOT_KEEP)
+        if Config.ROLLING_PRUNE_ENABLED:
+            keep = max(2, keep)
+        if len(manifest) <= keep:
             return
-        to_evict = manifest[: len(manifest) - Config.SNAPSHOT_KEEP]
+        to_evict = manifest[: len(manifest) - keep]
         for entry in to_evict:
             h = entry.get("height", -1)
             if h >= 0:
                 try:
-                    c = self._storage._conn()
-                    c.execute("DELETE FROM node_meta WHERE key=?",
-                              (f"{self._KEY_PREFIX}{h}",))
-                    c.commit()
+                    _key = f"{self._KEY_PREFIX}{h}"
+                    if self._storage._pgx_enabled:
+                        self._storage._pg_exec("DELETE FROM node_meta WHERE key=$1", _key)
+                    else:
+                        c = self._storage._conn()
+                        c.execute("DELETE FROM node_meta WHERE key=?", (_key,))
+                        c.commit()
                 except Exception:
                     pass
         # Update manifest
@@ -492,6 +617,225 @@ class StateSnapshotEngine:
             "no remote state write was necessary", snap_height
         )
         return True, "OK (canonical state already present)"
+
+    def restore_authenticated_bootstrap(self, blob: bytes, expected_digest: str,
+                                        verified_headers: list) -> Tuple[bool, str]:
+        """Install a fresh-node snapshot authenticated by a verified PoW chain.
+
+        ``verified_headers`` must contain the already-verified transport records
+        for heights 0..snapshot_height+1.  Height H+1 is the commitment block;
+        only 0..H are installed because the snapshot itself represents state at
+        H.  The caller must independently verify the H+1 coinbase Merkle proof
+        and pass its exact committed digest as ``expected_digest``.
+
+        This operation may also fast-forward a stale/behind node whose next
+        required full block body has already been pruned.  It is never allowed
+        to replace or reorg locally-applied canonical history: every local
+        block hash through the current local height must exactly match the
+        independently verified PoW header chain, and the snapshot height must
+        be strictly ahead of the local tip.
+        """
+        if not blob or not expected_digest:
+            return False, "authenticated bootstrap requires snapshot bytes and digest"
+        try:
+            raw = bounded_zlib_decompress(blob, Config.SNAPSHOT_MAX_UNCOMPRESSED_BYTES)
+        except Exception as exc:
+            return False, f"bootstrap snapshot decompression failed: {exc}"
+        actual_digest = hashlib.sha256(raw).hexdigest()
+        if actual_digest != str(expected_digest):
+            return False, (
+                f"bootstrap snapshot digest mismatch: committed={str(expected_digest)[:16]}... "
+                f"received={actual_digest[:16]}...")
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            return False, f"bootstrap snapshot parse failed: {exc}"
+        if not isinstance(payload, dict) or int(payload.get("version", 0)) < 4:
+            return False, "bootstrap snapshot is not complete format v4+"
+        try:
+            snap_h = int(payload.get("height", -1))
+        except Exception:
+            return False, "bootstrap snapshot height is invalid"
+        if snap_h <= 0:
+            return False, "bootstrap snapshot height must be positive"
+        local_h = int(self._storage.chain_height())
+        if local_h >= snap_h:
+            return False, (
+                f"authenticated bootstrap snapshot must be ahead of local tip; "
+                f"local height={local_h}, snapshot height={snap_h}")
+        if not isinstance(verified_headers, list) or len(verified_headers) <= snap_h + 1:
+            return False, "verified bootstrap header chain is incomplete"
+
+        # A non-fresh node may use an authenticated snapshot only as a strict
+        # fast-forward of its existing canonical chain.  Bind every locally
+        # applied height to the verified PoW chain before any state/header
+        # mutation.  This prevents a peer snapshot from becoming an implicit
+        # reorg or chain replacement mechanism.
+        try:
+            for _h in range(0, local_h + 1):
+                _local = self._storage.get_block(_h)
+                if _local is None:
+                    return False, f"local canonical chain has a gap at height {_h}"
+                _remote = verified_headers[_h]
+                if int(_remote.get("index", -1)) != _h:
+                    return False, f"verified bootstrap header index mismatch at height {_h}"
+                if str(getattr(_local, "block_hash", "")) != str(_remote.get("block_hash", "")):
+                    return False, (
+                        f"authenticated bootstrap is not a fast-forward: "
+                        f"local/verified hash mismatch at height {_h}")
+        except Exception as exc:
+            return False, f"failed to verify local canonical prefix: {exc}"
+        try:
+            anchor = verified_headers[snap_h]
+            commit_block = verified_headers[snap_h + 1]
+            if int(anchor.get("index", -1)) != snap_h:
+                return False, "verified snapshot anchor height mismatch"
+            if int(commit_block.get("index", -1)) != snap_h + 1:
+                return False, "verified snapshot commitment block missing"
+            if str(payload.get("anchor_block_hash", "")) != str(anchor.get("block_hash", "")):
+                return False, "snapshot anchor block hash does not match verified chain"
+            if str(payload.get("state_root", "")) != str(anchor.get("state_root", "")):
+                return False, "snapshot state_root does not match verified chain"
+        except Exception as exc:
+            return False, f"invalid verified bootstrap headers: {exc}"
+
+        replay = payload.get("tx_replay_guard", [])
+        if not isinstance(replay, list) or any(not isinstance(x, str) or not x for x in replay):
+            return False, "snapshot replay guard is malformed"
+        if len(replay) != len(set(replay)):
+            return False, "snapshot replay guard contains duplicates"
+        l2_tree = payload.get("l2_tree", {})
+        if not isinstance(l2_tree, dict):
+            return False, "snapshot L2 tree is malformed"
+        governance = payload.get("governance_proposals", [])
+        if not isinstance(governance, list):
+            return False, "snapshot governance state is malformed"
+        try:
+            _seen_gov = set()
+            for _g in governance:
+                if not isinstance(_g, dict):
+                    raise ValueError("proposal is not an object")
+                _v = int(_g.get("version", -1))
+                if _v < 0 or _v in _seen_gov:
+                    raise ValueError("invalid/duplicate proposal version")
+                _seen_gov.add(_v)
+                float(str(_g.get("threshold", "0.75")))
+                int(_g.get("rollback_window", 0))
+        except Exception as exc:
+            return False, f"snapshot governance metadata invalid: {exc}"
+        try:
+            l2_last_batch = int(payload.get("l2_last_batch_id", -1))
+            cumulative = int(payload.get("cumulative_issued_sat", -1))
+            if cumulative < 0:
+                raise ValueError("negative issuance")
+        except Exception as exc:
+            return False, f"snapshot monetary/L2 metadata invalid: {exc}"
+
+        # Write a durable marker before the multi-store installation.  A crash
+        # can therefore never be mistaken for a completed bootstrap.  The
+        # operation is idempotent for a fresh node and can be retried.
+        self._storage.set_meta("bootstrap_restore_in_progress", str(snap_h))
+        installed = []
+        try:
+            from visold.ledger.block import Block
+
+            # Install only authenticated header-only history through H.  Never
+            # trust peer finality signatures: the header verifier strips them.
+            for h in range(local_h + 1, snap_h + 1):
+                d = dict(verified_headers[h])
+                d["transactions"] = []
+                d["pruned"] = True
+                d["finalized"] = False
+                d["validator_sigs"] = []
+                blk = Block.from_dict(d)
+                self._storage.save_block(blk)
+                installed.append(h)
+
+            # Replace all canonical execution state from the digest-authenticated
+            # payload, then restore state components intentionally kept outside
+            # the legacy L1 state_root.
+            self._storage.restore_snapshot_state(payload)
+
+            if self._storage._pgx_enabled:
+                self._storage._pg_exec("DELETE FROM tx_replay_guard")
+                if replay:
+                    async def _fill_replay():
+                        async with self._storage._pg._pool.acquire() as c:
+                            await c.executemany(
+                                "INSERT INTO tx_replay_guard (tx_id) VALUES ($1) ON CONFLICT DO NOTHING",
+                                [(x,) for x in replay])
+                    self._storage._pg.run(_fill_replay())
+            else:
+                c = self._storage._conn()
+                with self._storage._sqlite_api_lock:
+                    c.execute("CREATE TABLE IF NOT EXISTS tx_replay_guard (tx_id TEXT PRIMARY KEY)")
+                    c.execute("DELETE FROM tx_replay_guard")
+                    c.executemany(
+                        "INSERT INTO tx_replay_guard (tx_id) VALUES (?)",
+                        [(x,) for x in replay])
+                    c.commit()
+
+            # Restore deterministic governance lifecycle state.  Timestamps
+            # are local diagnostics only; save_upgrade_proposal supplies them.
+            if self._storage._pgx_enabled:
+                self._storage._pg_exec("DELETE FROM upgrade_proposals")
+            else:
+                _gc = self._storage._conn()
+                _gc.execute("DELETE FROM upgrade_proposals")
+                _gc.commit()
+            for _g in governance:
+                self._storage.save_upgrade_proposal(
+                    version=int(_g["version"]), phase=str(_g["phase"]),
+                    signal_start=int(_g["signal_start_height"]),
+                    signal_end=int(_g["signal_end_height"]),
+                    lock_in_height=int(_g["lock_in_height"]),
+                    activation_height=int(_g["activation_height"]),
+                    threshold=float(str(_g["threshold"])),
+                    rollback_window=int(_g["rollback_window"]),
+                    disabled=bool(int(_g.get("disabled", 0))),
+                )
+
+            # Reconstruct the signaling window from authenticated header fields
+            # rather than trusting peer metadata.
+            _sig_start = max(0, snap_h - int(Config.FORK_SIGNAL_WINDOW) - 1)
+            for _h in range(_sig_start, snap_h + 1):
+                _hd = verified_headers[_h]
+                self._storage.set_meta(
+                    f"proto_sig:{_h}", str(int(_hd.get("protocol_version", Config.PROTOCOL_VERSION))))
+
+            self._storage.set_meta(
+                "l2_tree", json.dumps(l2_tree, separators=(",", ":"), sort_keys=True))
+            self._storage.set_meta("l2_last_batch_id", str(l2_last_batch))
+            # Keep one authenticated rollback checkpoint rather than importing
+            # peer-local L2 history.
+            self._storage.set_meta(
+                "l2_history",
+                json.dumps([{"height": snap_h, "tree": l2_tree,
+                             "last_batch_id": l2_last_batch}],
+                           separators=(",", ":"), sort_keys=True))
+            self._storage.set_meta("cumulative_issued_sat", str(cumulative))
+            self._storage.set_meta("rolling_pruned_until", str(snap_h))
+            self._storage.set_meta("bootstrap_checkpoint_height", str(snap_h))
+            self._storage.set_meta("bootstrap_checkpoint_hash", str(anchor.get("block_hash", "")))
+            self._storage.set_meta("snap_restored_height", str(snap_h))
+            self._storage.set_meta("snap_restored_root", str(payload.get("state_root", "")))
+            self._storage.set_meta("bootstrap_restore_in_progress", "")
+            self._storage.record_block_apply_result(snap_h, True)
+            metrics.inc("snapshots_restored")
+            log.info(
+                "StateSnapshotEngine: authenticated pruning bootstrap installed at height=%d",
+                snap_h)
+            return True, "OK"
+        except Exception as exc:
+            # Best-effort rewind of imported headers.  The in-progress marker is
+            # deliberately retained if any part of state installation failed,
+            # so startup/operations cannot treat this as a clean checkpoint.
+            for h in reversed(installed):
+                try:
+                    self._storage.delete_block(h)
+                except Exception:
+                    pass
+            return False, f"authenticated bootstrap installation failed: {exc}"
 
     # ── v7.5.0: Chunk-based serving ───────────────────────────────────────────
 

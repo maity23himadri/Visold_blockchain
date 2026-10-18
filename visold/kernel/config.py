@@ -1005,11 +1005,51 @@ class Config:
     SNAPSHOT_MAX_UNCOMPRESSED_BYTES = int(os.environ.get(
         "VISOLD_SNAPSHOT_MAX_UNCOMPRESSED_BYTES", str(256 * 1024 * 1024)))
 
-    # ── MEV Protection (Commit-Reveal) ────────────────────────────────────────
-    # When enabled, transactions are committed as a hash first, then revealed
-    # after COMMIT_REVEAL_DELAY_BLOCKS blocks.  Prevents front-running.
+    # ── Consensus-authenticated pruning bootstrap (v7.6.1) ─────────────────
+    # IMPORTANT: these are consensus constants, NOT environment-tunable.
+    # Every block immediately following a 600-block boundary commits, in its
+    # coinbase transaction, to a deterministic complete bootstrap snapshot of
+    # the previous block height. Fresh nodes can verify only compact headers
+    # from genesis, authenticate that coinbase commitment through the block's
+    # Merkle root, restore the committed snapshot, and continue normal sync
+    # without requiring pruned historical transaction bodies.
+    BOOTSTRAP_SNAPSHOT_INTERVAL = 600
+    BOOTSTRAP_COMMITMENT_ACTIVATION_HEIGHT = 601
+    BOOTSTRAP_COMMITMENT_TAG = "bootsnap"
+    BOOTSTRAP_HEADER_PAGE_SIZE = 200
+
+    # ── VARR authenticated temporary receipt mailbox ──────────────────────
+    # Receipts are NOT consensus state.  They preserve compact wallet-history
+    # metadata while full transaction bodies are pruned.  Each receiver owns
+    # deterministic mailbox slots that are routed over the existing peer mesh.
+    RECEIPT_RELAY_ENABLED = os.environ.get("VISOLD_RECEIPT_RELAY", "1") == "1"
+    RECEIPT_REPLICA_SLOTS = 12
+    RECEIPT_ROUTE_HOPS = 24
+    RECEIPT_ROUTE_FANOUT = 2
+    RECEIPT_ROUTE_FALLBACK_HOPS = 6
+    RECEIPT_QUERY_LIMIT = 128
+    RECEIPT_MAX_BYTES = 16 * 1024
+    RECEIPT_REPAIR_INTERVAL_SECS = 60
+    RECEIPT_ACK_GRACE_SECS = 300
+    # Emergency bound for abandoned addresses.  Zero disables age expiry and
+    # keeps an undelivered receipt until a receiver-signed ACK is observed.
+    RECEIPT_MAX_AGE_BLOCKS = int(os.environ.get("VISOLD_RECEIPT_MAX_AGE_BLOCKS", "0"))
+
+    # ── MEV protection: on-chain commit-reveal for transfers ──────────────────
+    # A protected transfer is two ordinary transfers from the same wallet:
+    #   1. commitment: a zero-value self-transfer whose data carries a salted hash
+    #      of the transfer's contents.  It is mined first, so bots see only the hash.
+    #   2. reveal: the transfer itself.  Consensus accepts it only when its
+    #      commitment is on-chain, from the same sender, between
+    #      COMMIT_REVEAL_DELAY_BLOCKS and MEV_COMMIT_MAX_AGE_BLOCKS blocks older,
+    #      and the commitment's merkle path checks against that block's header.
+    # MEV_PROTECTION_ENABLED is only the starting value.  The terminal menu (item 27)
+    # stores the node's own choice.  The rules are consensus rules for every node.
     MEV_PROTECTION_ENABLED      = os.environ.get("VISOLD_MEV_PROTECT", "0") == "1"
-    COMMIT_REVEAL_DELAY_BLOCKS  = 3    # VSD-M05 FIX: 3-block delay (was 1) to prevent miner front-running
+    COMMIT_REVEAL_DELAY_BLOCKS  = 3
+    MEV_COMMIT_MAX_AGE_BLOCKS   = 20
+    MEV_COMMIT_PREFIX           = "mev-commit:"
+    MEV_REVEAL_PREFIX           = "mev-reveal:"
 
     # ── Automated Slashing Evidence ───────────────────────────────────────────
     # When a double-sign is detected, automatically submit evidence to the network

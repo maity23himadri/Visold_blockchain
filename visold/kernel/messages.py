@@ -159,3 +159,13 @@ MSG_HASHRATE_REPORT = "HASHRATE_REPORT"
 #     "ts":            int,
 #   }
 MSG_RATE_DEFECTION_EVIDENCE = "RATE_DEFECTION_EVIDENCE"
+
+
+# ── VARR: Visold Authenticated Relay Receipts ───────────────────────────────
+# Non-consensus, proof-carrying temporary wallet-mailbox messages.  Receipt
+# authenticity is established from the original transaction signature plus a
+# Merkle proof into a locally verified canonical block header.
+MSG_RECEIPT_PUT      = "RECEIPT_PUT"
+MSG_RECEIPT_QUERY    = "RECEIPT_QUERY"
+MSG_RECEIPT_RESPONSE = "RECEIPT_RESPONSE"
+MSG_RECEIPT_ACK      = "RECEIPT_ACK"

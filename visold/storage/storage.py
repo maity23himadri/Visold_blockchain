@@ -550,6 +550,43 @@ class Storage:
                 data_json TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_tx_block_idx ON transactions(block_idx);
+            -- VARR: non-consensus temporary receipt relay + durable local wallet history.
+            -- relay_receipts may be deleted after a receiver-signed ACK; wallet_receipts
+            -- belongs only to this node's own wallet and is never globally relayed.
+            CREATE TABLE IF NOT EXISTS relay_receipts (
+                receipt_id      TEXT NOT NULL,
+                receiver        TEXT NOT NULL,
+                slot            INTEGER NOT NULL,
+                block_height    INTEGER NOT NULL,
+                block_hash      TEXT NOT NULL,
+                receipt_json    TEXT NOT NULL,
+                stored_at       INTEGER NOT NULL,
+                delivered_at    INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (receipt_id, slot)
+            );
+            CREATE INDEX IF NOT EXISTS idx_relay_receipts_receiver
+                ON relay_receipts(receiver, block_height, receipt_id);
+            CREATE TABLE IF NOT EXISTS relay_receipt_acks (
+                receipt_id      TEXT NOT NULL,
+                receiver        TEXT NOT NULL,
+                ack_json        TEXT NOT NULL,
+                acked_at        INTEGER NOT NULL,
+                PRIMARY KEY (receipt_id, receiver)
+            );
+            CREATE TABLE IF NOT EXISTS wallet_receipts (
+                receipt_id      TEXT PRIMARY KEY,
+                block_height    INTEGER NOT NULL,
+                block_hash      TEXT NOT NULL,
+                sender          TEXT NOT NULL,
+                receiver        TEXT NOT NULL,
+                amount_sat      INTEGER NOT NULL,
+                tx_type         TEXT NOT NULL,
+                timestamp       INTEGER NOT NULL,
+                receipt_json    TEXT NOT NULL,
+                received_at     INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_wallet_receipts_height
+                ON wallet_receipts(block_height, receipt_id);
             CREATE TABLE IF NOT EXISTS contract_accounts (
                 address       TEXT    PRIMARY KEY,
                 code_hash     TEXT    NOT NULL DEFAULT '',
@@ -650,6 +687,41 @@ class Storage:
             timestamp INTEGER,
             data_json TEXT
         );
+        -- VARR: non-consensus temporary relay receipts + node-local wallet history.
+        CREATE TABLE IF NOT EXISTS relay_receipts (
+            receipt_id      TEXT NOT NULL,
+            receiver        TEXT NOT NULL,
+            slot            INTEGER NOT NULL,
+            block_height    INTEGER NOT NULL,
+            block_hash      TEXT NOT NULL,
+            receipt_json    TEXT NOT NULL,
+            stored_at       INTEGER NOT NULL,
+            delivered_at    INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (receipt_id, slot)
+        );
+        CREATE INDEX IF NOT EXISTS idx_relay_receipts_receiver
+            ON relay_receipts(receiver, block_height, receipt_id);
+        CREATE TABLE IF NOT EXISTS relay_receipt_acks (
+            receipt_id      TEXT NOT NULL,
+            receiver        TEXT NOT NULL,
+            ack_json        TEXT NOT NULL,
+            acked_at        INTEGER NOT NULL,
+            PRIMARY KEY (receipt_id, receiver)
+        );
+        CREATE TABLE IF NOT EXISTS wallet_receipts (
+            receipt_id      TEXT PRIMARY KEY,
+            block_height    INTEGER NOT NULL,
+            block_hash      TEXT NOT NULL,
+            sender          TEXT NOT NULL,
+            receiver        TEXT NOT NULL,
+            amount_sat      INTEGER NOT NULL,
+            tx_type         TEXT NOT NULL,
+            timestamp       INTEGER NOT NULL,
+            receipt_json    TEXT NOT NULL,
+            received_at     INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_wallet_receipts_height
+            ON wallet_receipts(block_height, receipt_id);
         -- Replay protection is independent of the prunable transactions table.
         -- Rollback/reorg code deliberately removes entries for orphaned blocks,
         -- while canonical/pruned history keeps them indefinitely.
@@ -2645,8 +2717,53 @@ class Storage:
             }
             archived.append(d)
 
+        # ── Pull node-local VARR receipts delivered after global pruning ──
+        # These are authenticated against canonical block headers before they
+        # enter wallet_receipts.  They preserve only compact wallet metadata,
+        # never consensus state or the pruned transaction body.
+        receipt_rows: List[dict] = []
+        known_ids = set(live_tx_ids)
+        known_ids.update(d.get("tx_id") for d in archived if d.get("tx_id"))
+        try:
+            rr = self._conn().execute(
+                """SELECT receipt_id,block_height,block_hash,sender,receiver,
+                          amount_sat,tx_type,timestamp,receipt_json
+                     FROM wallet_receipts
+                    WHERE sender=? OR receiver=?
+                 ORDER BY block_height DESC, receipt_id DESC""",
+                (address, address)).fetchall()
+        except Exception:
+            rr = []
+        for r in rr:
+            try:
+                raw = json.loads(r["receipt_json"] or "{}")
+                txid = raw.get("tx_id", "")
+                if not txid or txid in known_ids:
+                    continue
+                known_ids.add(txid)
+                receipt_rows.append({
+                    "tx_id": txid,
+                    "sender": r["sender"],
+                    "receiver": r["receiver"],
+                    "amount": from_satoshi(int(r["amount_sat"] or 0)),
+                    "fee": 0.0,
+                    "timestamp": int(r["timestamp"] or 0),
+                    "memo": "",
+                    "nonce": 0,
+                    "tx_type": r["tx_type"] or "transfer",
+                    "data": "",
+                    "gas_limit": 0,
+                    "gas_price": 0.0,
+                    "contract_name": "",
+                    "block_idx": int(r["block_height"] or 0),
+                    "block_hash": r["block_hash"],
+                    "_relay_receipt": True,
+                })
+            except Exception:
+                continue
+
         # Combine and re-sort by timestamp descending (newest first).
-        result = live + archived
+        result = live + archived + receipt_rows
         result.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
         return result
 

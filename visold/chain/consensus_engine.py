@@ -184,7 +184,37 @@ class ConsensusEngine:
             used += tx_size
 
         reward = self.blockchain.compute_reward(height)
-        cb     = Transaction.coinbase(miner_address, reward, height)
+
+        # v7.6.1 — pruning-safe bootstrap commitment.  At the block
+        # immediately following each fixed consensus snapshot boundary, commit
+        # to the complete deterministic state of the parent height.  The
+        # commitment lives in the coinbase transaction, so it is authenticated
+        # by the existing Merkle root and PoW block hash without changing the
+        # header format.
+        _bootstrap_commitment = None
+        _parent_height = height - 1
+        if (height >= int(Config.BOOTSTRAP_COMMITMENT_ACTIVATION_HEIGHT)
+                and _parent_height > 0
+                and _parent_height % int(Config.BOOTSTRAP_SNAPSHOT_INTERVAL) == 0):
+            _snap_engine = getattr(self.blockchain, "_snapshot_engine", None)
+            if _snap_engine is None:
+                raise RuntimeError(
+                    "bootstrap commitment required but snapshot engine is unavailable")
+            _parent = latest
+            if _parent is None or int(_parent.index) != _parent_height or not _parent.state_root:
+                raise RuntimeError(
+                    "bootstrap commitment required but canonical parent state is unavailable")
+            _digest, _err = _snap_engine.ensure_bootstrap_snapshot(
+                _parent_height, _parent.state_root)
+            if not _digest:
+                raise RuntimeError(
+                    f"unable to create required bootstrap snapshot at "
+                    f"height {_parent_height}: {_err}")
+            _bootstrap_commitment = (_parent_height, _digest)
+
+        cb = Transaction.coinbase(
+            miner_address, reward, height,
+            bootstrap_snapshot=_bootstrap_commitment)
         txs.insert(0, cb)
 
         # ─────────────────────────────────────────────────────────────────────

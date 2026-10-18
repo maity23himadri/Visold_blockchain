@@ -44,6 +44,7 @@ from visold.kernel.logging_setup import log
 from visold.kernel.metrics import metrics
 from visold.kernel.units import bft_threshold_met, from_satoshi, gas_fee_to_sat, to_satoshi
 from visold.ledger.block import Block
+from visold.mempool.mev import check_reveal, is_protected_reveal
 from visold.ledger.transaction import Transaction
 from visold.mempool.pool import Mempool
 from visold.rollup.batches import RollupSubmission
@@ -608,6 +609,14 @@ class Blockchain:
     # ── Block validation ──────────────────────────────────────────────────────
     def validate_block(self, block: Block) -> Tuple[bool, str]:
         with self._lock:
+            # Pruned records are authenticated header/history metadata, never
+            # executable full blocks.  Snapshot bootstrap verifies them through
+            # the dedicated header path instead of weakening normal validation.
+            if getattr(block, "is_pruned", False):
+                return False, (
+                    f"Pruned block #{getattr(block, 'index', '?')} has no transaction body; "
+                    "full block validation/application is not possible"
+                )
             # Consensus fields must never accept IEEE-754 non-finite values.
             # NaN makes ordinary comparisons false and can otherwise bypass
             # timestamp and difficulty validation.
@@ -790,6 +799,51 @@ class Blockchain:
                     f"Coinbase receiver '{cb_tx.receiver}' does not match "
                     f"block miner_address '{block.miner_address}'")
 
+            # ── Consensus-authenticated pruning bootstrap commitment ─────────
+            # At H = K+1 for each fixed K=600*n boundary (after activation),
+            # the coinbase must commit to SHA-256(canonical complete snapshot
+            # bytes at K).  Every full validator recomputes this from its own
+            # canonical state *before* applying H.  Therefore a miner cannot
+            # commit a forged snapshot: the block itself would be rejected.
+            _parent_h = int(block.index) - 1
+            _commit_required = (
+                int(block.index) >= int(Config.BOOTSTRAP_COMMITMENT_ACTIVATION_HEIGHT)
+                and _parent_h > 0
+                and _parent_h % int(Config.BOOTSTRAP_SNAPSHOT_INTERVAL) == 0
+            )
+            _commit = Transaction.parse_bootstrap_commitment(
+                getattr(cb_tx, "memo", ""))
+            if _commit_required:
+                if _commit is None:
+                    return False, (
+                        f"Missing required bootstrap snapshot commitment for "
+                        f"parent height {_parent_h}")
+                _snap_h, _declared_digest = _commit
+                if _snap_h != _parent_h:
+                    return False, (
+                        f"Bootstrap snapshot height mismatch: got {_snap_h}, "
+                        f"expected {_parent_h}")
+                _parent_block = self.storage.get_block(_parent_h)
+                if _parent_block is None or not getattr(_parent_block, "state_root", ""):
+                    return False, "Bootstrap commitment parent state is unavailable"
+                _expected_digest, _raw, _derr = \
+                    self._snapshot_engine.compute_bootstrap_digest(
+                        _parent_h, _parent_block.state_root)
+                if not _expected_digest:
+                    return False, f"Cannot compute bootstrap commitment: {_derr}"
+                if _declared_digest != _expected_digest:
+                    return False, (
+                        f"Bootstrap snapshot commitment mismatch at height "
+                        f"{_parent_h}: declared={_declared_digest[:16]}..., "
+                        f"computed={_expected_digest[:16]}...")
+            elif _commit is not None:
+                # A commitment outside a consensus boundary would be ambiguous
+                # to future bootstrap clients and must not be accepted as a
+                # pseudo-anchor.  Keep ordinary legacy coinbase memos valid.
+                return False, (
+                    f"Unexpected bootstrap snapshot commitment in block "
+                    f"{block.index}")
+
             # ── Integrity results are authoritative for this immutable block ──
             # integrity_check() already verified every tx_id and the Merkle root.
             # Recomputing those same commitments here only added CPU cost during
@@ -869,6 +923,10 @@ class Blockchain:
                 )
                 if not ok:
                     return False, f"Invalid tx {tx.tx_id[:8]}: {msg}"
+                if is_protected_reveal(tx):
+                    mev_ok, mev_msg = check_reveal(self.storage, tx, block.index)
+                    if not mev_ok:
+                        return False, f"Invalid tx {tx.tx_id[:8]}: MEV protection: {mev_msg}"
                 # AUDIT-FIX-14a: require a real (non-zero) expiry for ordinary
                 # transactions. expiry=0 means "never expires" — a user tx
                 # with expiry=0 stays valid forever, which combined with
@@ -1212,6 +1270,10 @@ class Blockchain:
             )
             if not ok:
                 raise CandidateTxRejected(pos, tx, f"invalid transaction: {msg}")
+            if is_protected_reveal(tx):
+                mev_ok, mev_msg = check_reveal(self.storage, tx, block_index)
+                if not mev_ok:
+                    raise CandidateTxRejected(pos, tx, f"MEV protection: {mev_msg}")
             if expiry_required and tx.expiry == 0:
                 raise CandidateTxRejected(
                     pos, tx, "expiry=0 not permitted for non-coinbase transactions")
@@ -5657,6 +5719,15 @@ class Blockchain:
                 _to_apply = blocks[_skip_n:] if _overlap_ok else blocks
                 if not _to_apply:
                     return True, "Already have all these blocks"
+                # Preflight before mutating state: a page containing one normal
+                # block followed by a pruned record must fail atomically rather
+                # than apply a prefix and stop at the missing body.
+                for _candidate in _to_apply:
+                    if getattr(_candidate, "is_pruned", False):
+                        return False, (
+                            f"Block {_candidate.index} is pruned/header-only; "
+                            "sync needs an authenticated bootstrap snapshot or the full block body"
+                        )
                 # BUG-FIX (v7.0.0.1): Must interleave validate+apply per block.
                 #
                 # The old two-pass approach (validate ALL then apply ALL) is
@@ -5685,6 +5756,17 @@ class Blockchain:
                     if not ok:
                         return False, f"Apply block {block.index}: {msg}"
                 return True, "OK"
+
+            # A pruned fork payload cannot be re-executed, so reject the entire
+            # candidate before rollback/reorg work.  Authenticated bootstrap is
+            # a separate fresh-node checkpoint path and never bypasses reorg
+            # execution requirements.
+            for _candidate in blocks:
+                if getattr(_candidate, "is_pruned", False):
+                    return False, (
+                        f"Block {_candidate.index} is pruned/header-only; "
+                        "fork choice requires full block bodies or an authenticated checkpoint"
+                    )
 
             # ── Validate the supplied sequence before any fork-choice work ────
             # A paginated response is only a prefix of a peer chain.  It is

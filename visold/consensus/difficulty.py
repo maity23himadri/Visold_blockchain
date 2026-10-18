@@ -26,6 +26,7 @@ Origin: visold_vsd_.py L8493-9127
 
 import math
 import threading
+import itertools
 from typing import Dict, List, Optional, TYPE_CHECKING, Tuple
 
 from visold.kernel.config import Config
@@ -37,6 +38,9 @@ if TYPE_CHECKING:  # annotation-only references (no runtime import, no cycle)
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 1H: DIFFICULTY ENGINE — Hybrid Rolling-Window + Per-Block Adjustment
 # ─────────────────────────────────────────────────────────────────────────────
+_CHAIN_TOKENS = itertools.count(1)
+
+
 class DifficultyEngine:
     """
     Production-grade hybrid dynamic difficulty engine for Visold (VSD).
@@ -122,7 +126,8 @@ class DifficultyEngine:
     """
 
     # ── Class-level cache: parent_chain_height → required_difficulty ──────────
-    _cache:      Dict[int, float] = {}
+    # Keyed by (chain token, height): two chains in one process never share answers.
+    _cache:      Dict = {}
     _cache_lock: threading.Lock = threading.Lock()
     _CACHE_MAX:  int            = 1024          # evict oldest when exceeded
 
@@ -145,17 +150,18 @@ class DifficultyEngine:
         The result is a float and is cached by current_height.  Subsequent
         calls with the same height return instantly without touching the database.
         """
+        key = (cls._chain_token(storage), int(current_height))
         with cls._cache_lock:
-            if current_height in cls._cache:
-                return cls._cache[current_height]
+            if key in cls._cache:
+                return cls._cache[key]
 
         result = cls._compute_uncached(storage, current_height)
 
         with cls._cache_lock:
-            cls._cache[current_height] = result
+            cls._cache[key] = result
             # Evict the lowest-height entry when cache is full
             if len(cls._cache) > cls._CACHE_MAX:
-                del cls._cache[min(cls._cache.keys())]
+                del cls._cache[min(cls._cache, key=lambda k: k[1])]
 
         return result
 
@@ -169,9 +175,31 @@ class DifficultyEngine:
         Pass from_height=0 (default) to flush the entire cache.
         """
         with cls._cache_lock:
-            stale_keys = [h for h in cls._cache if h >= from_height]
+            stale_keys = [k for k in cls._cache if k[1] >= from_height]
             for k in stale_keys:
                 del cls._cache[k]
+
+    @classmethod
+    def _chain_token(cls, storage) -> int:
+        """Per-chain part of the cache key, so chains in one process never share answers.
+
+        The cache used to be keyed by height alone, so a value computed for one chain
+        (for example by background work left over from another chain) could be returned
+        to a different chain. Each storage object now gets its own token on first use.
+        """
+        if storage is None:
+            return 0
+        token = getattr(storage, "_difficulty_cache_token", None)
+        if token is None:
+            with cls._cache_lock:
+                token = getattr(storage, "_difficulty_cache_token", None)
+                if token is None:
+                    token = next(_CHAIN_TOKENS)
+                    try:
+                        setattr(storage, "_difficulty_cache_token", token)
+                    except AttributeError:
+                        return 0
+        return token
 
     # ── Mining target conversion ───────────────────────────────────────────────
 

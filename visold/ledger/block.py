@@ -72,6 +72,7 @@ class Block:
         "merkle_root", "block_hash", "version", "protocol_version",
         "vrf_proof", "vrf_output",
         "state_root",                                # v7.1.9 — see above
+        "_pruned", "_bootstrap_commitment",          # transport/storage metadata
     })
 
     def __init__(self, index: int, prev_hash: str, transactions: List[Transaction],
@@ -79,9 +80,22 @@ class Block:
                  nonce: int = 0, block_hash: str = "", validator_sigs: Optional[List[dict]] = None,
                  vrf_proof: str = "", vrf_output: str = "", finalized: bool = False,
                  state_root: str = "", protocol_version: int = 0,
-                 merkle_root: Optional[str] = None):
+                 merkle_root: Optional[str] = None,
+                 pruned: bool = False,
+                 bootstrap_commitment: Optional[dict] = None):
+        if type(pruned) is not bool:
+            raise ValueError("block pruned marker must be a boolean")
+        if pruned and transactions:
+            raise ValueError("pruned block must not include transaction bodies")
+        if pruned and not merkle_root:
+            raise ValueError("pruned block must preserve its original merkle_root")
+        if bootstrap_commitment is not None and not isinstance(bootstrap_commitment, dict):
+            raise ValueError("bootstrap_commitment metadata must be an object")
         # _sealed must be set via object.__setattr__ BEFORE any field assignment
         object.__setattr__(self, "_sealed", False)
+        self._pruned = pruned
+        self._bootstrap_commitment = (
+            dict(bootstrap_commitment) if bootstrap_commitment is not None else None)
         self.version          = self.VERSION
         self.protocol_version = protocol_version or Config.PROTOCOL_VERSION
         self.index            = index
@@ -111,6 +125,16 @@ class Block:
                 f"This prevents post-mining transaction tampering."
             )
         object.__setattr__(self, name, value)
+
+    @property
+    def is_pruned(self) -> bool:
+        """Whether this record is intentionally header-only after pruning."""
+        return bool(self._pruned)
+
+    @property
+    def bootstrap_commitment(self) -> Optional[dict]:
+        """Retained coinbase+Merkle-proof metadata for a pruned commitment block."""
+        return dict(self._bootstrap_commitment) if self._bootstrap_commitment is not None else None
 
     def seal(self, recompute_merkle: bool = True) -> 'Block':
         """
@@ -198,6 +222,15 @@ class Block:
         Once your network has fully re-mined under v7.1.9+ you can
         delete the legacy branch and tighten back to a single check.
         """
+        # A pruned record lacks the committed transaction body. It can be used
+        # for authenticated header history only and must never enter normal
+        # full-block validation/application.
+        if self.is_pruned:
+            return False, (
+                f"Pruned block #{self.index} has no transaction body; "
+                "header-only records cannot pass full-block integrity validation"
+            )
+
         # 1. Recompute merkle root from current transaction set
         computed_merkle = self._merkle()
         if self.merkle_root != computed_merkle:
@@ -590,6 +623,9 @@ class Block:
             "finalized":        self.finalized,
             "validator_sigs":   self.validator_sigs,
             "transactions":     [t.to_dict() for t in self.transactions],
+            **({"pruned": True} if self.is_pruned else {}),
+            **({"bootstrap_commitment": self.bootstrap_commitment}
+               if self.bootstrap_commitment else {}),
         }
 
     # ── Block size inspection ────────────────────────────────────────────────
@@ -621,7 +657,25 @@ class Block:
 
     @classmethod
     def from_dict(cls, d: dict) -> 'Block':
-        txs = [Transaction.from_dict(t) for t in d.get("transactions", [])]
+        if not isinstance(d, dict):
+            raise ValueError("block payload must be an object")
+        pruned_flag = d.get("pruned", False)
+        if type(pruned_flag) is not bool:
+            raise ValueError("block pruned marker must be a boolean")
+        raw_txs = d.get("transactions", [])
+        if not isinstance(raw_txs, list):
+            raise ValueError("block transactions must be a list")
+        if pruned_flag:
+            if raw_txs:
+                raise ValueError("pruned block must not include transaction bodies")
+            if not isinstance(d.get("merkle_root"), str) or not d.get("merkle_root"):
+                raise ValueError("pruned block must preserve its original merkle_root")
+            if not isinstance(d.get("block_hash"), str) or not d.get("block_hash"):
+                raise ValueError("pruned block must preserve its original block_hash")
+        retained = d.get("bootstrap_commitment")
+        if retained is not None and not isinstance(retained, dict):
+            raise ValueError("bootstrap_commitment metadata must be an object")
+        txs = [Transaction.from_dict(t) for t in raw_txs]
         blk = cls(
             index            = d["index"],
             prev_hash        = d["prev_hash"],
@@ -638,11 +692,13 @@ class Block:
             state_root       = d.get("state_root", ""),
             protocol_version = d.get("protocol_version", Config.PROTOCOL_VERSION),
             merkle_root      = d.get("merkle_root") if "merkle_root" in d else None,
+            pruned           = pruned_flag,
+            bootstrap_commitment = retained,
         )
         # Remember the historical Merkle commitment for a compact pruned
         # record. It must be restored *after* seal(), because seal() recomputes
         # merkle_root from the intentionally omitted transaction list.
-        pruned_merkle = d.get("merkle_root") if d.get("pruned") else None
+        pruned_merkle = d.get("merkle_root") if pruned_flag else None
         # SECURITY: Seal blocks loaded from storage or network so their
         # consensus-critical fields are immutable after deserialisation.
         blk.seal(recompute_merkle=False)

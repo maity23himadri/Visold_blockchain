@@ -25,6 +25,7 @@ Origin: visold_vsd_.py L11423-11907
 """
 
 import hashlib
+import json
 import math
 import re
 import struct
@@ -52,6 +53,63 @@ if TYPE_CHECKING:  # annotation-only references (no runtime import, no cycle)
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 4: TRANSACTION
 # ─────────────────────────────────────────────────────────────────────────────
+_MEV_HEX64 = re.compile(r"[0-9a-f]{64}")
+_MEV_DECIMAL = re.compile(r"0|[1-9][0-9]{0,18}")
+MEV_MAX_STEPS = 40
+
+
+def parse_mev_commit_data(data) -> Optional[str]:
+    """Return the commitment hash carried by ``data``, or None if it is not one."""
+    prefix = Config.MEV_COMMIT_PREFIX
+    if not isinstance(data, str) or not data.startswith(prefix):
+        return None
+    digest = data[len(prefix):]
+    return digest if _MEV_HEX64.fullmatch(digest) else None
+
+
+def encode_mev_steps(steps) -> str:
+    """Encode a merkle path: L<sibling>, R<sibling>, or O for an odd loner."""
+    return "".join("O" if kind == "O" else kind + sibling for kind, sibling in steps)
+
+
+def _decode_mev_steps(text: str):
+    steps = []
+    i = 0
+    while i < len(text):
+        kind = text[i]
+        if kind == "O":
+            steps.append(("O", ""))
+            i += 1
+        elif kind in ("L", "R"):
+            sibling = text[i + 1:i + 65]
+            if not _MEV_HEX64.fullmatch(sibling):
+                return None
+            steps.append((kind, sibling))
+            i += 65
+        else:
+            return None
+        if len(steps) > MEV_MAX_STEPS:
+            return None
+    return steps
+
+
+def parse_mev_reveal_data(data):
+    """Return (salt, commitment height, merkle steps) carried by a reveal, or None."""
+    prefix = Config.MEV_REVEAL_PREFIX
+    if not isinstance(data, str) or not data.startswith(prefix):
+        return None
+    parts = data[len(prefix):].split(":", 2)
+    if len(parts) != 3:
+        return None
+    salt, height_text, steps_text = parts
+    if not _MEV_HEX64.fullmatch(salt) or not _MEV_DECIMAL.fullmatch(height_text):
+        return None
+    steps = _decode_mev_steps(steps_text)
+    if steps is None:
+        return None
+    return salt, int(height_text), steps
+
+
 class Transaction:
     VERSION = 1
 
@@ -528,6 +586,32 @@ class Transaction:
                 return False, "Invalid signature"
             return True, "OK"
         # ── Standard transfer validation (unchanged) ───────────────────────────
+        # ── MEV protection: formats of the commitment and the reveal ──────────
+        # Chain rules (commitment on-chain, age, merkle path) are checked by
+        # visold/mempool/mev.py in block validation and mempool admission.
+        if self.tx_type == self.TYPE_TRANSFER and str(self.data).startswith(Config.MEV_COMMIT_PREFIX):
+            if self.sender == "COINBASE":
+                return False, "COINBASE cannot submit an MEV commitment"
+            if self.receiver != self.sender:
+                return False, "MEV commitment must be a self-transfer"
+            if to_satoshi(self.amount) != 0:
+                return False, "MEV commitment amount must be zero"
+            if self.memo:
+                return False, "MEV commitment memo must be empty"
+            if to_satoshi(self.fee) != int(getattr(Config, "MIN_TX_FEE_SAT", 1000)):
+                return False, "MEV commitment fee must equal MIN_TX_FEE_SAT"
+            if parse_mev_commit_data(self.data) is None:
+                return False, "MEV commitment data is malformed"
+            if self.is_expired(reference_time):
+                return False, f"Transaction expired at {self.expiry}"
+            if not self.pub_hex or not self.sig_hex:
+                return False, "Missing signature or pubkey"
+            if not signature_already_verified and not self.verify_signature(block_height=block_height):
+                return False, "Invalid signature"
+            return True, "OK"
+        if self.tx_type == self.TYPE_TRANSFER and str(self.data).startswith(Config.MEV_REVEAL_PREFIX):
+            if parse_mev_reveal_data(self.data) is None:
+                return False, "MEV reveal data is malformed"
         if self.amount <= 0:
             return False, "Amount must be positive"
         # BUG-FIX: a negative fee was never rejected here.  A crafted tx with
@@ -554,6 +638,19 @@ class Transaction:
                 return False, "Invalid signature"
         return True, "OK"
 
+    def mev_commitment(self, salt_hex: str) -> str:
+        """Salted commitment to this transfer, used by MEV commit-reveal.
+
+        Covers every field except ``data`` (which carries the commitment) and the
+        signature, so it can be computed before the transfer is signed.
+        """
+        core = json.dumps([self.sender, self.receiver, to_satoshi(self.amount),
+                           to_satoshi(self.fee), self.memo, int(self.nonce),
+                           int(self.timestamp), self.tx_type],
+                          separators=(",", ":"), ensure_ascii=True)
+        return sha256(b"visold-mev-commit-v1|" + core.encode("utf-8")
+                      + b"|" + salt_hex.encode("utf-8"))
+
     def compute_fee(self) -> float:
         return round(self.amount * Config.TX_FEE_RATE, 8)
 
@@ -565,6 +662,9 @@ class Transaction:
         where TX_FEE_RATE is 0.01 = 100 basis points.
         This avoids float multiplication of (amount * rate) which can diverge.
         """
+        if self.tx_type == self.TYPE_TRANSFER and str(self.data).startswith(Config.MEV_COMMIT_PREFIX):
+            # MEV commitments pay a fixed fee: their amount is zero.
+            return int(getattr(Config, "MIN_TX_FEE_SAT", 1000))
         if self.tx_type == self.TYPE_REGISTER and self.is_identity_claim(self):
             return int(getattr(Config, "MIN_TX_FEE_SAT", 1000))
         if (self.tx_type == self.TYPE_REGISTER and
@@ -622,12 +722,66 @@ class Transaction:
         )
 
     @classmethod
-    def coinbase(cls, receiver: str, amount: float, block_height: int) -> 'Transaction':
+    def coinbase(cls, receiver: str, amount: float, block_height: int,
+                 bootstrap_snapshot: Optional[Tuple[int, str]] = None) -> 'Transaction':
+        """Create the canonical coinbase transaction.
+
+        ``bootstrap_snapshot`` is the consensus-authenticated pruning-bootstrap
+        commitment introduced in v7.6.1.  When present it is ``(height,
+        sha256_hex)`` for the complete deterministic state snapshot at that
+        height.  The commitment lives inside the coinbase memo, therefore the
+        existing transaction-id -> Merkle-root -> block-hash chain authenticates
+        it without changing the block header format or GPU mining preimage.
+        """
+        memo = f"coinbase:{block_height}"
+        if bootstrap_snapshot is not None:
+            snap_h, digest = bootstrap_snapshot
+            snap_h = int(snap_h)
+            digest = str(digest).lower()
+            if snap_h < 0 or len(digest) != 64:
+                raise ValueError("invalid bootstrap snapshot commitment")
+            try:
+                int(digest, 16)
+            except ValueError as exc:
+                raise ValueError("bootstrap snapshot digest must be hex") from exc
+            memo += f"|{Config.BOOTSTRAP_COMMITMENT_TAG}:{snap_h}:{digest}"
         return cls(
             sender   = "COINBASE",
             receiver = receiver,
             amount   = amount,
-            memo     = f"coinbase:{block_height}",
+            memo     = memo,
             nonce    = 0,
             expiry   = 0,
         )
+
+    @classmethod
+    def parse_bootstrap_commitment(cls, memo: str) -> Optional[Tuple[int, str]]:
+        """Return ``(snapshot_height, digest)`` from a coinbase memo.
+
+        Malformed or non-canonical encodings return ``None``.  Consensus code
+        separately decides whether a commitment is mandatory at a given block
+        height.
+        """
+        if not isinstance(memo, str):
+            return None
+        marker = f"|{Config.BOOTSTRAP_COMMITMENT_TAG}:"
+        if marker not in memo:
+            return None
+        prefix, suffix = memo.split(marker, 1)
+        if not prefix.startswith("coinbase:"):
+            return None
+        parts = suffix.split(":")
+        if len(parts) != 2:
+            return None
+        try:
+            height = int(parts[0])
+        except (TypeError, ValueError):
+            return None
+        digest = parts[1].lower()
+        if height < 0 or len(digest) != 64:
+            return None
+        try:
+            int(digest, 16)
+        except ValueError:
+            return None
+        return height, digest

@@ -40,7 +40,7 @@ from visold.kernel.logging_setup import log
 from visold.kernel.metrics import metrics
 from visold.kernel.units import from_satoshi, gas_fee_to_sat, to_satoshi
 from visold.ledger.transaction import Transaction
-from visold.mempool.mev import _mev_mempool
+from visold.mempool.mev import protection_status
 from visold.network.capabilities import (
     CAP_ARCHIVE,
     CAP_BOOTSTRAP,
@@ -617,34 +617,13 @@ class RPCServer:
                         raise ValueError("findpeerswith requires [capability]")
                     return node.capability_router.find_peers_with(str(params[0]))
 
-                # ── NEW: MEV Protection RPC ───────────────────────────────────
-                elif method == "mevcommit":
-                    """
-                    Submit a transaction commitment (Phase 1 of MEV protection).
-                    Params: [commit_hash_hex]
-                    commit_hash = SHA-256(tx_id ‖ sender ‖ nonce)
-                    Returns: {"ok": bool, "msg": str}
-                    Requires Config.MEV_PROTECTION_ENABLED = True.
-                    """
-                    if not params:
-                        raise ValueError("mevcommit requires [commit_hash]")
-                    commit_hash = str(params[0])
-                    current_h   = node.blockchain.height()
-                    ok, msg = _mev_mempool.submit_commit(
-                        commit_hash, node.wallet.address, current_h)
-                    return {"ok": ok, "msg": msg,
-                            "pending_commits": _mev_mempool.pending_count()}
-
+                # ── MEV protection status (on-chain commit-reveal) ───────────
                 elif method == "getmevstatus":
                     """
-                    Return MEV protection status.
-                    No params required.
+                    Return MEV protection status, including any protected transfer
+                    in flight.  No params required.
                     """
-                    return {
-                        "enabled":         Config.MEV_PROTECTION_ENABLED,
-                        "pending_commits":  _mev_mempool.pending_count(),
-                        "delay_blocks":     Config.COMMIT_REVEAL_DELAY_BLOCKS,
-                    }
+                    return protection_status(node.storage)
 
                 # ── NEW: Static Analysis RPC ──────────────────────────────────
                 elif method == "analyzecontract":

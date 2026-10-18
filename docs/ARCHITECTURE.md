@@ -52,7 +52,7 @@ The former 55,370-line `visold_vsd_.py` is now a package, `visold/`, organised b
 | `BlockDatabase` | `visold.storage.block_database` |
 | `StateSnapshotEngine` | `visold.storage.snapshot` |
 | `Mempool` | `visold.mempool.pool` |
-| `CommitRevealMempool` | `visold.mempool.mev` |
+| `check_reveal`, `build_reveal_tx`, `build_commitment_tx` | `visold.mempool.mev` |
 | `StateEngine` | `visold.state.engine` |
 | `VVMEngine` | `visold.vm.engine` |
 | `VVMAssembler` | `visold.vm.assembler` |
@@ -229,7 +229,7 @@ Everything else: `grep -rn "^class Name\|^def name" visold/` or see the module i
 
 | Module | Lines | Origin | Main definitions |
 |---|---:|---|---|
-| `mempool.mev` | 165 | L18874-18990, L18994 | `CommitRevealMempool` |
+| `mempool.mev` | 165 | L18874-18990, L18994 | `check_reveal`, `build_reveal_tx`, `build_commitment_tx` |
 | `mempool.pool` | 1015 | L17919-17998, L18001-18866 | `Mempool` |
 
 ### `chain` (layer L7)
