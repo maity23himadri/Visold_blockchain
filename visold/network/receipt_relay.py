@@ -13,7 +13,7 @@ from visold.crypto.ecc import ecdsa_verify, pub_from_hex, pub_to_address, sig_fr
 from visold.crypto.hashing import sha256
 from visold.kernel.config import Config
 from visold.kernel.logging_setup import log
-from visold.kernel.units import to_satoshi
+from visold.kernel.units import from_satoshi
 from visold.ledger.transaction import Transaction
 from visold.network.spv import SPVClient
 
@@ -288,7 +288,81 @@ class ReceiptRelayManager:
         except Exception:
             return []
 
+    def _archive_verified_receipt(self, c, receipt: dict, summary: dict) -> None:
+        """Persist a verified receipt into the durable transaction-history archive.
+
+        ``relay_receipts`` is a temporary, ACK-deletable mailbox. ``wallet_receipts``
+        is the receiver's durable proof store. ``permanent_history`` is the durable
+        source used by Balance History after the ordinary transaction row is pruned.
+        All data written here is derived from a receipt already verified against the
+        transaction signature, tx_id, Merkle proof, and canonical retained header.
+        """
+        fields = self._signed_fields_tuple(receipt)
+        if fields is None:  # Defensive: verify_receipt() has already enforced this.
+            raise ValueError("verified receipt has malformed signed_fields")
+        fmap = self._field_map(fields)
+
+        def _int_field(name: str, default: int = 0) -> int:
+            try:
+                return int(fmap.get(name, str(default)))
+            except (TypeError, ValueError, OverflowError):
+                return default
+
+        amount = from_satoshi(int(summary["amount_sat"]))
+        fee = from_satoshi(_int_field("fee_sat"))
+        gas_price = from_satoshi(_int_field("gas_price_sat"))
+        metadata = {
+            "fee": fee,
+            "nonce": _int_field("nonce"),
+            "memo": fmap.get("memo", ""),
+            "gas_limit": _int_field("gas_limit"),
+            "gas_price": gas_price,
+            "contract_name": fmap.get("contract_name", ""),
+            # Compact VARR receipts deliberately carry only the payload hash.
+            "data_hash": fmap.get("data_hash", ""),
+            "receipt_id": str(summary["receipt_id"]),
+            "block_hash": str(summary["block_hash"]),
+            "history_source": "verified_varr_receipt",
+            "_relay_receipt": True,
+        }
+
+        # Keep this schema aligned with RollingWindowPruner's archive. Creating
+        # it idempotently here also supports nodes whose recovery path initializes
+        # receipt handling before the next pruning pass.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS permanent_history (
+                   tx_hash TEXT PRIMARY KEY,
+                   block_idx INTEGER NOT NULL,
+                   sender TEXT NOT NULL DEFAULT '',
+                   receiver TEXT NOT NULL DEFAULT '',
+                   amount REAL NOT NULL DEFAULT 0,
+                   tx_type TEXT NOT NULL DEFAULT 'transfer',
+                   timestamp INTEGER NOT NULL DEFAULT 0,
+                   metadata_json TEXT NOT NULL DEFAULT '{}'
+               )"""
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_permhist_block_idx "
+            "ON permanent_history (block_idx)"
+        )
+        c.execute(
+            """INSERT OR IGNORE INTO permanent_history
+                   (tx_hash, block_idx, sender, receiver, amount, tx_type,
+                    timestamp, metadata_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (str(summary["tx_id"]), int(summary["block_height"]),
+             str(summary["sender"]), str(summary["receiver"]), amount,
+             str(summary["tx_type"] or "transfer"), int(summary["timestamp"]),
+             _canonical_json(metadata).decode("utf-8")),
+        )
+
     def deliver_to_local_wallet(self, receipt: dict) -> Tuple[bool, str]:
+        """Verify, then durably store receipt and Balance History archive row.
+
+        Relay mailbox rows may be removed after a signed ACK. The local wallet
+        proof and permanent_history row must survive that cleanup. Re-delivery is
+        idempotent through each table's receipt/transaction primary key.
+        """
         ok, reason = self.verify_receipt(receipt, require_canonical=True)
         if not ok:
             return False, reason
@@ -298,17 +372,24 @@ class ReceiptRelayManager:
         now = int(time.time())
         try:
             with self.storage._aux_lock:
-                c=self._conn()
+                c = self._conn()
+                # Both durable records are committed together. Never ACK/delete a
+                # relay copy after persisting only one of these two records.
                 c.execute(
                     """INSERT OR IGNORE INTO wallet_receipts
                        (receipt_id,block_height,block_hash,sender,receiver,amount_sat,tx_type,timestamp,receipt_json,received_at)
                        VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                    (s["receipt_id"],s["block_height"],s["block_hash"],s["sender"],s["receiver"],
-                     s["amount_sat"],s["tx_type"],s["timestamp"],
-                     _canonical_json(receipt).decode("utf-8"),now))
+                    (s["receipt_id"], s["block_height"], s["block_hash"],
+                     s["sender"], s["receiver"], s["amount_sat"], s["tx_type"],
+                     s["timestamp"], _canonical_json(receipt).decode("utf-8"), now))
+                self._archive_verified_receipt(c, receipt, s)
                 c.commit()
             return True, "delivered"
         except Exception as exc:
+            try:
+                self._conn().rollback()
+            except Exception:
+                pass
             return False, f"local receipt storage error: {exc}"
 
     def local_wallet_receipts(self, limit: int = 100) -> List[dict]:

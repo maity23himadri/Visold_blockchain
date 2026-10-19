@@ -167,20 +167,30 @@ class RollingWindowPruner:
 
     # ── Public API ────────────────────────────────────────────────────────────
     def maybe_prune(self, current_height: int) -> int:
-        """
-        Trigger a pruning pass if the height has advanced enough.
-        Returns the number of blocks whose tx data was pruned.
-        Non-blocking: skipped if another pass is already running.
+        """Trigger a pruning pass if the height has advanced enough.
+        Returns the number of blocks processed by the pass/reconciliation.
+        Non-blocking: skipped if another pass is in flight.
         """
         if not Config.ROLLING_PRUNE_ENABLED:
             return 0
         if current_height < Config.ROLLING_PRUNE_WINDOW + Config.ROLLING_PRUNE_INTERVAL:
             return 0
-        if (current_height - self._last_height) < Config.ROLLING_PRUNE_INTERVAL:
-            return 0
         if not self._running_lock.acquire(blocking=False):
             return 0   # another pass is in flight
         try:
+            # Check the marker only after owning the pruner lock.  Otherwise two
+            # background triggers could both decide to reconcile and run with
+            # different heights out of order, moving the watermark backwards.
+            try:
+                _reconcile_version = self._storage.get_meta(
+                    "rolling_prune_reconcile_version")
+            except Exception:
+                _reconcile_version = None
+            if _reconcile_version != "1":
+                return self.reconcile_after_bootstrap(
+                    current_height, _lock_already_held=True)
+            if (current_height - self._last_height) < Config.ROLLING_PRUNE_INTERVAL:
+                return 0
             self._last_height = current_height
             return self._run_prune_pass(current_height)
         finally:
@@ -242,7 +252,29 @@ class RollingWindowPruner:
             watermark = max(0, int(self._storage.get_meta("rolling_pruned_until") or 0))
         except Exception:
             watermark = 0
-        start = min(watermark, cutoff)
+
+        # Repair the specific stale-watermark shape emitted by older snapshot
+        # bootstrap code: it could set the watermark beyond the rolling cutoff
+        # while block 0 (or another prefix block) still had a full body.  This
+        # cheap sentinel check avoids rescanning the entire chain on every block.
+        # The full contiguous-prefix reconciliation runs once after bootstrap.
+        if watermark > 0:
+            try:
+                first_block = self._storage.get_block(0)
+                if first_block is not None:
+                    first_data = first_block.to_dict()
+                    if not bool(first_data.get("pruned", False)):
+                        watermark = 0
+                        self._storage.set_meta("rolling_pruned_until", "0")
+            except Exception:
+                # On an uncertain read, do not move the watermark forward.
+                watermark = min(watermark, cutoff)
+        start = watermark
+
+        # A watermark beyond the rolling cutoff is valid after authenticated
+        # bootstrap when the imported history is already header-only.  Never
+        # clamp it back to cutoff: doing so would move the retention boundary
+        # backwards and could weaken rollback protection.
 
         # SQLite's canonical body lives in the same connection that also stores
         # transaction metadata.  Keep those changes ACID in one transaction.
@@ -375,6 +407,13 @@ class RollingWindowPruner:
                     "pruned": True,
                     "transactions": [],
                 }
+                # A previously-pruned body can still carry an authenticated
+                # bootstrap commitment needed by reconnecting peers.  Preserve
+                # it when rebuilding/repairing the slim header; freshly derived
+                # metadata from the full coinbase takes precedence.
+                _stored_bootstrap_meta = full.get("bootstrap_commitment")
+                if isinstance(_stored_bootstrap_meta, dict):
+                    header["bootstrap_commitment"] = dict(_stored_bootstrap_meta)
                 if _bootstrap_meta is not None:
                     header["bootstrap_commitment"] = _bootstrap_meta
 
@@ -435,19 +474,21 @@ class RollingWindowPruner:
                     c.commit()
 
                 # ── Canonical compaction ──────────────────────────────────
-                if not already_pruned or (
-                        getattr(self._storage, "_pgx_enabled", False) and pgx_tx_ids):
-                    if is_sqlite_canonical:
-                        c.execute(
-                            """INSERT OR REPLACE INTO block_headers
-                               (idx, block_hash, prev_hash, merkle_root, state_root,
-                                timestamp, difficulty, nonce)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (idx, header["block_hash"], header["prev_hash"],
-                             header["merkle_root"], header["state_root"],
-                             int(header["timestamp"]), float(header["difficulty"]),
-                             int(header["nonce"])),
-                        )
+                if is_sqlite_canonical:
+                    # Header-only blocks imported by snapshot bootstrap may not
+                    # have a corresponding block_headers row yet.  Always repair
+                    # that index, even when the body was already pruned.
+                    c.execute(
+                        """INSERT OR REPLACE INTO block_headers
+                           (idx, block_hash, prev_hash, merkle_root, state_root,
+                            timestamp, difficulty, nonce)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (idx, header["block_hash"], header["prev_hash"],
+                         header["merkle_root"], header["state_root"],
+                         int(header["timestamp"]), float(header["difficulty"]),
+                         int(header["nonce"])),
+                    )
+                    if not already_pruned:
                         slim_json = json.dumps(header, separators=(",", ":"))
                         result = c.execute(
                             "UPDATE blocks SET data_json=? WHERE idx=?",
@@ -459,22 +500,22 @@ class RollingWindowPruner:
                                 "RollingWindowPruner: SQLite canonical block=%d "
                                 "missing; retaining transaction data", idx)
                             break
-                    else:
-                        if not self._storage.prune_block_body(
-                                idx, header, tx_ids=pgx_tx_ids):
-                            log.warning(
-                                "RollingWindowPruner: canonical block compaction "
-                                "failed for block=%d; retaining transaction data",
-                                idx,
-                            )
-                            break
-
-                        # Auxiliary block row is non-authoritative in KV/PGX mode.
-                        slim_json = json.dumps(header, separators=(",", ":"))
-                        c.execute(
-                            "UPDATE blocks SET data_json=? WHERE idx=?",
-                            (slim_json, idx),
+                elif (not already_pruned or pgx_tx_ids):
+                    if not self._storage.prune_block_body(
+                            idx, header, tx_ids=pgx_tx_ids):
+                        log.warning(
+                            "RollingWindowPruner: canonical block compaction "
+                            "failed for block=%d; retaining transaction data",
+                            idx,
                         )
+                        break
+
+                    # Auxiliary block row is non-authoritative in KV/PGX mode.
+                    slim_json = json.dumps(header, separators=(",", ":"))
+                    c.execute(
+                        "UPDATE blocks SET data_json=? WHERE idx=?",
+                        (slim_json, idx),
+                    )
 
                 # ── Remove transaction projections only after compaction ───
                 if getattr(self._storage, "_pgx_enabled", False):
@@ -543,6 +584,164 @@ class RollingWindowPruner:
                 pass
             log.warning("RollingWindowPruner: pass error: %s", exc)
             return pruned
+    def reconcile_after_bootstrap(
+            self, current_height: int, *, _lock_already_held: bool = False) -> int:
+        """Reconcile pruning metadata and header indexes after snapshot bootstrap.
+
+        Authenticated bootstrap installs header-only rows for the imported suffix,
+        but the local canonical prefix can still contain full block bodies.  The
+        persisted watermark must therefore be derived from the actual contiguous
+        pruned prefix, never copied from the snapshot height.  When pruning is
+        enabled, finish the ordinary rolling-prune range synchronously so a node
+        does not resume syncing with stale full bodies below the cutoff.
+
+        Returns the number of heights processed by rolling-prune passes.  A
+        partial/no-progress pass leaves the watermark at the last verified safe
+        boundary; the next normal pruning trigger can resume it.
+        """
+        height = max(0, int(current_height))
+        if not _lock_already_held:
+            if not self._running_lock.acquire(blocking=True):
+                # A blocking acquire should normally succeed; retain a conservative
+                # result rather than claiming the bootstrap range was compacted.
+                return 0
+        processed = 0
+        try:
+            cutoff = max(0, height - int(Config.ROLLING_PRUNE_WINDOW))
+            c = self._storage._conn()
+
+            # Find the contiguous pruned prefix, while repairing any missing
+            # block_headers rows for header-only blocks installed by an earlier
+            # bootstrap.  Do not infer pruning from the old watermark: older
+            # releases could set it to snapshot_height while leaving the local
+            # prefix's transaction bodies untouched.
+            contiguous = 0  # contiguous pruned prefix, bounded by rolling cutoff
+            prefix_open = True
+            all_prefix_boundary = 0  # actual contiguous pruned prefix through the tip
+            all_prefix_open = True
+            first_full_at_or_after_cutoff = None
+            scan_complete = True
+            batch = []
+            for idx in range(height + 1):
+                block = self._storage.get_block(idx)
+                if block is None:
+                    log.warning(
+                        "RollingWindowPruner: bootstrap reconciliation found a "
+                        "canonical gap at block=%d; stopping prefix scan", idx)
+                    scan_complete = False
+                    break
+                try:
+                    full = block.to_dict()
+                except Exception:
+                    full = dict(block) if isinstance(block, dict) else {}
+                is_pruned = bool(full.get("pruned", False))
+
+                if is_pruned:
+                    batch.append((
+                        idx, str(full.get("block_hash", "")),
+                        str(full.get("prev_hash", "")),
+                        str(full.get("merkle_root", "")),
+                        str(full.get("state_root", "")),
+                        int(full.get("timestamp", 0) or 0),
+                        float(full.get("difficulty", 0) or 0),
+                        int(full.get("nonce", 0) or 0),
+                    ))
+                    if len(batch) >= 1000:
+                        c.executemany(
+                            """INSERT OR REPLACE INTO block_headers
+                               (idx, block_hash, prev_hash, merkle_root, state_root,
+                                timestamp, difficulty, nonce)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", batch)
+                        c.commit()
+                        batch.clear()
+
+                if all_prefix_open:
+                    if is_pruned:
+                        all_prefix_boundary = idx + 1
+                    else:
+                        all_prefix_open = False
+                if idx >= cutoff and not is_pruned and first_full_at_or_after_cutoff is None:
+                    first_full_at_or_after_cutoff = idx
+
+                if idx < cutoff and prefix_open:
+                    if is_pruned:
+                        contiguous = idx + 1
+                    else:
+                        prefix_open = False
+
+            if batch:
+                c.executemany(
+                    """INSERT OR REPLACE INTO block_headers
+                       (idx, block_hash, prev_hash, merkle_root, state_root,
+                        timestamp, difficulty, nonce)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", batch)
+                c.commit()
+
+            if not scan_complete:
+                # Keep only the verified contiguous prefix; a partial scan must
+                # never advertise a larger watermark or mark reconciliation done.
+                self._storage.set_meta("rolling_pruned_until", str(contiguous))
+                metrics.set_gauge("rolling_pruned_until_height", float(contiguous))
+                self._last_height = -1
+                return 0
+
+            if (not Config.ROLLING_PRUNE_ENABLED or
+                    height < int(Config.ROLLING_PRUNE_WINDOW) +
+                    int(Config.ROLLING_PRUNE_INTERVAL)):
+                self._storage.set_meta(
+                    "rolling_pruned_until", str(all_prefix_boundary))
+                metrics.set_gauge(
+                    "rolling_pruned_until_height", float(all_prefix_boundary))
+                self._storage.set_meta("rolling_prune_reconcile_version", "1")
+                self._last_height = height
+                return 0
+
+            # Initially trust only the contiguous prefix already marked pruned.
+            # The regular compactor will convert any remaining bodies below the
+            # cutoff, in bounded batches, before we advance the boundary further.
+            self._storage.set_meta("rolling_pruned_until", str(contiguous))
+            metrics.set_gauge("rolling_pruned_until_height", float(contiguous))
+
+            target = cutoff
+            # Run bounded batches to completion.  The guard guarantees progress
+            # or exits, so a backend failure cannot cause an infinite loop.
+            while self.get_pruned_watermark() < target:
+                before = self.get_pruned_watermark()
+                self._run_prune_pass(height)
+                after = self.get_pruned_watermark()
+                if after <= before:
+                    break
+                processed += after - before
+
+            # If every height below the cutoff is now pruned, imported header-only
+            # history above it may extend the contiguous pruned prefix further.
+            # Preserve that fact for rollback guards and avoid reprocessing it as
+            # though it were still a full-body range.
+            if self.get_pruned_watermark() >= target:
+                final_boundary = (
+                    first_full_at_or_after_cutoff
+                    if first_full_at_or_after_cutoff is not None
+                    else height + 1
+                )
+                self._storage.set_meta("rolling_pruned_until", str(final_boundary))
+                metrics.set_gauge(
+                    "rolling_pruned_until_height", float(final_boundary))
+            self._storage.set_meta("rolling_prune_reconcile_version", "1")
+            self._last_height = height
+            return processed
+        except Exception as exc:
+            log.warning("RollingWindowPruner: bootstrap reconciliation failed: %s", exc)
+            try:
+                # Reset only to a conservative value; never claim the snapshot
+                # height itself was pruned merely because its state was restored.
+                self._storage.set_meta("rolling_pruned_until", "0")
+            except Exception:
+                pass
+            return processed
+        finally:
+            if not _lock_already_held:
+                self._running_lock.release()
+
     # ── Header retrieval ──────────────────────────────────────────────────────
     def get_header(self, idx: int) -> Optional[dict]:
         """Return slim header dict for a pruned block, or None."""

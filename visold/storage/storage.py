@@ -2714,6 +2714,12 @@ class Storage:
                 "data":        meta.get("data", "") or "",
                 "contract_name": meta.get("contract_name", "") or "",
                 "_archived":   True,   # tag so callers can show a hint
+                # Preserve the origin marker when the permanent row was created
+                # from a verified VARR receipt. Balance History still treats this
+                # as one archived transaction, not a second receipt-only row.
+                "_relay_receipt": bool(meta.get("_relay_receipt", False)),
+                "receipt_id": meta.get("receipt_id", ""),
+                "block_hash": meta.get("block_hash", ""),
             }
             archived.append(d)
 

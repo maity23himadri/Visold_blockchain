@@ -235,6 +235,10 @@ class P2PNetwork:
         self._receipt_repair_slot = 0
         self.peers: Dict[str, PeerConnection] = {}
         self._lock       = threading.Lock()
+        # At most one authenticated checkpoint repair may mutate canonical
+        # state at a time. Several peers can reject the same bad local snapshot
+        # concurrently, so serialize this recovery path network-wide.
+        self._bootstrap_recovery_lock = threading.Lock()
         self._block_serve_cache = LRUCache(5, ttl=60.0) 
 
         # Plumtree-style: eager set (active) + lazy set (ihave hints)
@@ -1877,6 +1881,15 @@ class P2PNetwork:
                 for attempt in range(6):   # up to ~6 * 4s = 24s
                     if not p.connected:
                         return
+                    # If a pruned-history response dispatched authenticated
+                    # bootstrap, do not race it with another legacy 0..199
+                    # replay request.  The bootstrap path owns sync until it
+                    # either fast-forwards the state or reports failure.
+                    if getattr(p, "_authenticated_pruned_recovery_active", False):
+                        log.info(
+                            "[AutoSync] Yielding to authenticated pruned-history "
+                            "recovery for peer %s", peer_id[:12])
+                        return
                     cur_h = self.blockchain.height()
 
                     # BUG-FIX (v7.0.0.6) — Two problems with the old
@@ -2510,6 +2523,89 @@ class P2PNetwork:
             if pending is not None and pending.get("id") == request_id:
                 peer._sync_pending = None
 
+    def _recover_same_height_bootstrap_commitment(self, preferred_peer: 'PeerConnection',
+                                                  expected_height: int) -> bool:
+        """Repair a checkpoint state mismatch using a committed snapshot.
+
+        This is invoked only after ordinary block validation rejects the first
+        post-checkpoint block for a snapshot-commitment mismatch. It verifies
+        the peer's complete PoW/header chain and the block H+1 commitment, then
+        requires every local block hash 0..H to match before replacing state at
+        the *same* height. The ordinary full-block sync is resumed afterwards;
+        this method never accepts H+1 on behalf of the normal block validator.
+        """
+        if not self._bootstrap_recovery_lock.acquire(blocking=False):
+            log.info("[BootstrapSync] Another checkpoint recovery is already active")
+            return False
+
+        import queue as _queue_mod
+
+        try:
+            local_height = int(self.blockchain.height())
+            interval = int(Config.BOOTSTRAP_SNAPSHOT_INTERVAL)
+            if (local_height != int(expected_height) or interval <= 0
+                    or local_height <= 0 or local_height % interval != 0):
+                log.warning(
+                    "[BootstrapSync] Refusing same-height repair outside the "
+                    "expected checkpoint: expected=%s local=%s interval=%s",
+                    expected_height, local_height, interval)
+                return False
+
+            with self._lock:
+                peers = [p for p in self.peers.values() if p.connected]
+            ordered_peers = []
+            seen_ids = set()
+            for candidate in [preferred_peer] + [p for p in peers if p is not preferred_peer]:
+                if (candidate is None or not candidate.connected
+                        or candidate.peer_id in seen_ids):
+                    continue
+                seen_ids.add(candidate.peer_id)
+                ordered_peers.append(candidate)
+
+            for candidate_peer in ordered_peers:
+                if not candidate_peer.connected:
+                    continue
+                # Do not steal a response queue owned by another in-flight sync.
+                if getattr(candidate_peer, "_snap_response_queue", None) is not None:
+                    continue
+                response_q = _queue_mod.Queue(maxsize=8)
+                candidate_peer._snap_response_queue = response_q
+                try:
+                    candidate_peer.send({"type": MSG_GET_SNAPSHOT_MANIFEST})
+                    try:
+                        manifest_msg = response_q.get(timeout=20)
+                    except _queue_mod.Empty:
+                        log.warning(
+                            "[BootstrapSync] Manifest timeout from %s during "
+                            "same-height recovery", candidate_peer.peer_id[:12])
+                        continue
+                    if manifest_msg.get("type") != MSG_SNAPSHOT_MANIFEST:
+                        continue
+                    manifest = manifest_msg.get("manifest", [])
+                    ok = self._authenticated_bootstrap_from_manifest(
+                        candidate_peer, manifest, response_q,
+                        snapshot_timeout=60, allow_same_height_repair=True)
+                    if ok:
+                        log.warning(
+                            "[BootstrapSync] Authenticated same-height state repair "
+                            "completed at height %d using peer %s; normal block sync resumed",
+                            expected_height, candidate_peer.peer_id[:12])
+                        return True
+                except Exception as exc:
+                    log.warning(
+                        "[BootstrapSync] Same-height recovery from %s failed: %s",
+                        candidate_peer.peer_id[:12], exc)
+                finally:
+                    if getattr(candidate_peer, "_snap_response_queue", None) is response_q:
+                        candidate_peer._snap_response_queue = None
+            log.error(
+                "[BootstrapSync] Could not authenticate a repair snapshot at height %d; "
+                "local canonical state was not intentionally replaced",
+                expected_height)
+            return False
+        finally:
+            self._bootstrap_recovery_lock.release()
+
     def _on_chain_sync_result(self, peer: 'PeerConnection', blocks: list,
                                ok: bool, reason: str,
                                needs_next_page: bool, next_page_from: int,
@@ -2656,6 +2752,154 @@ class P2PNetwork:
                     f"block(s) {first_idx}-{last_idx} from "
                     f"{peer.peer_id[:12]} at local height {local_height}: "
                     f"{reason}")
+                # A pruned/header-only response cannot be repaired by replaying
+                # genesis: the same body is permanently unavailable.  Dispatch
+                # an authenticated snapshot fast-forward instead.  This path is
+                # deliberately separate from generic validation failures and
+                # does not relax accept_chain()'s fail-closed rule.
+                _pruned_body_rejection = any(marker in str(reason).lower() for marker in (
+                    "pruned/header-only",
+                    "required historical block body is pruned",
+                    "historical block body is pruned",
+                    "block body is pruned",
+                ))
+                if _pruned_body_rejection:
+                    if (not Config.SNAPSHOT_FAST_SYNC_ENABLED
+                            or not hasattr(self.blockchain, "_snapshot_engine")):
+                        log.error(
+                            "[BootstrapSync] Pruned history blocks sync at local height %d, "
+                            "but authenticated snapshot recovery is disabled/unavailable. "
+                            "No unsafe replay fallback will be attempted. Reason: %s",
+                            local_height, reason)
+                        return
+
+                    now = time.monotonic()
+                    with peer._sync_state_lock:
+                        _active = bool(getattr(
+                            peer, "_authenticated_pruned_recovery_active", False))
+                        _last = float(getattr(
+                            peer, "_pruned_recovery_last_attempt_at", 0.0))
+                        _start_pruned_recovery = (
+                            peer.connected and not _active and now - _last >= max(
+                                5.0, float(Config.CHAIN_SYNC_TIMEOUT_SECS)))
+                        if _start_pruned_recovery:
+                            peer._pruned_recovery_last_attempt_at = now
+                            peer._authenticated_pruned_recovery_active = True
+                    if _start_pruned_recovery and peer.connected:
+                        log.warning(
+                            "[BootstrapSync] Pruned block body rejected at local height %d; "
+                            "starting authenticated snapshot recovery from peer %s",
+                            local_height, peer.peer_id[:12])
+
+                        def _run_pruned_recovery(_peer=peer):
+                            try:
+                                recovered = self._authenticated_pruned_recovery_from_peer(_peer)
+                                if recovered:
+                                    log.info(
+                                        "[BootstrapSync] Authenticated pruned-history recovery "
+                                        "completed for peer %s at local height %d",
+                                        _peer.peer_id[:12], self.blockchain.height())
+                                else:
+                                    log.error(
+                                        "[BootstrapSync] Authenticated pruned-history recovery did "
+                                        "not complete for peer %s; inspect preceding logs to see "
+                                        "whether state installation began or completed",
+                                        _peer.peer_id[:12])
+                            except Exception as _re:
+                                log.exception(
+                                    "[BootstrapSync] Pruned-history recovery failed for %s: %s",
+                                    _peer.peer_id[:12], _re)
+                            finally:
+                                with _peer._sync_state_lock:
+                                    _peer._authenticated_pruned_recovery_active = False
+
+                        threading.Thread(
+                            target=_run_pruned_recovery,
+                            daemon=True,
+                            name=f"pruned-bootstrap-{peer.peer_id[:8]}",
+                        ).start()
+                    elif _active:
+                        log.info(
+                            "[BootstrapSync] Authenticated recovery already active for %s",
+                            peer.peer_id[:12])
+                    else:
+                        log.info(
+                            "[BootstrapSync] Pruned-history recovery is throttled for %s; "
+                            "will retry after cooldown",
+                            peer.peer_id[:12])
+                    # Do not send the known-ineffective generic 0..199 replay.
+                    return
+
+                # A checkpoint-commitment mismatch cannot be fixed by replaying
+                # blocks 0..199: the local tip is already at H and ordinary
+                # validation will reject H+1 again until the consensus-relevant
+                # snapshot state is reconciled. Use an authenticated same-height
+                # repair, then resume full-block validation at H+1.
+                _reason_lower = str(reason).lower()
+                _interval = int(Config.BOOTSTRAP_SNAPSHOT_INTERVAL)
+                _first_received = blocks[0].index if blocks else -1
+                _at_checkpoint_failure = (
+                    _interval > 0 and local_height > 0
+                    and local_height % _interval == 0
+                    and local_height + 1 >= int(Config.BOOTSTRAP_COMMITMENT_ACTIVATION_HEIGHT)
+                    and self.blockchain.height() == local_height
+                    and _first_received == local_height + 1
+                )
+                # These error forms mean validation could not establish the
+                # locally reconstructed checkpoint state. The remote chain is
+                # still untrusted: the recovery path independently verifies
+                # genesis -> H+1, the PoW chain, the commitment, the snapshot
+                # digest, and the entire local canonical prefix before writes.
+                _checkpoint_state_errors = (
+                    "bootstrap snapshot commitment mismatch",
+                    "bootstrap commitment parent state is unavailable",
+                    "cannot compute bootstrap commitment:",
+                    "unable to serialise deterministic bootstrap state",
+                )
+                _is_checkpoint_state_error = any(
+                    marker in _reason_lower for marker in _checkpoint_state_errors
+                )
+                if _at_checkpoint_failure:
+                    if _is_checkpoint_state_error:
+                        now = time.monotonic()
+                        with peer._sync_state_lock:
+                            if now - peer._sync_last_reject_at >= 5.0:
+                                peer._sync_last_reject_at = now
+                                start_bootstrap_recovery = True
+                            else:
+                                start_bootstrap_recovery = False
+                        if start_bootstrap_recovery and peer.connected:
+                            log.warning(
+                                "[BootstrapSync] Checkpoint state validation failed at height %d; "
+                                "starting authenticated same-height recovery. Full reason: %s",
+                                local_height, reason)
+                            threading.Thread(
+                                target=self._recover_same_height_bootstrap_commitment,
+                                args=(peer, local_height),
+                                daemon=True,
+                                name=f"bootstrap-repair-{peer.peer_id[:8]}",
+                            ).start()
+                        elif not peer.connected:
+                            log.warning(
+                                "[BootstrapSync] Checkpoint state failure at height %d, but peer "
+                                "disconnected; waiting for a connected peer. Full reason: %s",
+                                local_height, reason)
+                        else:
+                            log.info(
+                                "[BootstrapSync] Duplicate checkpoint recovery throttled for %s; "
+                                "full reason: %s", peer.peer_id[:12], reason)
+                    else:
+                        # Do not replay genesis on a failed H+1 boundary batch:
+                        # it cannot repair the same-height checkpoint. Emit the
+                        # unabridged reason so a non-state validation error is
+                        # diagnosable instead of hidden behind the TUI truncation.
+                        log.error(
+                            "[ChainSync] Checkpoint-boundary batch rejected at local height %d; "
+                            "authenticated state repair was NOT attempted because the rejection "
+                            "does not match a known local-state failure. Full reason: %s",
+                            local_height, reason)
+                    return
+
                 now = time.monotonic()
                 with peer._sync_state_lock:
                     if now - peer._sync_last_reject_at >= 5.0:
@@ -5810,9 +6054,130 @@ class P2PNetwork:
 
         return True
 
+    def _reconcile_mempool_after_authenticated_bootstrap(self) -> tuple[int, int]:
+        """Drop persisted mempool entries now confirmed or nonce-stale after a snapshot jump."""
+        try:
+            pending = self.storage.mempool_all()
+            pending_ids = [str(tx.tx_id) for tx in pending
+                           if getattr(tx, "tx_id", "")]
+            known_canonical = self.storage.existing_tx_ids(pending_ids)
+            if known_canonical:
+                self.blockchain.mempool.clear_confirmed(sorted(known_canonical))
+            stale_removed = self.blockchain.mempool.purge_stale_nonces()
+            if known_canonical or stale_removed:
+                log.info(
+                    "[BootstrapSync] Reconciled persisted mempool after snapshot: "
+                    "removed %d confirmed and %d stale-nonce tx(s)",
+                    len(known_canonical), int(stale_removed or 0))
+            return len(known_canonical), int(stale_removed or 0)
+        except Exception as exc:
+            # Snapshot state has already been installed. Do not claim rollback;
+            # surface this loudly because stale pending entries must not be mined.
+            log.error(
+                "[BootstrapSync] Snapshot installed but mempool reconciliation failed; "
+                "review pending transactions before mining: %s", exc)
+            return -1, -1
+
+    def _authenticated_pruned_recovery_from_peer(
+            self, peer: 'PeerConnection', *, manifest_timeout: float = 20.0,
+            snapshot_timeout: float = 60.0) -> bool:
+        """Safely fast-forward a stale node when required block bodies were pruned.
+
+        Unlike the legacy equal-height snapshot path, this method only invokes
+        the authenticated bootstrap verifier and only when the peer advertises
+        a committed snapshot strictly ahead of the current local height. A
+        missing/invalid manifest never leads to an unverified snapshot restore.
+        State installation is serialized with checkpoint-repair recovery.
+        """
+        import queue as _queue_mod
+
+        # Snapshot installation must not race same-height checkpoint repair or
+        # another stale-node fast-forward on a different peer.
+        recovery_lock = getattr(self, "_bootstrap_recovery_lock", None)
+        lock_acquired = False
+        if recovery_lock is not None:
+            lock_acquired = recovery_lock.acquire(blocking=False)
+            if not lock_acquired:
+                log.info(
+                    "[BootstrapSync] Another authenticated state recovery is active; "
+                    "deferring pruned-history recovery for %s", peer.peer_id[:12])
+                return False
+
+        response_q = None
+        sync_lock = getattr(peer, "_sync_state_lock", None)
+        try:
+            if (not Config.SNAPSHOT_FAST_SYNC_ENABLED
+                    or not hasattr(self.blockchain, "_snapshot_engine")
+                    or not peer.connected or sync_lock is None):
+                return False
+
+            response_q = _queue_mod.Queue(maxsize=8)
+            with sync_lock:
+                if getattr(peer, "_snap_response_queue", None) is not None:
+                    log.info(
+                        "[BootstrapSync] Snapshot response queue already owned for %s; "
+                        "deferring pruned-history recovery", peer.peer_id[:12])
+                    return False
+                peer._snap_response_queue = response_q
+
+            peer.send({"type": MSG_GET_SNAPSHOT_MANIFEST})
+            try:
+                manifest_msg = response_q.get(timeout=max(1.0, float(manifest_timeout)))
+            except _queue_mod.Empty:
+                log.warning(
+                    "[BootstrapSync] Snapshot manifest timed out from %s during pruned recovery",
+                    peer.peer_id[:12])
+                return False
+
+            if (not isinstance(manifest_msg, dict)
+                    or manifest_msg.get("type") != MSG_SNAPSHOT_MANIFEST):
+                log.warning(
+                    "[BootstrapSync] Invalid snapshot-manifest response from %s",
+                    peer.peer_id[:12])
+                return False
+            manifest = manifest_msg.get("manifest", [])
+            if not isinstance(manifest, list):
+                return False
+
+            local_height = int(self.blockchain.height())
+            eligible = []
+            for entry in manifest:
+                if not isinstance(entry, dict) or not entry.get("bootstrap_digest"):
+                    continue
+                try:
+                    height = int(entry.get("height", -1))
+                except (TypeError, ValueError):
+                    continue
+                if height > local_height:
+                    eligible.append(entry)
+            if not eligible:
+                log.warning(
+                    "[BootstrapSync] Peer %s has no committed snapshot ahead of local h=%d",
+                    peer.peer_id[:12], local_height)
+                return False
+
+            # This verifier independently fetches and validates genesis..H+1,
+            # checks the commitment digest, and requires the entire local chain
+            # to be an exact canonical prefix before any snapshot state changes.
+            return self._authenticated_bootstrap_from_manifest(
+                peer, manifest, response_q, snapshot_timeout=snapshot_timeout)
+        except Exception as exc:
+            log.warning(
+                "[BootstrapSync] Authenticated pruned recovery from %s failed: %s",
+                peer.peer_id[:12], exc)
+            return False
+        finally:
+            if response_q is not None and sync_lock is not None:
+                with sync_lock:
+                    if getattr(peer, "_snap_response_queue", None) is response_q:
+                        peer._snap_response_queue = None
+            if lock_acquired:
+                recovery_lock.release()
+
     def _authenticated_bootstrap_from_manifest(self, peer: 'PeerConnection',
                                               manifest: list, resp_q,
-                                              snapshot_timeout: float = 60) -> bool:
+                                              snapshot_timeout: float = 60,
+                                              allow_same_height_repair: bool = False) -> bool:
         """Bootstrap a fresh or stale-prefix node although peers prune bodies.
 
         Security boundary: peer manifest data is untrusted.  We download and
@@ -5842,7 +6207,9 @@ class P2PNetwork:
                 h = int(e.get("height", -1))
             except Exception:
                 continue
-            if h > local_height and e.get("bootstrap_digest"):
+            if ((h > local_height or
+                 (allow_same_height_repair and h == local_height))
+                    and e.get("bootstrap_digest")):
                 candidates.append((h, e))
         candidates.sort(key=lambda x: x[0], reverse=True)
         if not candidates:
@@ -5927,33 +6294,58 @@ class P2PNetwork:
                 if not blob:
                     continue
 
-                ok, err = self.blockchain._snapshot_engine.restore_authenticated_bootstrap(
-                    blob, committed_digest, verified)
-                if not ok:
-                    log.warning("[BootstrapSync] Authenticated restore h=%d failed: %s",
-                                snap_h, err)
-                    continue
+                # Serialize installation with block validation/application. In
+                # particular, same-height repair must not race a block arriving
+                # from another peer between the verified-prefix check and the
+                # authenticated state replacement.
+                with self.blockchain._lock:
+                    ok, err = self.blockchain._snapshot_engine.restore_authenticated_bootstrap(
+                        blob, committed_digest, verified,
+                        allow_same_height_repair=allow_same_height_repair)
+                    if not ok:
+                        log.warning("[BootstrapSync] Authenticated restore h=%d failed: %s",
+                                    snap_h, err)
+                        continue
 
-                # Refresh in-memory L2 state from the authenticated payload.
-                try:
-                    self.blockchain.layer2._try_restore_from_storage()
-                    # Fresh Blockchain() constructed GovernanceEngine before the
-                    # authenticated snapshot existed; reload its now-restored
-                    # deterministic proposal lifecycle state.
-                    self.blockchain._governance._proposals.clear()
-                    self.blockchain._governance._blacklist.clear()
-                    self.blockchain._governance._load_persisted_proposals()
-                except Exception as exc:
-                    log.warning("[BootstrapSync] consensus-state reload failed after restore: %s", exc)
-                    return False
+                    # Refresh in-memory consensus components before releasing
+                    # the blockchain lock, so no block observes mixed old/new state.
+                    try:
+                        self.blockchain.layer2._try_restore_from_storage()
+                        # Fresh Blockchain() constructed GovernanceEngine before the
+                        # authenticated snapshot existed; reload its now-restored
+                        # deterministic proposal lifecycle state.
+                        self.blockchain._governance._proposals.clear()
+                        self.blockchain._governance._blacklist.clear()
+                        self.blockchain._governance._load_persisted_proposals()
+                    except Exception as exc:
+                        log.warning("[BootstrapSync] consensus-state reload failed after restore: %s", exc)
+                        return False
 
-                # Drop stale difficulty cache entries calculated while the
-                # local canonical chain was still only genesis.
+                    # Drop stale difficulty cache entries calculated while the
+                    # local canonical chain was still only genesis/stale state.
+                    try:
+                        from visold.consensus.difficulty import DifficultyEngine
+                        DifficultyEngine.invalidate_cache()
+                    except Exception:
+                        pass
+
+                    # A snapshot skips old block bodies, so apply_block() cannot
+                    # clear persisted mempool rows for transactions confirmed while
+                    # this node was offline. Reconcile against canonical tx/replay
+                    # indexes before the node can mine again.
+                    self._reconcile_mempool_after_authenticated_bootstrap()
+
+                # Header-only blocks installed by authenticated bootstrap retain
+                # Merkle roots, so proof-carrying receipts for transactions in
+                # pruned bodies can now be verified. Trigger mailbox retrieval
+                # immediately instead of waiting for the periodic maintenance tick.
                 try:
-                    from visold.consensus.difficulty import DifficultyEngine
-                    DifficultyEngine.invalidate_cache()
-                except Exception:
-                    pass
+                    if Config.RECEIPT_RELAY_ENABLED:
+                        self.query_receipt_mailbox()
+                except Exception as _receipt_exc:
+                    log.warning(
+                        "[BootstrapSync] Immediate receipt mailbox query failed: %s",
+                        _receipt_exc)
 
                 log.info(
                     "[BootstrapSync] Authenticated snapshot h=%d installed; "
@@ -5974,9 +6366,10 @@ class P2PNetwork:
         """
         Legacy single-peer snapshot verification path.
 
-        Used only when the local node is already at the snapshot height.
-        Fresh/behind nodes must use ordinary block synchronization; a peer
-        snapshot is never trusted to replace unrooted auxiliary consensus state.
+        Uses the authenticated header+snapshot path when the local node is
+        behind the peer snapshot. Equal-height legacy restoration is retained
+        for the existing compatibility path; stale/pruned recovery calls the
+        authenticated-only helper above and never enters that path.
         """
         if not Config.SNAPSHOT_FAST_SYNC_ENABLED:
             return False

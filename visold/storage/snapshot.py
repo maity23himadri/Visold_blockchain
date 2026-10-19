@@ -55,8 +55,9 @@ class StateSnapshotEngine:
     _KEY_PREFIX  = "snap:"
     _MANIFEST    = "snap_manifest"   # JSON list of {height, state_root, size}
 
-    def __init__(self, storage: 'Storage'):
+    def __init__(self, storage: 'Storage', rolling_pruner=None):
         self._storage       = storage
+        self._rolling_pruner = rolling_pruner
         self._last_snap_h   = -1
         self._snap_lock     = threading.Lock()
 
@@ -619,7 +620,9 @@ class StateSnapshotEngine:
         return True, "OK (canonical state already present)"
 
     def restore_authenticated_bootstrap(self, blob: bytes, expected_digest: str,
-                                        verified_headers: list) -> Tuple[bool, str]:
+                                        verified_headers: list, *,
+                                        allow_same_height_repair: bool = False
+                                        ) -> Tuple[bool, str]:
         """Install a fresh-node snapshot authenticated by a verified PoW chain.
 
         ``verified_headers`` must contain the already-verified transport records
@@ -629,11 +632,13 @@ class StateSnapshotEngine:
         and pass its exact committed digest as ``expected_digest``.
 
         This operation may also fast-forward a stale/behind node whose next
-        required full block body has already been pruned.  It is never allowed
-        to replace or reorg locally-applied canonical history: every local
-        block hash through the current local height must exactly match the
-        independently verified PoW header chain, and the snapshot height must
-        be strictly ahead of the local tip.
+        required full block body has already been pruned. It can repair state
+        at the same height only when the caller explicitly enables that mode
+        after a bootstrap-commitment validation failure. In every mode, every
+        local block hash through the current local height must exactly match
+        the independently verified PoW header chain. A same-height repair does
+        not replace canonical headers or reorg the chain; it replaces only the
+        state represented by the authenticated snapshot.
         """
         if not blob or not expected_digest:
             return False, "authenticated bootstrap requires snapshot bytes and digest"
@@ -659,9 +664,11 @@ class StateSnapshotEngine:
         if snap_h <= 0:
             return False, "bootstrap snapshot height must be positive"
         local_h = int(self._storage.chain_height())
-        if local_h >= snap_h:
+        same_height_repair = bool(allow_same_height_repair and local_h == snap_h)
+        if local_h > snap_h or (local_h == snap_h and not same_height_repair):
             return False, (
-                f"authenticated bootstrap snapshot must be ahead of local tip; "
+                f"authenticated bootstrap snapshot must be ahead of local tip "
+                f"unless explicit same-height repair is enabled; "
                 f"local height={local_h}, snapshot height={snap_h}")
         if not isinstance(verified_headers, list) or len(verified_headers) <= snap_h + 1:
             return False, "verified bootstrap header chain is incomplete"
@@ -814,7 +821,28 @@ class StateSnapshotEngine:
                              "last_batch_id": l2_last_batch}],
                            separators=(",", ":"), sort_keys=True))
             self._storage.set_meta("cumulative_issued_sat", str(cumulative))
-            self._storage.set_meta("rolling_pruned_until", str(snap_h))
+            # Do not set rolling_pruned_until=snap_h.  The local prefix can
+            # still contain full bodies even though the imported suffix is
+            # header-only.  Reconcile from persisted block markers and run the
+            # normal rolling pruner before declaring the restore complete.
+            if self._rolling_pruner is not None:
+                try:
+                    self._rolling_pruner.reconcile_after_bootstrap(snap_h)
+                except Exception as _prune_exc:
+                    # Snapshot state is authenticated and already installed.  A
+                    # pruning failure must not undo that state transition, but
+                    # leave a conservative watermark and log so pruning retries.
+                    log.warning(
+                        "StateSnapshotEngine: post-bootstrap pruning reconciliation "
+                        "failed at height=%d: %s", snap_h, _prune_exc)
+                    try:
+                        self._storage.set_meta("rolling_pruned_until", "0")
+                    except Exception:
+                        pass
+            else:
+                # Conservative fallback for direct engine construction.  Never
+                # assert that the snapshot height itself proves old bodies gone.
+                self._storage.set_meta("rolling_pruned_until", "0")
             self._storage.set_meta("bootstrap_checkpoint_height", str(snap_h))
             self._storage.set_meta("bootstrap_checkpoint_hash", str(anchor.get("block_hash", "")))
             self._storage.set_meta("snap_restored_height", str(snap_h))

@@ -2724,7 +2724,6 @@ class CLI:
                         sender_tx  = d.get("sender",   "") or ""
                         receiver_tx= d.get("receiver", "") or ""
                         amount_tx  = float(d.get("amount", 0) or 0)
-                        fee_raw_tx = float(d.get("fee",    0) or 0)
                         memo_tx    = (d.get("memo", "") or "").strip()
                         tx_type    = _parse_tx_type(d.get("tx_type"))
                         blk_idx    = d.get("block_idx")
@@ -2733,10 +2732,10 @@ class CLI:
                                       .strftime('%Y-%m-%d %H:%M') if ts_raw else "unknown time")
                         blk_str    = f"#{blk_idx}" if blk_idx is not None else "pending"
 
-                        fee_deducted_tx = round(fee_raw_tx, 8) if fee_raw_tx else round(amount_tx * Config.TX_FEE_RATE, 8)
-                        net_tx          = round(amount_tx - fee_deducted_tx, 8)
-                        fee_note_tx     = f"(net of {fee_deducted_tx:.8f} fee)" if fee_deducted_tx else ""
-                        tx_change_str   = f"+{net_tx:.8f}" + (f" {fee_note_tx}" if fee_note_tx else "")
+                        # Transfer fees are charged to the sender on top of amount;
+                        # the receiver is credited the full transaction amount.
+                        # Do not subtract or display the sender's fee as a recipient fee.
+                        tx_change_str   = f"+{amount_tx:.8f}"
                         tx_counterpart  = f"← {_uid(sender_tx)}"
 
                         # ── reward side ───────────────────────────────────────
@@ -2808,9 +2807,10 @@ class CLI:
                             sign_str    = clr(f"-{total_cost:.8f}{fee_note}", RED)
                         else:
                             # incoming
-                            fee_deducted = round(fee_raw, 8) if fee_raw else round(amount * Config.TX_FEE_RATE, 8)
-                            net          = round(amount - fee_deducted, 8)
-                            change       = net
+                            # The transaction amount is the recipient's credit.
+                            # The fee is sender-paid separately, so history must not
+                            # subtract it from an incoming transfer.
+                            change       = amount
                             if memo.startswith("ORDER:"):
                                 cause = "Order Recv"
                             elif tx_type == 3:
@@ -2825,8 +2825,7 @@ class CLI:
                                 cause = "Received"
                             cause_clr   = GREEN
                             counterpart = f"← {_uid(sender)}"
-                            fee_note    = f" (net of {fee_deducted:.8f} fee)" if fee_deducted else ""
-                            sign_str    = clr(f"+{net:.8f}{fee_note}", GREEN)
+                            sign_str    = clr(f"+{change:.8f}", GREEN)
 
                         # ── memo display (truncate if long, hide coinbase tag) ─
                         if memo.startswith("coinbase:"):

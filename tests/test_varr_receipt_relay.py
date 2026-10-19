@@ -87,11 +87,74 @@ def test_receipt_survives_body_pruning_and_preserves_sender(tmp_path, monkeypatc
             assert hit["receiver"] == target.address
             assert int(hit["amount_sat"]) == 500_000_000
             assert hit["block_height"] == 8
+            # A verified relay receipt must become a durable permanent-history
+            # row as well as a local wallet proof. Balance History reads through
+            # get_address_txs(), so it must surface exactly one archived row.
+            archive_rows = st._conn().execute(
+                "SELECT tx_hash, block_idx, sender, receiver, amount, tx_type, timestamp, metadata_json "
+                "FROM permanent_history WHERE tx_hash=?", (tx.tx_id,)
+            ).fetchall()
+            assert len(archive_rows) == 1
+            archive = archive_rows[0]
+            assert archive["block_idx"] == 8
+            assert archive["sender"] == tx.sender
+            assert archive["receiver"] == target.address
+            assert float(archive["amount"]) == 5.0
+            import json
+            meta = json.loads(archive["metadata_json"])
+            assert meta["fee"] == 0.05
+            assert meta["nonce"] == tx.nonce
+            assert meta["_relay_receipt"] is True
+            assert meta["history_source"] == "verified_varr_receipt"
+
             merged = st.get_address_txs(target.address)
-            recovered = next(d for d in merged if d.get("tx_id") == tx.tx_id)
+            hits = [d for d in merged if d.get("tx_id") == tx.tx_id]
+            assert len(hits) == 1
+            recovered = hits[0]
             assert recovered["sender"] == tx.sender
+            assert recovered["receiver"] == target.address
             assert recovered["amount"] == 5.0
+            assert recovered["fee"] == 0.05
+            assert recovered["block_idx"] == 8
+            assert recovered.get("_archived") is True
             assert recovered.get("_relay_receipt") is True
+
+            # Re-delivery is idempotent. A receiver-signed ACK may let the
+            # temporary relay mailbox garbage-collect its copy, but the durable
+            # wallet proof and Balance History archive must remain intact.
+            ok, why = mgr.deliver_to_local_wallet(receipt)
+            assert ok, why
+            assert st._conn().execute(
+                "SELECT COUNT(*) FROM wallet_receipts WHERE receipt_id=?",
+                (receipt["receipt_id"],),
+            ).fetchone()[0] == 1
+            assert st._conn().execute(
+                "SELECT COUNT(*) FROM permanent_history WHERE tx_hash=?",
+                (tx.tx_id,),
+            ).fetchone()[0] == 1
+            ok, why = mgr.store_relay_receipt(receipt, 0)
+            assert ok, why
+            ack = mgr.make_ack(receipt["receipt_id"])
+            ok, why = mgr.accept_ack(ack)
+            assert ok, why
+            monkeypatch.setattr(Config, "RECEIPT_ACK_GRACE_SECS", 0)
+            assert mgr.gc_delivered() == 1
+            assert st._conn().execute(
+                "SELECT COUNT(*) FROM relay_receipts WHERE receipt_id=?",
+                (receipt["receipt_id"],),
+            ).fetchone()[0] == 0
+            assert st._conn().execute(
+                "SELECT COUNT(*) FROM wallet_receipts WHERE receipt_id=?",
+                (receipt["receipt_id"],),
+            ).fetchone()[0] == 1
+            assert st._conn().execute(
+                "SELECT COUNT(*) FROM permanent_history WHERE tx_hash=?",
+                (tx.tx_id,),
+            ).fetchone()[0] == 1
+            final_history = [d for d in st.get_address_txs(target.address)
+                             if d.get("tx_id") == tx.tx_id]
+            assert len(final_history) == 1
+            assert final_history[0]["amount"] == 5.0
         finally:
             st.close()
 
@@ -115,6 +178,18 @@ def test_receipt_tampering_and_forged_ack_are_rejected(tmp_path, monkeypatch):
             forged["receipt_id"] = sha256(json.dumps(base, sort_keys=True, separators=(",", ":")).encode())
             ok, _ = mgr.verify_receipt(forged, require_canonical=True)
             assert not ok
+            # Invalid proofs must never create either the durable wallet copy or
+            # a permanent-history row.
+            ok, _ = mgr.deliver_to_local_wallet(forged)
+            assert not ok
+            assert st._conn().execute(
+                "SELECT COUNT(*) FROM wallet_receipts WHERE receipt_id=?",
+                (receipt["receipt_id"],),
+            ).fetchone()[0] == 0
+            assert st._conn().execute(
+                "SELECT COUNT(*) FROM permanent_history WHERE tx_hash=?",
+                (tx.tx_id,),
+            ).fetchone()[0] == 0
 
             assert mgr.store_relay_receipt(receipt, 0)[0]
             attacker = Wallet.generate()

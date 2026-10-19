@@ -128,7 +128,7 @@ class Blockchain:
         self._vvm_engine    = VVMEngine(storage)
         # v7.4.0: Rolling window pruner and state snapshot engine
         self._rolling_pruner   = RollingWindowPruner(storage)
-        self._snapshot_engine  = StateSnapshotEngine(storage)
+        self._snapshot_engine  = StateSnapshotEngine(storage, self._rolling_pruner)
         # Injected by VisoldNode after construction
         self._slash_evidence: Optional[Any] = None
         # ── v7.7.0 Rate defection auditor ────────────────────────────────────
@@ -480,6 +480,40 @@ class Blockchain:
 
     def get_block(self, idx: int) -> Optional[Block]:
         return self.storage.get_block(idx)
+
+    def _rebuild_economic_monitor_history(self) -> None:
+        """Rebase transient monitor history onto the current canonical chain tip.
+
+        The monitor cannot reconstruct historical payout splits safely from the
+        current role table, because roles may have changed since those blocks.
+        It therefore rebuilds producer history from stored canonical blocks and
+        clears old reward/fee samples rather than retaining orphaned observations
+        or fabricating historical payouts.
+        """
+        try:
+            tip = int(self.storage.chain_height())
+            producers = []
+            if tip >= 1:
+                start = max(1, tip - EconomicMonitor.WINDOW + 1)
+                for height in range(tip, start - 1, -1):
+                    block = self.storage.get_block(height)
+                    if block is None:
+                        # The retained range may cross a pruning gap. Do not infer
+                        # a consecutive suffix across missing canonical history.
+                        break
+                    address = str(getattr(block, "miner_address", "") or "").strip()
+                    if address:
+                        producers.append(address)
+                producers.reverse()
+            self._eco_mon.replace_canonical_history(producers)
+        except Exception as exc:
+            # Economic telemetry must never prevent a consensus rollback. Fail
+            # closed by discarding uncertain history instead of keeping stale data.
+            log.warning("Economic monitor history reset after rollback; reason: %s", exc)
+            try:
+                self._eco_mon.replace_canonical_history([])
+            except Exception:
+                log.exception("Unable to clear stale economic monitor history")
 
     # ── Hybrid difficulty ─────────────────────────────────────────────────────
     def get_difficulty(self) -> float:
@@ -2939,7 +2973,7 @@ class Blockchain:
                         current_nonce = self.storage.get_nonce(tx.sender)
                         self.storage.set_nonce(tx.sender, max(current_nonce, tx.nonce + 1))
 
-                self._distribute_rewards(block, fee_pool_sat)
+                _block_reward_allocations = self._distribute_rewards(block, fee_pool_sat)
 
                 # ── v7.2.0 APPLY REGISTER TX ROLE CHANGES AFTER REWARDS ─────
                 # Rewards at block N use the role set as-of END of block N-1.
@@ -3153,9 +3187,11 @@ class Blockchain:
             network_clock.record_block_timestamp(block.timestamp)
 
             # ── Economic monitoring (Problem #15) ─────────────────────────────
-            if block.miner_address:
-                self._eco_mon.record_reward(block.miner_address,
-                                            self.compute_reward(block.index))
+            # Record actual credits from the same deterministic distribution used
+            # by state application.  A proposer's base subsidy is not necessarily
+            # the amount they received when role-based payouts are enabled.
+            self._eco_mon.record_block_rewards(
+                block.miner_address, _block_reward_allocations)
             self._eco_mon.record_block_fees(from_satoshi(fee_pool_sat))
 
             # ── Local Transaction Indexer (vsd_personal_ledger) ───────────────
@@ -4972,6 +5008,11 @@ class Blockchain:
         self.storage.decrement_cumulative_issued_sat(
             self.compute_reward_sat(block.index))
 
+        # Economic-monitor histories are in-memory and must follow canonical
+        # storage after rollback/reorg; otherwise orphaned blocks can sustain
+        # false producer-streak and concentration alerts.
+        self._rebuild_economic_monitor_history()
+
         # Confirmed indexes are now gone, so mempool.restore() can legitimately
         # accept the original tx ids back into the pool.
         for _tx in _mempool_restore:
@@ -5388,7 +5429,7 @@ class Blockchain:
             str(miner.get("address", "")), tip_before)
         return score_micro * activity
 
-    def _distribute_rewards(self, block: Block, fee_pool_sat: int):
+    def _distribute_rewards(self, block: Block, fee_pool_sat: int) -> dict[str, int]:
         """
         V2 reward distribution (v7.1.12 — Option B clean break).
 
@@ -5451,6 +5492,16 @@ class Blockchain:
         # counting fees as issuance.
         self.storage.increment_cumulative_issued_sat(base_reward_sat)
         total_sat = base_reward_sat + fee_pool_sat
+        allocations: dict[str, int] = {}
+
+        def _credit_reward(address: str, amount_sat: int) -> None:
+            amount_sat = int(amount_sat)
+            if amount_sat <= 0:
+                return
+            self.storage.credit_sat(address, amount_sat)
+            # Burn is accounted for separately and is not a recipient reward.
+            if address and address != Config.BURN_ADDRESS:
+                allocations[address] = allocations.get(address, 0) + amount_sat
 
         # 2. Gather the role set AS-OF the START of this block.  REGISTER
         #    txs inside this block will mutate roles AFTER this function
@@ -5463,10 +5514,10 @@ class Blockchain:
         #    every node because the role tables are empty on every node.
         if not all_validators and not all_miners:
             if block.miner_address:
-                self.storage.credit_sat(block.miner_address, total_sat)
+                _credit_reward(block.miner_address, total_sat)
             else:
-                self.storage.credit_sat(Config.BURN_ADDRESS, total_sat)
-            return
+                _credit_reward(Config.BURN_ADDRESS, total_sat)
+            return allocations
 
         # 4. V2 share constants in millionths (sum to 1_000_000 exactly)
         s_creator_m = int(round(Config.REWARD_CREATOR        * 1_000_000))  # 200_000
@@ -5484,7 +5535,7 @@ class Blockchain:
 
         # 5. Block proposer reward (20%)
         creator_sat = total_sat * s_creator_m // 1_000_000
-        self.storage.credit_sat(block.miner_address, creator_sat)
+        _credit_reward(block.miner_address, creator_sat)
         total_credited_sat += creator_sat
 
         # 6. All-miners pool (45%, or 80% when no validators)
@@ -5498,19 +5549,19 @@ class Blockchain:
                 total_weight = sum(w for _, w in active)
                 for miner, weight in active:
                     share_sat = miner_pool_sat * weight // total_weight
-                    self.storage.credit_sat(miner["address"], share_sat)
+                    _credit_reward(miner["address"], share_sat)
                     credited_miners_sat += share_sat
                 # Integer-division remainder → block proposer (deterministic)
                 miner_remainder = miner_pool_sat - credited_miners_sat
                 if miner_remainder > 0:
-                    self.storage.credit_sat(block.miner_address, miner_remainder)
+                    _credit_reward(block.miner_address, miner_remainder)
             else:
                 # Registered miners exist but none has recent canonical PoW;
                 # preserve conservation by assigning the pool to the proposer.
-                self.storage.credit_sat(block.miner_address, miner_pool_sat)
+                _credit_reward(block.miner_address, miner_pool_sat)
         else:
             # No miners registered (bootstrap edge — proposer receives pool).
-            self.storage.credit_sat(block.miner_address, miner_pool_sat)
+            _credit_reward(block.miner_address, miner_pool_sat)
         total_credited_sat += miner_pool_sat
 
         # 7. All-validators pool (35%) — only when validators registered
@@ -5523,25 +5574,26 @@ class Blockchain:
             if total_stake > 0:
                 for i, val in enumerate(all_validators):
                     v_share_sat = v_pool_sat * stakes[i] // total_stake
-                    self.storage.credit_sat(val["address"], v_share_sat)
+                    _credit_reward(val["address"], v_share_sat)
                     val_all_credited += v_share_sat
                 # Integer-division remainder → block proposer
                 val_remainder = v_pool_sat - val_all_credited
                 if val_remainder > 0:
-                    self.storage.credit_sat(block.miner_address, val_remainder)
+                    _credit_reward(block.miner_address, val_remainder)
                 total_credited_sat += v_pool_sat
             else:
                 # Validators registered but ALL stakes round to dust
                 # (extreme edge case).  Redirect to proposer so no
                 # satoshi is leaked — same v7.1.11 Bug-4 logic.
-                self.storage.credit_sat(block.miner_address, v_pool_sat)
+                _credit_reward(block.miner_address, v_pool_sat)
                 total_credited_sat += v_pool_sat
 
         # 8. Burn integer-division dust to BURN_ADDRESS so
         #    sum(all credits) == total_sat exactly.  Typically 0-2 sat.
         burn_sat = total_sat - total_credited_sat
         if burn_sat > 0:
-            self.storage.credit_sat(Config.BURN_ADDRESS, burn_sat)
+            _credit_reward(Config.BURN_ADDRESS, burn_sat)
+        return allocations
 
 
     # ── Chain from peer (fork handling / reorg) ───────────────────────────────

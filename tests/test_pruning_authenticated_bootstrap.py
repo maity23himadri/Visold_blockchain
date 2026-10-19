@@ -9,6 +9,7 @@ import pytest
 
 from visold.chain.blockchain import Blockchain
 from visold.chain.consensus_engine import ConsensusEngine
+from visold.consensus.difficulty import DifficultyEngine
 from visold.kernel.config import Config
 from visold.ledger.block import Block
 from visold.ledger.transaction import Transaction
@@ -19,6 +20,9 @@ from visold.wallet.wallet import Wallet
 
 @pytest.fixture
 def bootstrap_cfg(monkeypatch):
+    # Difficulty cache entries are process-global and otherwise leak between
+    # independent test chains that reuse the same heights.
+    DifficultyEngine.invalidate_cache()
     # Tiny deterministic values exercise the production 600-block protocol in
     # seconds.  These are process-local test overrides, never runtime settings.
     monkeypatch.setattr(Config, "INITIAL_DIFFICULTY", 0.001)
@@ -30,9 +34,14 @@ def bootstrap_cfg(monkeypatch):
     monkeypatch.setattr(Config, "ROLLING_PRUNE_INTERVAL", 1)
     monkeypatch.setattr(Config, "ROLLING_PRUNE_BATCH", 100)
     monkeypatch.setattr(Config, "SNAPSHOT_KEEP", 2)
+    yield
+    DifficultyEngine.invalidate_cache()
 
 
 def _mine_to(bc: Blockchain, miner: Wallet, height: int):
+    # Keep the tests deterministic: this helper explicitly invokes pruning in
+    # tests that need it, so do not also race the background pruner thread.
+    bc._rolling_pruner.prune_async = lambda _height: None
     eng = ConsensusEngine(bc, miner)
     while bc.height() < height:
         candidate = eng.build_candidate_block(miner.address)
@@ -76,15 +85,22 @@ def test_all_pruning_nodes_can_bootstrap_fresh_node_from_authenticated_snapshot(
             blob, committed, verified)
         assert ok, msg
         assert fresh.height() == 4
-        assert fresh_st.get_meta("rolling_pruned_until") == "4"
+        # Snapshot restore prunes the old local prefix through the rolling
+        # cutoff rather than incorrectly setting the watermark to snapshot H.
+        assert fresh_st.get_meta("rolling_pruned_until") == "5"
+        assert fresh.get_block(0).is_pruned is True
+        assert fresh.get_block(1).is_pruned is True
 
         # Replay protection is part of the authenticated snapshot, despite old
-        # transaction rows/bodies being absent on the fresh node.
-        old_coinbase = source.get_block(2).bootstrap_commitment
-        # Pick any confirmed txid from the source's replay guard.
-        row = st._conn().execute(
-            "SELECT tx_id FROM tx_replay_guard ORDER BY tx_id LIMIT 1").fetchone()
-        assert row and fresh_st.replay_guard_exists(row["tx_id"])
+        # transaction rows/bodies being absent on the fresh node. Choose an ID
+        # from the exact snapshot payload, not an arbitrary source DB row: the
+        # source has already advanced to h=5, while this snapshot represents h=4.
+        snapshot_payload = json.loads(zlib.decompress(blob).decode("utf-8"))
+        snapshot_replay_ids = snapshot_payload["tx_replay_guard"]
+        assert snapshot_replay_ids
+        snapshot_tx_id = snapshot_replay_ids[0]
+        assert st.replay_guard_exists(snapshot_tx_id)
+        assert fresh_st.replay_guard_exists(snapshot_tx_id)
 
         # Continue with ordinary fully-validated blocks after the snapshot.
         fresh.layer2._try_restore_from_storage()
@@ -268,3 +284,100 @@ def test_stale_snapshot_fast_forward_rejects_nonmatching_local_prefix(bootstrap_
         assert not ok
         assert "not a fast-forward" in why
         assert other.height() == 1
+
+
+def test_same_height_checkpoint_repair_recovers_aux_state_and_resumes_validation(bootstrap_cfg):
+    """A stale auxiliary counter at H must be repairable only via the H+1 commitment."""
+    import sqlite3
+
+    with tempfile.TemporaryDirectory() as td:
+        source_st = Storage(os.path.join(td, "source.db"))
+        source = Blockchain(source_st)
+        miner = Wallet.generate()
+        _mine_to(source, miner, 4)
+
+        # Candidate construction persists the complete H=4 snapshot and inserts
+        # its digest in block 5's coinbase, but does not yet advance the chain.
+        engine = ConsensusEngine(source, miner)
+        block5 = engine.build_candidate_block(miner.address)
+        assert block5.index == 5
+        assert block5.mine()
+        snapshot_blob = source._snapshot_engine.get_snapshot_blob(4)
+        assert snapshot_blob
+
+        # Clone the exact canonical history at H, then simulate a legacy DB with
+        # a missing auxiliary issuance counter. Canonical block hashes stay intact.
+        local_path = os.path.join(td, "local.db")
+        dst = sqlite3.connect(local_path)
+        try:
+            source_st._conn().backup(dst)
+        finally:
+            dst.close()
+
+        local_st = Storage(local_path)
+        local = Blockchain(local_st)
+        local_st.set_meta("cumulative_issued_sat", "0")
+        assert local.height() == 4
+        assert local.get_block(4).block_hash == source.get_block(4).block_hash
+
+        # Source commits H through block H+1. The corrupted local state must fail
+        # normal validation; we are not allowed to bypass this rejection.
+        ok, why = source.apply_block(block5)
+        assert ok, why
+        assert local.validate_block(block5)[0] is False
+        assert "commitment mismatch" in local.validate_block(block5)[1].lower()
+
+        header_chain = [source.get_block(h).to_dict() for h in range(0, 6)]
+        ok, why, verified, committed = verify_bootstrap_header_chain(
+            header_chain, source_st.get_meta("genesis_hash"), 4)
+        assert ok, why
+
+        # Same-height replacement is denied by default. It works only through
+        # the explicit recovery gate, with independently verified H+1 headers.
+        ok, why = local._snapshot_engine.restore_authenticated_bootstrap(
+            snapshot_blob, committed, verified)
+        assert not ok
+        assert "same-height repair" in why.lower()
+
+        ok, why = local._snapshot_engine.restore_authenticated_bootstrap(
+            snapshot_blob, committed, verified,
+            allow_same_height_repair=True)
+        assert ok, why
+        assert local.height() == 4
+        expected_snapshot = json.loads(zlib.decompress(snapshot_blob).decode("utf-8"))
+        assert local_st.get_cumulative_issued_sat() == int(
+            expected_snapshot["cumulative_issued_sat"])
+
+        # H+1 still passes ordinary validation/application after the authenticated
+        # state is repaired; the recovery code does not itself apply block 5.
+        ok, why = local.apply_block(block5)
+        assert ok, why
+        assert local.height() == source.height() == 5
+        assert local.latest_block().block_hash == source.latest_block().block_hash
+        assert local.latest_block().state_root == source.latest_block().state_root
+        assert local_st.get_cumulative_issued_sat() == source_st.get_cumulative_issued_sat()
+
+
+def test_same_height_checkpoint_repair_rejects_a_different_canonical_prefix(bootstrap_cfg):
+    """An authenticated snapshot cannot replace a different chain at the same height."""
+    with tempfile.TemporaryDirectory() as td:
+        source_st, source, _miner = _source(td)
+        headers = [source.get_block(h).to_dict() for h in range(0, 6)]
+        blob = source._snapshot_engine.get_snapshot_blob(4)
+        ok, why, verified, committed = verify_bootstrap_header_chain(
+            headers, source_st.get_meta("genesis_hash"), 4)
+        assert ok, why
+
+        other_st = Storage(os.path.join(td, "other.db"))
+        other = Blockchain(other_st)
+        other_miner = Wallet.generate()
+        _mine_to(other, other_miner, 4)
+        before_hash = other.latest_block().block_hash
+        assert before_hash != source.get_block(4).block_hash
+
+        ok, why = other._snapshot_engine.restore_authenticated_bootstrap(
+            blob, committed, verified, allow_same_height_repair=True)
+        assert not ok
+        assert "not a fast-forward" in why.lower()
+        assert other.height() == 4
+        assert other.latest_block().block_hash == before_hash
