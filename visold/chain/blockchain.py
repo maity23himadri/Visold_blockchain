@@ -5722,6 +5722,30 @@ class Blockchain:
             incoming_tip  = blocks[-1].index
             current_tip   = self.height()
 
+            # A peer may legitimately send the recent overlap used to check a
+            # pruned node's chain tip. If every supplied height is already
+            # canonical and every retained block hash matches, this is an
+            # idempotent success even when the range ends at (or below) our
+            # tip. Header-only/pruned duplicates can be hash-compared without
+            # re-executing their missing transaction bodies. A different hash
+            # is NOT accepted here and continues into fork-choice below.
+            if all(int(getattr(b, "index", -1)) <= current_tip for b in blocks):
+                contiguous = all(
+                    int(blocks[i].index) == int(blocks[i - 1].index) + 1
+                    for i in range(1, len(blocks))
+                )
+                if not contiguous or int(blocks[0].index) < 0:
+                    return False, "Non-contiguous or invalid historical overlap"
+                exact_overlap = True
+                for candidate in blocks:
+                    stored = self.storage.get_block(int(candidate.index))
+                    if (stored is None
+                            or str(stored.block_hash) != str(candidate.block_hash)):
+                        exact_overlap = False
+                        break
+                if exact_overlap:
+                    return True, "Already have all these blocks"
+
             # ── Case 1: Pure extension (no overlap) ───────────────────────────
             # Incoming chain starts exactly one above our tip — just append.
             # Also handles fresh-node bootstrap: height() == -1 and peer sends

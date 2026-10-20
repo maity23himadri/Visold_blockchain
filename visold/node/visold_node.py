@@ -92,8 +92,18 @@ class VisoldNode:
       6. RPCServer (needs node reference for all of the above)
     """
 
-    def __init__(self, port: int = Config.DEFAULT_PORT):
+    def __init__(self, port: Optional[int] = None):
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_started = False
+        self._shutdown_complete = False
+        self._startup_timers: list = []
+        # Load config before selecting the default listen port. A default argument
+        # bound to Config.DEFAULT_PORT at import time would ignore config.json.
         Config.ensure_dirs()
+        if port is None:
+            port = int(Config.DEFAULT_PORT)
+        else:
+            port = int(port)
 
         ok, msg = SecurityGate.verify_startup()
         if not ok:
@@ -192,9 +202,12 @@ class VisoldNode:
         self.identity = IdentitySystem(
             self.storage, self.network, self.wallet,
             blockchain=self.blockchain, state_engine=self.state_engine)
-        self.port     = port
+        # P2PNetwork may choose a nearby free port in Auto mode. The node, RPC,
+        # status file, identity advertisement, and UI must all use the actual
+        # listener port, not the originally requested base port.
+        self.port     = int(self.network.port)
 
-        rpc_port  = port + Config.RPC_PORT_OFFSET
+        rpc_port  = self.port + Config.RPC_PORT_OFFSET
         self.rpc  = RPCServer(self, rpc_port)
 
         # ── Fix #12: Safety Invariant Checker ────────────────────────────────
@@ -615,9 +628,13 @@ class VisoldNode:
         try:
             self.capability_router.update_own_capabilities(self.storage)
             adv = self.capability_router.build_adv_message()
-            threading.Timer(5.0,
+            _capability_timer = threading.Timer(
+                5.0,
                 lambda: self.network._gossip(adv) if self.network._running else None
-            ).start()
+            )
+            _capability_timer.daemon = True
+            self._startup_timers.append(_capability_timer)
+            _capability_timer.start()
             log.info(f"Capability discovery: advertising "
                      f"{self.capability_router.own_capabilities()}")
         except Exception as e:
@@ -636,11 +653,14 @@ class VisoldNode:
         # make the construction deterministic, so block_hash is guaranteed
         # to match what that peer would have computed locally.
         try:
-            threading.Timer(
+            _genesis_timer = threading.Timer(
                 5.0,
                 lambda: self.network.broadcast_genesis()
                 if self.network._running else None
-            ).start()
+            )
+            _genesis_timer.daemon = True
+            self._startup_timers.append(_genesis_timer)
+            _genesis_timer.start()
         except Exception as e:
             log.debug(f"Genesis broadcast schedule error (non-fatal): {e}")
 
@@ -741,25 +761,76 @@ class VisoldNode:
                  f"| mev_protect={'ON' if protection_default(self.storage) else 'OFF'}")
 
     def stop(self):
-        self.mining.stop()
-        self.network.stop()
-        self.rpc.stop()
-        self.sentinel.stop()
-        # ── SHBS: Stop monitoring ────────────────────────────────────────────
-        try:
-            if getattr(self, 'shbs', None) is not None:
-                self.shbs.stop()
-        except Exception as _shbs_stop_err:
-            log.error(f"[SHBS] Stop error (non-fatal): {_shbs_stop_err}")
-        self.circuit_breaker.stop()
-        # Stop StateEngine last — drain any remaining queued events first
-        self.state_engine.stop()
-        # Close KV block database cleanly
-        try:
-            self.storage._block_db.close()
-        except Exception:
-            pass
-        log.info("Node stopped")
+        """Idempotent, best-effort shutdown of every node-owned resource.
+
+        A failure in one optional subsystem must not short-circuit cleanup of
+        listeners, worker processes, state engine, or persistent databases.
+        This is also safe to call from the CLI's finalizer after menu option 0.
+        """
+        with self._shutdown_lock:
+            if self._shutdown_complete or self._shutdown_started:
+                return
+            self._shutdown_started = True
+            failures = []
+
+            def _stop_component(label, fn):
+                if not callable(fn):
+                    return
+                try:
+                    fn()
+                except BaseException as exc:
+                    failures.append((label, exc))
+                    try:
+                        log.error("Shutdown component %s failed: %s", label, exc)
+                    except Exception:
+                        pass
+
+            # Cancel delayed startup broadcasts before shutting down their target
+            # network. Non-daemon Timer threads used to keep Termux sessions alive
+            # for up to five seconds after menu option 0.
+            for timer in list(getattr(self, "_startup_timers", [])):
+                try:
+                    timer.cancel()
+                    if timer is not threading.current_thread() and timer.is_alive():
+                        timer.join(timeout=0.5)
+                except Exception as exc:
+                    failures.append(("startup timer", exc))
+            getattr(self, "_startup_timers", []).clear()
+
+            # Stop producers first so no new work should be added while the
+            # network and state-processing components are being closed.
+            mining = getattr(self, "mining", None)
+            _stop_component("mining", getattr(mining, "stop", None))
+            sequencer = getattr(self, "sequencer", None)
+            _stop_component("sequencer", getattr(sequencer, "stop", None))
+            _stop_component("P2P network", getattr(getattr(self, "network", None), "stop", None))
+            _stop_component("JSON-RPC", getattr(getattr(self, "rpc", None), "stop", None))
+            _stop_component("sentinel", getattr(getattr(self, "sentinel", None), "stop", None))
+            _stop_component("self-healing system", getattr(getattr(self, "shbs", None), "stop", None))
+            _stop_component("circuit breaker", getattr(getattr(self, "circuit_breaker", None), "stop", None))
+
+            # StateEngine is stopped after network producers are closed; it can
+            # process/finish work already queued before the STOP event.
+            _stop_component("state engine", getattr(getattr(self, "state_engine", None), "stop", None))
+
+            # Reap lazy signature-verification worker processes explicitly; they
+            # otherwise can make a mobile Python session remain busy at exit.
+            try:
+                from visold.crypto.parallel_verify import shutdown_signature_pool
+                _stop_component("signature worker pool", shutdown_signature_pool)
+            except Exception as exc:
+                failures.append(("signature worker pool", exc))
+
+            storage = getattr(self, "storage", None)
+            block_db = getattr(storage, "_block_db", None) if storage is not None else None
+            _stop_component("block database", getattr(block_db, "close", None))
+            _stop_component("storage backends", getattr(storage, "close", None))
+
+            self._shutdown_complete = True
+            if failures:
+                log.warning("Node shutdown completed with %d cleanup warning(s)", len(failures))
+            else:
+                log.info("Node stopped cleanly")
 
 
     def send_transaction(self, to_user_or_addr: str, amount: float,

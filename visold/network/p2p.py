@@ -157,8 +157,17 @@ class P2PNetwork:
     # Per-IP inbound connection rate limit:
     # no more than _CONN_RATE_LIMIT new connections from one IP within
     # _CONN_RATE_WINDOW seconds.  Legitimate peers reconnect rarely.
-    _CONN_RATE_LIMIT  = 5
+    # Several legitimate nodes can sit behind one mobile carrier/NAT address.
+    # Five attempts per minute was too low for a small multi-node mesh: retries
+    # and simultaneous TCP/UDP handshakes could consume the whole budget before
+    # all nodes joined.  Keep the window bounded, but leave room for a 6-node mesh.
+    _CONN_RATE_LIMIT  = 12
     _CONN_RATE_WINDOW = 60   # seconds
+
+    # Peer exchange is paginated and automatic dialing is deliberately bounded.
+    _PEX_PAGE_SIZE = 100
+    _PEX_DIAL_BATCH = 4
+    _PEX_DIRECTORY_MAX = 5000
 
     # ── v7.1.0: Per-peer message-rate limits (DoS protection) ────────────────
     # The existing byte-rate cap (MAX_PEER_BANDWIDTH) catches bulk floods, and
@@ -234,7 +243,32 @@ class P2PNetwork:
         self._receipt_ack_sent = LRUCache(8192, ttl=3600)
         self._receipt_repair_slot = 0
         self.peers: Dict[str, PeerConnection] = {}
-        self._lock       = threading.Lock()
+        self._lock       = threading.RLock()
+        # Gossip-learned node directory. This is reachability metadata, not
+        # consensus state. Direct authenticated handshakes mark records verified.
+        self._node_directory: Dict[str, dict] = {}
+        self._node_directory_lock = threading.RLock()
+        self._node_directory_max = self._PEX_DIRECTORY_MAX
+        self._node_directory_ttl_secs = 30 * 24 * 60 * 60
+        self._node_directory_claim_cache = {}
+        self._node_directory_storage_refresh_at = 0.0
+        self._pex_dial_lock = threading.Lock()
+        self._pex_dial_times = deque()
+        self._pex_seed_dials_per_minute = 12
+        # Serialize automatic chain checks across peer connections. A single
+        # sync coordinator avoids every incoming peer starting a large history scan.
+        self._auto_sync_gate = threading.Lock()
+        # Bound concurrent expensive chain-serving scans across all peers. Busy
+        # requests receive an explicit retryable response; they are never treated
+        # as an invalid chain or a peer fault.
+        self._chain_serve_semaphore = threading.BoundedSemaphore(4)
+        self._sync_heartbeat_cursor = 0
+        self._sync_heartbeat_round = 0
+        # Authenticated handshakes reserve admission capacity before ACCEPT is
+        # sent.  This prevents a dialer from believing a connection succeeded
+        # when the listener later rejects it for capacity/subnet policy.
+        # Access is protected by _lock; token -> {peer_id, ip, local_outbound}.
+        self._peer_admission_reservations: Dict[str, dict] = {}
         # At most one authenticated checkpoint repair may mutate canonical
         # state at a time. Several peers can reject the same bad local snapshot
         # concurrently, so serialize this recovery path network-wide.
@@ -246,6 +280,9 @@ class P2PNetwork:
         self._seen_msgs  = LRUCache(4096, ttl=3600)  # BUG-FIX (v7.0.1.0): 1-hour TTL
         self._id_cache   = LRUCache(Config.LRU_CACHE_SIZE)
         self._server     = None
+        self._server_thread: Optional[threading.Thread] = None
+        self._shutdown_lock = threading.Lock()
+        self._stopped = False
         self._running    = False
         self._callbacks  = defaultdict(list)
         self.hashrate    = 0.0
@@ -350,8 +387,12 @@ class P2PNetwork:
         self._sequencer = sequencer
 
     def start(self):
+        if self._stopped:
+            raise RuntimeError("P2P network has been stopped and cannot be restarted")
         self._running = True
-        threading.Thread(target=self._server_loop, daemon=True).start()
+        self._server_thread = threading.Thread(
+            target=self._server_loop, daemon=True, name="p2p-listener")
+        self._server_thread.start()
         threading.Thread(target=self._pex_loop, daemon=True).start()
         threading.Thread(target=self._reconnect_loop, daemon=True).start()
         threading.Thread(target=self._peer_decay_loop, daemon=True).start()
@@ -488,6 +529,7 @@ class P2PNetwork:
         sess = None
         peer = None
         final_peer = None
+        admission_token: Optional[str] = None
 
         try:
             sess  = self._udp.get_session(addr)
@@ -506,7 +548,14 @@ class P2PNetwork:
 
             peer_id          = msg.get("node_id", "")
             pub_hex          = msg.get("pub_hex", "")
-            user_id          = msg.get("user_id", "")
+            user_id          = str(msg.get("user_id", "") or "")
+            peer_wallet_addr = str(msg.get("wallet_addr", "") or "")
+            peer_is_seed_node = (msg.get("seed_node") is True)
+            try:
+                peer_chain_height = int(msg.get("chain_height", -1))
+            except (TypeError, ValueError):
+                peer_chain_height = -1
+            peer_chain_tip_hash = str(msg.get("chain_tip_hash", "") or "")
             peer_logic_hash  = msg.get("logic_hash", "")
             peer_hello_caps  = msg.get("capabilities", [])
             peer_listen_port = int(msg.get("listen_port", Config.DEFAULT_PORT))
@@ -527,7 +576,9 @@ class P2PNetwork:
             # ── ECDSA challenge ───────────────────────────────────────────
             challenge = secrets.token_hex(16)
             peer.send({"type": MSG_VERIFY, "challenge": challenge,
-                       "tls_fp": TLSManager.fingerprint()})
+                       "tls_fp": TLSManager.fingerprint(),
+                       # The dialer can reserve its own peer slot before proof.
+                       "node_id": self.node_id})
 
             resp = peer.recv_line(timeout=8)
             if not resp:
@@ -552,20 +603,49 @@ class P2PNetwork:
             else:
                 _inbound_trust = UDPPeerConnection.TRUST_HIGH
 
-            # ── Send ACCEPT ───────────────────────────────────────────────
-            peer.send({"type": MSG_ACCEPT, "node_id": self.node_id,
+            # Reserve a real peer/subnet slot before ACCEPT. Sending ACCEPT first
+            # allowed the dialer to display CONNECTED while we rejected it later.
+            admission_token = self._reserve_peer_admission(
+                peer_id, ip, local_outbound=False)
+            if admission_token is None:
+                peer.send({"type": MSG_REJECT,
+                           "reason": "Peer admission rejected (capacity/subnet/duplicate)"})
+                peer.close()
+                return
+
+            _accept_message = {"type": MSG_ACCEPT, "node_id": self.node_id,
                        "pub_hex": self.wallet.pub_hex,
+                       "user_id": str(self.storage.get_meta("user_id") or ""),
+                       "wallet_addr": str(getattr(self.wallet, "address", "") or ""),
+                       "seed_node": self._is_seed_node_mode(),
                        "version": Config.VERSION,
                        "tls_fp": TLSManager.fingerprint(),
                        "logic_hash": _NODE_LOGIC_HASH,
                        "capabilities": Config.NODE_CAPABILITIES,
                        "chain_height": self.blockchain.height(),
-                       "udp_port": self.port})
+                       "chain_tip_hash": self._local_chain_tip_hash(),
+                       "udp_port": self.port}
+            if not self._send_accept_if_admitted(
+                    admission_token, peer_id, peer, _accept_message):
+                # Fail closed, but tell the dialer immediately when the transport
+                # is still writable instead of making it wait for a handshake timeout.
+                try:
+                    peer.send({"type": MSG_REJECT,
+                               "reason": "Peer admission race; retry later"})
+                except Exception:
+                    pass
+                peer.close()
+                return
 
             # ── Rebuild UDPPeerConnection with proper peer_id + trust ─────
             final_peer = UDPPeerConnection(
-                peer_id, ip, peer_udp_port, sess,
+                peer_id, ip, peer_listen_port, sess,
                 reputation=1.0, trust_level=_inbound_trust)
+            final_peer.user_id = user_id
+            final_peer.wallet_addr = peer_wallet_addr
+            final_peer.is_seed_node = peer_is_seed_node
+            final_peer.chain_height = peer_chain_height
+            final_peer.chain_tip_hash = peer_chain_tip_hash
             # Register capabilities
             if peer_hello_caps and hasattr(self, "_capability_router"):
                 try:
@@ -578,7 +658,8 @@ class P2PNetwork:
                 self._udp_peers[addr] = final_peer
 
             self._register_peer(final_peer, peer_id, pub_hex, user_id,  # type: ignore[arg-type]
-                                initiator=True)
+                                initiator=True, admission_token=admission_token,
+                                local_outbound=False, wallet_addr=peer_wallet_addr)
             if not final_peer.connected:
                 # _register_peer() can reject/close the peer (peer cap,
                 # anti-eclipse, self-connect, etc.).  The handshake did not
@@ -596,6 +677,7 @@ class P2PNetwork:
         except Exception as e:
             log.debug(f"[UDP] Inbound handler error {ip}:{port}: {e}")
         finally:
+            self._release_peer_admission(admission_token)
             if not handshake_registered:
                 # Do not leave a failed final peer in the address-indexed UDP
                 # registry: _udp_connect_to() uses this map as its fast
@@ -633,6 +715,8 @@ class P2PNetwork:
         peer = UDPPeerConnection("outbound", ip, port, sess)
         final_peer = None
         handshake_registered = False
+        admission_token: Optional[str] = None
+        remote_id_from_verify = ""
 
         try:
             # ── VSA-08: open the handshake before waiting for it ───────────
@@ -655,7 +739,11 @@ class P2PNetwork:
                 "type":         MSG_HELLO,
                 "node_id":      self.node_id,
                 "pub_hex":      self.wallet.pub_hex,
-                "user_id":      getattr(self.wallet, "user_id", ""),
+                "user_id":      str(self.storage.get_meta("user_id") or getattr(self.wallet, "user_id", "") or ""),
+                "wallet_addr":  str(getattr(self.wallet, "address", "") or ""),
+                "seed_node":    self._is_seed_node_mode(),
+                "chain_height": self.blockchain.height(),
+                "chain_tip_hash": self._local_chain_tip_hash(),
                 "version":      Config.VERSION,
                 "listen_port":  self.port,
                 "udp_port":     self.port,
@@ -676,6 +764,15 @@ class P2PNetwork:
                 peer.close(); return False
 
             challenge = verify_msg.get("challenge", "")
+            remote_id_from_verify = str(verify_msg.get("node_id", "") or "")
+            # Current peers announce their ID in VERIFY, enabling a preflight
+            # reservation before we prove identity and before they send ACCEPT.
+            if remote_id_from_verify:
+                admission_token = self._reserve_peer_admission(
+                    remote_id_from_verify, ip, local_outbound=True)
+                if admission_token is None:
+                    peer.close()
+                    return False
             h   = hashlib.sha256(challenge.encode()).digest()
             sig = ecdsa_sign(self.wallet.priv, h)
             peer.send({"type": "CHALLENGE_RESP",
@@ -688,12 +785,30 @@ class P2PNetwork:
 
             remote_peer_id    = accept_msg.get("node_id", "")
             remote_pub_hex    = accept_msg.get("pub_hex", "")
-            remote_user_id    = accept_msg.get("user_id", "")
+            remote_user_id     = str(accept_msg.get("user_id", "") or "")
+            remote_wallet_addr = str(accept_msg.get("wallet_addr", "") or "")
+            remote_is_seed_node = (accept_msg.get("seed_node") is True)
+            try:
+                accept_chain_height = int(accept_msg.get("chain_height", -1))
+            except (TypeError, ValueError):
+                accept_chain_height = -1
+            accept_chain_tip_hash = str(accept_msg.get("chain_tip_hash", "") or "")
             remote_logic_hash = accept_msg.get("logic_hash", "")
             remote_caps       = accept_msg.get("capabilities", [])
 
             if not remote_peer_id or not remote_pub_hex:
                 peer.close(); return False
+            if remote_id_from_verify and remote_peer_id != remote_id_from_verify:
+                log.warning("[UDP] peer identity changed between VERIFY and ACCEPT; rejecting")
+                peer.close(); return False
+            if admission_token is None:
+                admission_token = self._reserve_peer_admission(
+                    remote_peer_id, ip, local_outbound=True)
+                if admission_token is None:
+                    peer.close(); return False
+            if not self._mark_peer_admission_accepted(admission_token, remote_peer_id):
+                peer.close()
+                return False
 
             # ── Trust classification ──────────────────────────────────────
             if (remote_logic_hash
@@ -707,6 +822,11 @@ class P2PNetwork:
             final_peer = UDPPeerConnection(
                 remote_peer_id, ip, port, sess,
                 reputation=1.0, trust_level=_trust)
+            final_peer.user_id = remote_user_id
+            final_peer.wallet_addr = remote_wallet_addr
+            final_peer.is_seed_node = remote_is_seed_node
+            final_peer.chain_height = accept_chain_height
+            final_peer.chain_tip_hash = accept_chain_tip_hash
 
             if remote_caps and hasattr(self, "_capability_router"):
                 try:
@@ -719,7 +839,8 @@ class P2PNetwork:
 
             self._register_peer(final_peer, remote_peer_id,  # type: ignore[arg-type]
                                 remote_pub_hex, remote_user_id,
-                                initiator=True)
+                                initiator=True, admission_token=admission_token,
+                                local_outbound=True, wallet_addr=remote_wallet_addr)
             if not final_peer.connected:
                 # _register_peer() rejected/closed the connection.  Do not
                 # leave its dead UDPSession as the canonical session for this
@@ -739,6 +860,7 @@ class P2PNetwork:
             log.debug(f"[UDP] connect_to {ip}:{port} error: {e}")
             return False
         finally:
+            self._release_peer_admission(admission_token)
             if not handshake_registered:
                 # A rejected _register_peer() can happen after final_peer has
                 # already been inserted into _udp_peers.  Remove only that
@@ -984,26 +1106,69 @@ class P2PNetwork:
             self._msg_rate.pop(peer_id, None)
 
     def stop(self):
-        self._running = False
-        self._upnp.stop()
-        self._dns_seeder.stop()
-        self._ice.stop()
-        # ── UDP transport teardown ─────────────────────────────────────────
-        try:
-            self._udp.stop()
-        except Exception:
-            pass
-        with self._udp_peers_lock:
-            for p in list(self._udp_peers.values()):
-                try: p.close()
-                except Exception: pass
-            self._udp_peers.clear()
-        with self._lock:
-            for p in list(self.peers.values()):
-                p.close()
-            self.peers.clear()
+        """Stop P2P services and release listener/peer sockets deterministically."""
+        with self._shutdown_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            self._running = False
 
-    _LISTEN_PORT_SEARCH = 8
+            # Closing the listening socket wakes accept() immediately on most
+            # platforms; the accept timeout remains a portable fallback.
+            listen_sock = getattr(self, "_listen_sock", None)
+            if listen_sock is not None:
+                try:
+                    listen_sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    listen_sock.close()
+                except Exception:
+                    pass
+
+            # Keep shutdown best-effort: one optional subsystem must never
+            # prevent the remaining transports from releasing their resources.
+            for label, service in (("UPnP", getattr(self, "_upnp", None)),
+                                   ("DNS seeder", getattr(self, "_dns_seeder", None)),
+                                   ("ICE", getattr(self, "_ice", None)),
+                                   ("UDP transport", getattr(self, "_udp", None))):
+                try:
+                    if service is not None:
+                        service.stop()
+                except Exception as exc:
+                    log.warning("P2P shutdown: %s stop failed: %s", label, exc)
+
+            with getattr(self, "_udp_peers_lock", threading.Lock()):
+                udp_peers = list(getattr(self, "_udp_peers", {}).values())
+                getattr(self, "_udp_peers", {}).clear()
+            for peer in udp_peers:
+                try:
+                    peer.close()
+                except Exception:
+                    pass
+
+            lock = getattr(self, "_lock", None)
+            if lock is not None:
+                with lock:
+                    peers = list(getattr(self, "peers", {}).values())
+                    self.peers.clear()
+            else:
+                peers = list(getattr(self, "peers", {}).values())
+                self.peers.clear()
+            for peer in peers:
+                try:
+                    peer.close()
+                except Exception:
+                    pass
+
+            server_thread = getattr(self, "_server_thread", None)
+            if (server_thread is not None and server_thread is not threading.current_thread()
+                    and server_thread.is_alive()):
+                server_thread.join(timeout=2.0)
+            log.info("P2P network stopped; listeners and peer sockets released")
+
+    # Support several Visold instances on one device (each needs a P2P/RPC pair).
+    _LISTEN_PORT_SEARCH = 32
     # VSA-08: how long an outbound UDP handshake waits for POW_CHALLENGE after the
     # heartbeat that starts the responder's handshake.
     _UDP_CHALLENGE_WAIT_SECS = 3.0
@@ -1015,65 +1180,135 @@ class P2PNetwork:
             return wait
         return max(0.1, min(float(wait), deadline - time.monotonic()))
 
-    def _open_listen_sockets(self, base_port: int):
-        """Bind the TCP listener and the UDP transport to one port (VSA-13, VSA-14).
+    @staticmethod
+    def _rpc_port_is_available(port: int) -> bool:
+        """Check the exact local-only IPv4 bind used by RPCServer.
 
-        Candidates are ``base_port`` and the next few ports, excluding the RPC port.
-        A candidate is taken only when both the TCP socket and the UDP socket bind to
-        it, so the port advertised in the handshake, the UPnP mapping and the ICE
-        candidates is one that both transports serve.  Sets ``self.port`` and returns
-        ``(tcp_socket, udp_transport)``.  Raises RuntimeError when no candidate works,
-        so startup fails instead of advertising a port that nothing listens on.
+        P2P listeners bind wildcard dual-stack sockets, but JSON-RPC binds only
+        to 127.0.0.1. Using a wildcard probe here can incorrectly reject an RPC
+        port occupied on an unrelated specific interface. Keep this probe in
+        sync with RPCServer.start() and its allow_reuse_address=True setting.
         """
-        reserved = {base_port + Config.RPC_PORT_OFFSET}
-        candidates = [base_port] + [
-            p for p in range(base_port + 1, base_port + 1 + self._LISTEN_PORT_SEARCH)
-            if p not in reserved]
+        if not 1024 <= int(port) <= 65535:
+            return False
+        probe = None
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(("127.0.0.1", int(port)))
+            return True
+        except (OSError, ValueError, OverflowError):
+            return False
+        finally:
+            if probe is not None:
+                try:
+                    probe.close()
+                except OSError:
+                    pass
+
+    def _open_listen_sockets(self, base_port: int):
+        """Bind TCP+UDP on one port, honoring Auto or Manual mode.
+
+        Auto preserves scan-to-bind behavior. Manual binds exactly ``base_port``
+        and fails clearly instead of silently switching to a different port.
+        A candidate is accepted only when P2P TCP/UDP and the corresponding RPC
+        offset are available, reducing partial startup where P2P works but RPC
+        silently fails to bind.
+        """
+        mode = str(getattr(Config, "PORT_MODE", "auto")).strip().lower()
+        if mode not in ("auto", "manual"):
+            mode = "auto"
+        rpc_offset = int(Config.RPC_PORT_OFFSET)
+        if mode == "manual":
+            candidates = [base_port]
+        else:
+            # Search at most _LISTEN_PORT_SEARCH port numbers including the
+            # requested base. Never reuse the requested plan's RPC offset as a
+            # P2P fallback: another Visold instance may already have its local-
+            # only RPC server bound there, and a wildcard P2P bind can otherwise
+            # overlap that service on Android/Linux.
+            candidates = [
+                candidate for candidate in range(
+                    base_port, min(65536, base_port + max(1, self._LISTEN_PORT_SEARCH)))
+                if candidate != base_port + rpc_offset
+            ]
         last_error: Optional[BaseException] = None
+        skipped: List[str] = []
         for port in candidates:
-            if port > 65535:
-                break
+            if port < 1024 or port > 65535 or port + rpc_offset > 65535:
+                last_error = ValueError(f"port {port} leaves no valid RPC port")
+                continue
             srv = None
             udp = None
             try:
+                rpc_port = port + rpc_offset
+                if not self._rpc_port_is_available(rpc_port):
+                    raise OSError(f"local JSON-RPC port 127.0.0.1:{rpc_port} is unavailable")
                 srv = _create_dual_stack_server_socket(port)
                 srv.bind((wildcard_for_family(srv.family, Config.BIND_ADDRESS), port))
                 udp = UDPTransport(
                     port=port,
                     bind_addr=Config.BIND_ADDRESS if Config.BIND_ADDRESS else '',
-                    max_pending_inbound=Config.MAX_PEERS)
-            except (OSError, ValueError) as exc:
+                    # The seed can hold a larger bounded burst while still
+                    # keeping UDP pending-handshake memory bounded.
+                    max_pending_inbound=(256 if self._is_seed_node_mode()
+                                         else Config.MAX_PEERS))
+            except (OSError, ValueError, OverflowError) as exc:
                 last_error = exc
+                skipped.append(f"{port}: {exc}")
                 if srv is not None:
-                    srv.close()
+                    try:
+                        srv.close()
+                    except OSError:
+                        pass
                 if udp is not None:
-                    udp._sock.close()
+                    try:
+                        udp._sock.close()
+                    except Exception:
+                        pass
+                if mode == "manual":
+                    break
                 continue
             self.port = port
+            if mode == "auto" and port != base_port:
+                why = "; ".join(skipped[:4])
+                suffix = f"; skipped candidates: {why}" if why else ""
+                log.warning(
+                    "P2P Auto mode requested port %s but selected %s (RPC %s)%s",
+                    base_port, port, port + rpc_offset, suffix)
+            else:
+                log.info("P2P port plan selected: P2P TCP/UDP %s, local RPC %s",
+                         port, port + rpc_offset)
             return srv, udp
+        mode_msg = "Manual mode was configured" if mode == "manual" else "Auto scan was exhausted"
+        details = "; ".join(skipped[:8])
         raise RuntimeError(
-            f"P2P startup: no free TCP+UDP port from {base_port} "
-            f"(RPC port {base_port + Config.RPC_PORT_OFFSET} reserved); "
-            f"last error: {last_error}")
+            f"P2P startup: {mode_msg}; no usable TCP+UDP/RPC port plan from {base_port} "
+            f"(manual mode requires exactly {base_port}; RPC offset +{rpc_offset}); "
+            f"last error: {last_error}; candidate failures: {details or 'none recorded'}")
 
     def _bind_listener(self, srv, base_port: int) -> bool:
-        """Bind the listener to the first free candidate port (VSA-14).
-
-        Candidates are ``base_port`` and the next few ports, excluding the RPC port
-        (``base_port + RPC_PORT_OFFSET``) so the fallback never collides with the RPC
-        server.  The wildcard is chosen for the socket's own address family (VSA-12).
-        Returns False, without raising, when no candidate can be bound.
-        """
-        reserved = {base_port + Config.RPC_PORT_OFFSET}
-        candidates = [base_port] + [
-            p for p in range(base_port + 1, base_port + 1 + self._LISTEN_PORT_SEARCH)
-            if p not in reserved]
+        """Compatibility helper honoring Manual mode and checking the RPC offset."""
+        mode = str(getattr(Config, "PORT_MODE", "auto")).strip().lower()
+        if mode not in ("auto", "manual"):
+            mode = "auto"
+        candidates = ([base_port] if mode == "manual" else [
+            candidate for candidate in range(
+                base_port, min(65536, base_port + max(1, self._LISTEN_PORT_SEARCH)))
+            if candidate != base_port + int(Config.RPC_PORT_OFFSET)
+        ])
         for port in candidates:
-            if port > 65535:
-                break
+            if port < 1024 or port > 65535 or port + Config.RPC_PORT_OFFSET > 65535:
+                continue
+            if not self._rpc_port_is_available(port + Config.RPC_PORT_OFFSET):
+                if mode == "manual":
+                    return False
+                continue
             try:
                 srv.bind((wildcard_for_family(srv.family, Config.BIND_ADDRESS), port))
-            except (OSError, ValueError):
+            except (OSError, ValueError, OverflowError):
+                if mode == "manual":
+                    return False
                 continue
             self.port = port
             return True
@@ -1207,6 +1442,7 @@ class P2PNetwork:
         # addr[1] is the port number regardless of address family
         tmp = PeerConnection("unknown", client_ip, addr[1], sock)
         _pa_push("IN", client_ip, addr[1], "ARRIVING")
+        admission_token: Optional[str] = None
         try:
             # CRIT-01 FIX: Server generates and sends the PoW challenge BEFORE
             # reading the client's HELLO.  The client must solve it and embed
@@ -1224,7 +1460,14 @@ class P2PNetwork:
                 tmp.close(); return
             peer_id  = msg.get("node_id", "")
             pub_hex  = msg.get("pub_hex", "")
-            user_id  = msg.get("user_id", "")
+            user_id  = str(msg.get("user_id", "") or "")
+            peer_wallet_addr = str(msg.get("wallet_addr", "") or "")
+            peer_is_seed_node = (msg.get("seed_node") is True)
+            try:
+                peer_chain_height = int(msg.get("chain_height", -1))
+            except (TypeError, ValueError):
+                peer_chain_height = -1
+            peer_chain_tip_hash = str(msg.get("chain_tip_hash", "") or "")
             peer_tls_fp = msg.get("tls_fp", "")   # advertised TLS fingerprint
             # NEW: software identity hash for trust classification
             peer_logic_hash = msg.get("logic_hash", "")
@@ -1258,7 +1501,9 @@ class P2PNetwork:
 
             challenge = secrets.token_hex(16)
             tmp.send({"type": MSG_VERIFY, "challenge": challenge,
-                      "tls_fp": TLSManager.fingerprint()})
+                      "tls_fp": TLSManager.fingerprint(),
+                      # Allows the dialer to reserve admission before responding.
+                      "node_id": self.node_id})
 
             resp = tmp.recv_line(timeout=8)
             if not resp:
@@ -1311,18 +1556,40 @@ class P2PNetwork:
                     tmp.close()
                     return
 
-            tmp.send({"type": MSG_ACCEPT, "node_id": self.node_id,
-                      "pub_hex": self.wallet.pub_hex, "version": Config.VERSION,
+            # Reserve before ACCEPT; otherwise the dialer can register a ghost
+            # peer if local capacity/subnet admission later rejects registration.
+            admission_token = self._reserve_peer_admission(
+                peer_id, client_ip, local_outbound=False)
+            if admission_token is None:
+                _pa_push("IN", client_ip, peer_listen_port, "REJECTED:Admission")
+                tmp.send({"type": MSG_REJECT,
+                          "reason": "Peer admission rejected (capacity/subnet/duplicate)"})
+                tmp.close()
+                return
+
+            _accept_message = {"type": MSG_ACCEPT, "node_id": self.node_id,
+                      "pub_hex": self.wallet.pub_hex,
+                      "user_id": str(self.storage.get_meta("user_id") or ""),
+                      "wallet_addr": str(getattr(self.wallet, "address", "") or ""),
+                      "seed_node": self._is_seed_node_mode(),
+                      "version": Config.VERSION,
                       "tls_fp": TLSManager.fingerprint(),
                       "ice_candidates": ice_cands_out,
                       "logic_hash": _NODE_LOGIC_HASH,
-                      # v6.9.9.7: include capabilities and our chain height so
-                      # the connecting node knows our role immediately and can
-                      # decide whether to sync from us without extra round-trips.
                       "capabilities": Config.NODE_CAPABILITIES,
                       "chain_height": self.blockchain.height(),
-                      # v7.5-UDP: advertise our UDP port in ACCEPT
-                      "udp_port":     self.port})
+                      "chain_tip_hash": self._local_chain_tip_hash(),
+                      "udp_port": self.port}
+            if not self._send_accept_if_admitted(
+                    admission_token, peer_id, tmp, _accept_message):
+                _pa_push("IN", client_ip, peer_listen_port, "REJECTED:AdmissionRace")
+                try:
+                    tmp.send({"type": MSG_REJECT,
+                              "reason": "Peer admission race; retry later"})
+                except Exception:
+                    pass
+                tmp.close()
+                return
 
             # v6.9.9.7: register inbound peer's capabilities immediately from HELLO
             # (was delayed until first MSG_CAPABILITY_ADV, up to 120 s later).
@@ -1352,6 +1619,11 @@ class P2PNetwork:
 
             peer = PeerConnection(peer_id, client_ip, peer_listen_port, sock,
                                   reputation=1.0, trust_level=_inbound_trust)
+            peer.user_id = user_id
+            peer.wallet_addr = peer_wallet_addr
+            peer.is_seed_node = peer_is_seed_node
+            peer.chain_height = peer_chain_height
+            peer.chain_tip_hash = peer_chain_tip_hash
             # BUG-FIX (v7.0.0.1): Transfer any bytes already buffered by
             # recv_line() during the handshake into the new peer object.
             # recv_line() accumulates raw TCP bytes in tmp._recv_buf.  TCP is a
@@ -1371,9 +1643,10 @@ class P2PNetwork:
             # because MSG_GET_CHAIN is in _GOSSIP_DEDUP_SKIP and whichever
             # side is shorter simply receives an empty MSG_CHAIN reply.
             self._register_peer(peer, peer_id, pub_hex, user_id,
-                                initiator=True)    # v7.0.1.2 — both sides sync
-            # BUG-FIX (v7.0.0.6): _register_peer() can reject the peer silently
-            # (anti-eclipse subnet limit or MAX_PEERS cap) by calling peer.close()
+                                initiator=True, admission_token=admission_token,
+                                local_outbound=False, wallet_addr=peer_wallet_addr)
+            # The pre-ACCEPT reservation should make registration succeed; keep
+            # this guard as a final defense against duplicate/cap races by closing
             # and returning without raising an exception.  The old code pushed
             # "CONNECTED" and called _peer_message_loop unconditionally, resulting
             # in a false dashboard event and a _peer_message_loop call on a closed
@@ -1386,6 +1659,8 @@ class P2PNetwork:
         except Exception as e:
             log.debug(f"Inbound handler error {_format_peer_addr(client_ip, addr[1])}: {e}")
             tmp.close()
+        finally:
+            self._release_peer_admission(admission_token)
 
     def connect_to(self, ip: str, port: int) -> bool:
         """
@@ -1399,6 +1674,8 @@ class P2PNetwork:
         On success, completes the existing TLS + HELLO handshake so that the
         rest of the networking code is completely unchanged.
         """
+        admission_token: Optional[str] = None
+        peer_id_from_verify = ""
         # ── ICE connection attempt ────────────────────────────────────────────
         raw_sock: Optional[socket.socket] = None
 
@@ -1424,6 +1701,8 @@ class P2PNetwork:
                 return False
 
         # ── From here: identical to original connect_to logic ─────────────────
+        _candidate_peer_cert_fp = ""
+        _endpoint_key = TLSManager.endpoint_pin_key(ip, port)
         try:
             # TLS wrap outbound socket
             tls_ctx = TLSManager.client_context()
@@ -1438,50 +1717,45 @@ class P2PNetwork:
                         pass
                     return False
 
-                # ── TOFU: pin outbound peer cert immediately after TLS handshake ─
-                # BUG-FIX v6.9.8: Changed from reject-on-mismatch to pin-only.
-                #
-                # Old behaviour: verify_peer_fingerprint_by_ip() returned False
-                # whenever the peer's cert fingerprint differed from the stored
-                # one, causing connect_to to return False and log "TOFU fingerprint
-                # check failed."  This broke reconnection after ANY node restart
-                # because self-signed certs are regenerated on startup — a new
-                # fingerprint is normal, not an attack.
-                #
-                # The in-handshake ECDSA CHALLENGE_RESP already proves identity
-                # cryptographically (connecting node must sign our challenge with
-                # the private key matching pub_hex in their HELLO).  IP-keyed TOFU
-                # adds no security benefit over that proof and actively breaks
-                # reconnection on Android/Pydroid3 where restarts are frequent.
-                #
-                # New behaviour: always pin the new fingerprint (TOFU first-use
-                # semantics), log a warning if the fingerprint changed, but never
-                # drop the connection here.  The ECDSA exchange below is the real
-                # identity gate.
+                # Capture the actual TLS certificate, but do not update TOFU state
+                # yet.  First validate the signed application identity and the
+                # persistent peer-id fingerprint below.  IP-only pinning caused
+                # false changes when two nodes shared an IPv6 address on different
+                # ports, and updating before authentication was unsafe.
                 try:
                     peer_cert_der = raw_sock.getpeercert(binary_form=True)
-                    if peer_cert_der:
-                        from cryptography.hazmat.primitives import hashes as _h
-                        from cryptography.x509 import load_der_x509_certificate as _ldx
-                        _cert = _ldx(peer_cert_der)
-                        _fp   = _cert.fingerprint(_h.SHA256()).hex()
-                        with TLSManager._lock:
-                            _stored = TLSManager._ip_fp_store.get(ip)
-                            if _stored is None:
-                                TLSManager._ip_fp_store[ip] = _fp
-                                log.debug(f"[TOFU] Pinned cert for {ip}: {_fp[:16]}...")
-                            elif not hmac.compare_digest(_stored, _fp):
-                                # Cert rotated (normal after restart) — re-pin,
-                                # do NOT reject.  The ECDSA handshake below is
-                                # the authoritative identity check.
-                                TLSManager._ip_fp_store[ip] = _fp
-                                log.warning(
-                                    f"[TOFU] Cert fingerprint changed for {ip} "
-                                    f"(stored={_stored[:16]}... new={_fp[:16]}...) "
-                                    f"— re-pinned. ECDSA will verify identity.")
+                    if not peer_cert_der:
+                        log.warning(
+                            f"[TOFU] No TLS certificate presented by "
+                            f"{_format_peer_addr(ip, port)} — rejecting")
+                        raw_sock.close()
+                        return False
+                    from cryptography.hazmat.primitives import hashes as _h
+                    from cryptography.x509 import load_der_x509_certificate as _ldx
+                    _cert = _ldx(peer_cert_der)
+                    _candidate_peer_cert_fp = _cert.fingerprint(_h.SHA256()).hex()
+
+                    # Operator-configured bootstrap pins are strict.  Exact
+                    # endpoint pins are preferred; legacy IP-only entries remain
+                    # wildcard pins for backward compatibility.
+                    _bootstrap_fp = TLSManager.bootstrap_fingerprint_for_endpoint(
+                        ip, port)
+                    if (_bootstrap_fp and not hmac.compare_digest(
+                            _bootstrap_fp, _candidate_peer_cert_fp)):
+                        log.warning(
+                            f"[TOFU] Bootstrap certificate pin mismatch for "
+                            f"{_format_peer_addr(ip, port)} — rejecting")
+                        raw_sock.close()
+                        return False
                 except Exception as e:
-                    # Non-fatal: cert pinning is best-effort; ECDSA is the gate.
-                    log.debug(f"[TOFU] Cert pin skipped for {ip}: {e}")
+                    log.warning(
+                        f"[TOFU] TLS certificate inspection failed for "
+                        f"{_format_peer_addr(ip, port)}: {e} — rejecting")
+                    try:
+                        raw_sock.close()
+                    except Exception:
+                        pass
+                    return False
 
             tmp = PeerConnection("unknown", ip, port, raw_sock)
             my_user_id = self.storage.get_meta("user_id") or ""
@@ -1528,6 +1802,10 @@ class P2PNetwork:
                 "pub_hex":        self.wallet.pub_hex,
                 "version":        Config.VERSION,
                 "user_id":        my_user_id,
+                "wallet_addr":    str(getattr(self.wallet, "address", "") or ""),
+                "seed_node":      self._is_seed_node_mode(),
+                "chain_height":   self.blockchain.height(),
+                "chain_tip_hash": self._local_chain_tip_hash(),
                 "tls_fp":         TLSManager.fingerprint(),
                 "ice_candidates": ice_cands,    # ignored by old nodes
                 "logic_hash":     _NODE_LOGIC_HASH,
@@ -1562,6 +1840,25 @@ class P2PNetwork:
 
             challenge   = msg.get("challenge", "")
             peer_tls_fp = msg.get("tls_fp", "")
+            peer_id_from_verify = str(msg.get("node_id", "") or "")
+            # Reserve a local slot before sending CHALLENGE_RESP. Current Visold
+            # peers include node_id in VERIFY; legacy peers use fallback below.
+            if peer_id_from_verify:
+                admission_token = self._reserve_peer_admission(
+                    peer_id_from_verify, ip, local_outbound=True)
+                if admission_token is None:
+                    tmp.close(); return False
+            # Bind the HELLO/VERIFY-advertised certificate identity to the actual
+            # certificate presented by this TLS session.  This prevents the app
+            # handshake from pinning a fingerprint unrelated to the socket.
+            if (_candidate_peer_cert_fp and peer_tls_fp
+                    and not hmac.compare_digest(
+                        _candidate_peer_cert_fp, str(peer_tls_fp).lower())):
+                log.warning(
+                    f"TLS certificate/handshake fingerprint mismatch for "
+                    f"{_format_peer_addr(ip, port)} — rejecting")
+                tmp.close()
+                return False
             sig = self.wallet.sign(challenge.encode())
             tmp.send({"type": "CHALLENGE_RESP", "sig": sig_to_hex(sig)})
 
@@ -1581,22 +1878,55 @@ class P2PNetwork:
             peer_id  = msg.get("node_id", sha256(
                 _format_peer_addr(ip, port).encode()))
             pub_hex  = msg.get("pub_hex", "")
+            if peer_id_from_verify and peer_id != peer_id_from_verify:
+                log.warning("[TCP] peer identity changed between VERIFY and ACCEPT; rejecting")
+                tmp.close(); return False
+            if admission_token is None:
+                admission_token = self._reserve_peer_admission(
+                    peer_id, ip, local_outbound=True)
+                if admission_token is None:
+                    tmp.close(); return False
+            if not self._mark_peer_admission_accepted(admission_token, peer_id):
+                tmp.close()
+                return False
             # NEW: read the remote node's software identity from ACCEPT
             accept_logic_hash = msg.get("logic_hash", "")
+            remote_user_id = str(msg.get("user_id", "") or "")
+            remote_wallet_addr = str(msg.get("wallet_addr", "") or "")
+            remote_is_seed_node = (msg.get("seed_node") is True)
             # v6.9.9.7: read capabilities and chain height from ACCEPT
             accept_caps        = msg.get("capabilities", [])
-            accept_chain_height = int(msg.get("chain_height", -1))
+            try:
+                accept_chain_height = int(msg.get("chain_height", -1))
+            except (TypeError, ValueError):
+                accept_chain_height = -1
+            accept_chain_tip_hash = str(msg.get("chain_tip_hash", "") or "")
 
-            # TLS fingerprint pinning for outbound connection
+            # TLS fingerprint pinning for outbound connection.  The advertised
+            # fingerprint must match the TLS certificate from this socket (above),
+            # and a previously pinned fingerprint for this peer_id must not change.
             if peer_tls_fp:
                 stored_fp = self.storage.get_peer_tls_fp(peer_id)
                 if stored_fp and not hmac.compare_digest(stored_fp, peer_tls_fp):
                     log.warning(
                         f"TLS fingerprint mismatch for outbound {peer_id[:12]} — "
-                        f"possible MITM! Rejecting.")
+                        f"possible MITM or unexpected certificate rotation; rejecting.")
                     tmp.close(); return False
                 elif not stored_fp:
                     self.storage.set_peer_tls_fp(peer_id, peer_tls_fp)
+
+            # Only record the endpoint cache after the signed challenge succeeded,
+            # the certificate matched VERIFY, and the durable peer-id pin passed.
+            # This cache is keyed by IP + listening port, so colocated Visold nodes
+            # no longer overwrite one another's certificate observations.
+            if _candidate_peer_cert_fp:
+                _old_endpoint_fp = TLSManager.record_verified_endpoint_fingerprint(
+                    ip, port, _candidate_peer_cert_fp)
+                if _old_endpoint_fp:
+                    log.warning(
+                        f"[TOFU] Certificate changed for endpoint "
+                        f"{_endpoint_key} after peer identity verification; "
+                        f"the peer-id pin passed, so endpoint cache was refreshed.")
 
             # ── Logic Hash Trust Classification (Hybrid Approach) ─────────────
             # Mirror the inbound logic: keep the connection, but flag the peer
@@ -1615,6 +1945,11 @@ class P2PNetwork:
 
             peer = PeerConnection(peer_id, ip, port, raw_sock,
                                   reputation=1.0, trust_level=_outbound_trust)
+            peer.user_id = remote_user_id
+            peer.wallet_addr = remote_wallet_addr
+            peer.is_seed_node = remote_is_seed_node
+            peer.chain_height = accept_chain_height
+            peer.chain_tip_hash = accept_chain_tip_hash
             # BUG-FIX (v7.0.0.1): Same _recv_buf transfer as the inbound path.
             # recv_line() was called multiple times during the outbound handshake
             # (POW_CHALLENGE, VERIFY, ACCEPT).  Any bytes arriving in the same
@@ -1624,12 +1959,12 @@ class P2PNetwork:
             # silently discarded, explaining why sync requests sent immediately
             # after connect are never processed on the receiving node.
             peer._recv_buf = tmp._recv_buf
-            self._register_peer(peer, peer_id, pub_hex, "",
-                                initiator=True)   # outbound — we request sync
+            self._register_peer(peer, peer_id, pub_hex, remote_user_id,
+                                initiator=True, admission_token=admission_token,
+                                local_outbound=True, wallet_addr=remote_wallet_addr)
 
-            # BUG-FIX (v7.0.0.7): Mirror the inbound peer.connected guard that
-            # was added in v7.0.0.6.  _register_peer() can silently close the
-            # peer and return (anti-eclipse subnet limit or MAX_PEERS cap).
+            # Registration is now backed by the pre-ACCEPT reservation. Keep
+            # this guard as a final defense against duplicate/self/cap races.
             # Without this guard the old code unconditionally spawned a
             # _peer_message_loop thread on a closed socket.  The thread exited
             # immediately (peer.connected==False) causing no data corruption, but
@@ -1680,34 +2015,644 @@ class P2PNetwork:
             except Exception:
                 pass
             return False
+        finally:
+            self._release_peer_admission(admission_token)
+
+    def _local_chain_tip_hash(self) -> str:
+        """Return the current block hash for handshake/sync scheduling only.
+
+        This hash is an optimization hint, not a consensus vote. Blocks and
+        incoming chains are still validated by the unchanged consensus path.
+        """
+        try:
+            height = int(self.blockchain.height())
+            if height < 0:
+                return ""
+            block = self.blockchain.get_block(height)
+            if isinstance(block, dict):
+                value = block.get("block_hash", "")
+            else:
+                value = getattr(block, "block_hash", "") if block is not None else ""
+            value = str(value or "").strip().lower()
+            return value if len(value) == 64 and all(c in "0123456789abcdef" for c in value) else ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _is_seed_node_mode() -> bool:
+        """Whether this process is explicitly configured as the public seed.
+
+        A node having seed peers in its own bootstrap list does NOT make it a
+        seed. Operators must set VISOLD_SEED_NODE=1 or config.json seed_node=true
+        on the one designated seed process.
+        """
+        return bool(getattr(Config, "SEED_NODE_MODE", False))
+
+    def minimum_peer_target(self) -> Optional[int]:
+        """Return the finite desired peer target, or ``None`` for an unbounded seed.
+
+        Ordinary nodes keep the configured finite target (3 by default). The
+        explicitly designated seed has no finite minimum target: its discovery
+        loop keeps exploring known and PEX-discovered peers, while admission is
+        independently governed by the seed-only unlimited capacity policy.
+
+        ``None`` must never be compared to an integer directly; callers should
+        use ``_below_minimum_peer_target`` / ``_minimum_peer_target_met``.
+        """
+        if self._is_seed_node_mode():
+            seed_target = getattr(Config, "SEED_MIN_PEERS", None)
+            if seed_target is None:
+                return None
+            try:
+                return max(1, int(seed_target))
+            except (TypeError, ValueError, OverflowError):
+                return None
+        try:
+            return max(1, int(getattr(Config, "MIN_PEERS", 3)))
+        except (TypeError, ValueError, OverflowError):
+            return 3
+
+    def _below_minimum_peer_target(self, peer_count: int) -> bool:
+        """Whether peer discovery should continue for the current count.
+
+        For an unbounded seed this deliberately remains true for every finite
+        peer count; retry cadence, peer deduplication, failure cooldowns and
+        bounded candidate batches keep discovery from becoming a tight loop.
+        """
+        target = self.minimum_peer_target()
+        return target is None or int(peer_count) < target
+
+    def _minimum_peer_target_met(self, peer_count: int) -> bool:
+        """Return whether a finite target has been met (never true for seed)."""
+        target = self.minimum_peer_target()
+        return target is not None and int(peer_count) >= target
+
+    def _peer_capacity_limit(self) -> Optional[int]:
+        """Return the effective active-peer cap; None means seed-only unlimited.
+
+        Config.MAX_PEERS stays finite for ordinary nodes. Unlimited is a role
+        policy used only when this process is explicitly the seed node.
+        """
+        if self._is_seed_node_mode():
+            return None
+        return max(1, int(getattr(Config, "MAX_PEERS", 30)))
+
+    def _peer_capacity_reached(self, peer_count: int) -> bool:
+        limit = self._peer_capacity_limit()
+        return limit is not None and int(peer_count) >= limit
+
+    def _peer_subnet_limit(self) -> Optional[int]:
+        """Return the subnet-diversity limit, or None for a designated seed.
+
+        Ordinary nodes retain a diversity guard. The explicitly designated seed
+        must not reject otherwise valid newcomers just because many mobile users
+        share an IPv4 /24 or IPv6 /48; total-cap and subnet-cap admission dead-ends
+        would defeat the seed's bootstrap purpose. Rate limits and handshake
+        proof-of-work remain in force, and pending work queues remain bounded.
+        """
+        if self._is_seed_node_mode():
+            return None
+        maximum = max(1, int(getattr(Config, "MAX_PEERS", 30)))
+        return min(maximum, max(8, (maximum + 3) // 4))
+
+    def _reserve_peer_admission(self, peer_id: str, ip: str,
+                                local_outbound: bool) -> Optional[str]:
+        """Reserve a peer slot before completing an authenticated handshake.
+
+        Reservations count against both the global peer cap and the subnet
+        diversity cap.  A reservation is held until registration or handshake
+        cleanup, so two different peers cannot race for the final slot.
+
+        Simultaneous duplicate dials use one deterministic preference at both
+        endpoints: the lower node_id's outbound connection is canonical.  An
+        unaccepted non-canonical reservation may be superseded by the canonical
+        direction; an already-accepted reservation is never superseded before
+        registration, because doing so could produce a false CONNECTED result.
+        """
+        if not peer_id or peer_id == self.node_id:
+            log.debug("[PeerAdmission] rejecting empty/self peer id %r", peer_id)
+            return None
+        normalized_ip = _normalize_ip(str(ip or ""))
+        if not normalized_ip:
+            return None
+        subnet = self._peer_subnet(normalized_ip)
+        maximum = self._peer_capacity_limit()
+        subnet_limit = self._peer_subnet_limit()
+        now = time.monotonic()
+
+        with self._lock:
+            reservations = getattr(self, "_peer_admission_reservations", None)
+            if reservations is None:
+                reservations = {}
+                self._peer_admission_reservations = reservations
+
+            # Fail-safe cleanup if an abnormal thread termination skipped finally.
+            # Normal handshakes are much shorter than this 120 s TTL.
+            for old_token, record in list(reservations.items()):
+                if now - float(record.get("created_at", now)) > 120.0:
+                    reservations.pop(old_token, None)
+
+            preferred_outbound = self.node_id < peer_id
+            direction = bool(local_outbound)
+            existing = self.peers.get(peer_id)
+            if existing is not None and getattr(existing, "connected", False):
+                existing_direction = getattr(existing, "local_outbound", None)
+                # A canonical active connection is stable; don't churn it.
+                if existing_direction == preferred_outbound:
+                    log.debug(
+                        "[PeerAdmission] rejecting duplicate for %s; canonical "
+                        "session is already active", peer_id[:12])
+                    return None
+                # A non-canonical live connection may be replaced only by the
+                # canonical direction. This keeps both endpoints convergent.
+                if direction != preferred_outbound:
+                    log.debug(
+                        "[PeerAdmission] rejecting non-canonical duplicate for %s",
+                        peer_id[:12])
+                    return None
+
+            same_peer_reservations = [
+                (tok, rec) for tok, rec in reservations.items()
+                if rec.get("peer_id") == peer_id
+            ]
+            for _other_token, other in same_peer_reservations:
+                other_direction = bool(other.get("local_outbound"))
+                # Only one in-flight reservation per direction. This avoids two
+                # outbound dials to one peer both receiving ACCEPT, after which
+                # the loser would be registered nowhere on the remote node.
+                if other_direction == direction:
+                    log.debug(
+                        "[PeerAdmission] duplicate in-flight %s handshake for %s",
+                        "outbound" if direction else "inbound", peer_id[:12])
+                    return None
+                # Do not interrupt a handshake once ACCEPT was emitted. Its
+                # owner must finish registration/cleanup before another session
+                # for this identity is admitted. A later canonical retry can
+                # replace an already-live non-canonical socket safely.
+                if bool(other.get("accepted")):
+                    log.debug(
+                        "[PeerAdmission] accepted handshake already pending for %s",
+                        peer_id[:12])
+                    return None
+                # A pending canonical reservation wins over a non-canonical one.
+                if other_direction == preferred_outbound and direction != preferred_outbound:
+                    log.debug(
+                        "[PeerAdmission] canonical handshake already pending for %s",
+                        peer_id[:12])
+                    return None
+                # Otherwise the new reservation is canonical and may race the
+                # pending non-canonical one; _send_accept_if_admitted() prevents
+                # that non-canonical path from issuing ACCEPT from now on.
+
+            connected_other_ids = {
+                pid for pid, p in self.peers.items()
+                if pid != peer_id and getattr(p, "connected", False)
+            }
+            reserved_other_ids = {
+                record.get("peer_id") for record in reservations.values()
+                if record.get("peer_id") and record.get("peer_id") != peer_id
+                and record.get("peer_id") not in connected_other_ids
+            }
+            if (maximum is not None
+                    and len(connected_other_ids | reserved_other_ids) >= maximum):
+                log.debug("[PeerAdmission] rejecting %s: MAX_PEERS=%s reached",
+                          peer_id[:12], maximum)
+                return None
+
+            subnet_ids = {
+                pid for pid, p in self.peers.items()
+                if pid != peer_id and getattr(p, "connected", False)
+                and self._peer_subnet(getattr(p, "ip", "")) == subnet
+            }
+            reserved_subnet_ids = {
+                record.get("peer_id") for record in reservations.values()
+                if record.get("peer_id") and record.get("peer_id") != peer_id
+                and record.get("peer_id") not in connected_other_ids
+                and self._peer_subnet(record.get("ip", "")) == subnet
+            }
+            if (subnet_limit is not None
+                    and len(subnet_ids | reserved_subnet_ids) >= subnet_limit):
+                log.debug(
+                    "[PeerAdmission] rejecting %s from subnet %s: %s/%s peers",
+                    peer_id[:12], subnet, len(subnet_ids | reserved_subnet_ids),
+                    subnet_limit)
+                return None
+
+            token = secrets.token_hex(16)
+            reservations[token] = {
+                "peer_id": peer_id,
+                "ip": normalized_ip,
+                "local_outbound": direction,
+                "created_at": now,
+                "accepted": False,
+            }
+            return token
+
+    def _release_peer_admission(self, token: Optional[str]) -> None:
+        if not token:
+            return
+        with self._lock:
+            reservations = getattr(self, "_peer_admission_reservations", None)
+            if reservations is not None:
+                reservations.pop(token, None)
+
+    def _mark_peer_admission_accepted(self, token: Optional[str],
+                                      peer_id: str) -> bool:
+        """Mark a client-side reservation after the remote has sent ACCEPT.
+
+        This closes the short race where an inbound competing handshake could
+        steal/replace the local slot after the remote already committed to the
+        outbound session but before _register_peer() ran.
+        """
+        if not token:
+            return False
+        with self._lock:
+            record = getattr(self, "_peer_admission_reservations", {}).get(token)
+            if not record or record.get("peer_id") != peer_id:
+                return False
+            record["accepted"] = True
+            return True
+
+    def _send_accept_if_admitted(self, token: Optional[str], peer_id: str,
+                                 peer: Any, message: dict) -> bool:
+        """Send ACCEPT only while the preflight reservation is still valid.
+
+        Marking ``accepted`` is atomic under the admission lock; the socket write
+        happens outside that lock so a slow mobile link cannot block unrelated
+        peers from registering. Reservation admission then holds off new
+        handshakes for this identity until registration consumes the token.
+        """
+        if not token:
+            return False
+        with self._lock:
+            reservations = getattr(self, "_peer_admission_reservations", {})
+            record = reservations.get(token)
+            if not record or record.get("peer_id") != peer_id:
+                return False
+            preferred_outbound = self.node_id < peer_id
+            direction = bool(record.get("local_outbound"))
+            for other_token, other in reservations.items():
+                if other_token == token or other.get("peer_id") != peer_id:
+                    continue
+                other_direction = bool(other.get("local_outbound"))
+                # Once another transport for this identity has already received
+                # ACCEPT, don't accept a second one. If both transports were
+                # already accepted concurrently, _register_peer() still applies
+                # the same deterministic direction rule on both endpoints.
+                if bool(other.get("accepted")):
+                    return False
+                # A canonical pending handshake suppresses non-canonical ACCEPT.
+                if other_direction == preferred_outbound and direction != preferred_outbound:
+                    return False
+                # Same-direction duplicates should never be admitted, but fail
+                # closed if a stale/raced reservation exists.
+                if other_direction == direction:
+                    return False
+            existing = self.peers.get(peer_id)
+            if existing is not None and getattr(existing, "connected", False):
+                existing_direction = getattr(existing, "local_outbound", None)
+                if existing_direction == preferred_outbound:
+                    return False
+                if direction != preferred_outbound:
+                    return False
+            # Mark first, while protected by the lock. _reserve_peer_admission
+            # will then hold off all competing handshakes for this identity until
+            # this reservation is consumed or its owner releases it. Perform the
+            # actual socket send after dropping the global peer-table lock.
+            record["accepted"] = True
+
+        try:
+            sent = bool(peer.send(message))
+        except Exception:
+            sent = False
+        if not sent:
+            with self._lock:
+                current = getattr(self, "_peer_admission_reservations", {}).get(token)
+                if current is record:
+                    current["accepted"] = False
+        return sent
+
+    def _remember_node_info(self, info: dict, *, verified: bool = False,
+                            source: str = "pex") -> Optional[dict]:
+        """Remember a discovered endpoint for the operator's network directory.
+
+        This cache is strictly a peer-discovery convenience, never consensus or
+        ownership state.  PEX-supplied names are only advertised labels; a name
+        is marked registered only when the local canonical name-claim index
+        confirms the wallet address.
+        """
+        if not isinstance(info, dict):
+            return None
+        ip = _normalize_ip(str(info.get("ip", "") or "").strip())
+        try:
+            port = int(info.get("port"))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not ip or not (1 <= port <= 65535):
+            return None
+        if ip in {"0.0.0.0", "::", "<unknown>"}:
+            return None
+        # Accept IPv4/IPv6 literals or DNS names, but reject control characters,
+        # URL schemes, path fragments and other strings that cannot be endpoints.
+        if any(ch.isspace() for ch in ip) or any(ch in ip for ch in "/\\?#"):
+            return None
+        try:
+            parsed_ip = ipaddress.ip_address(ip.split("%", 1)[0])
+            if parsed_ip.is_unspecified or parsed_ip.is_multicast:
+                return None
+        except ValueError:
+            if len(ip) > 253 or not ip or ip.startswith(".") or ip.endswith("."):
+                return None
+            if any(not (c.isalnum() or c in ".-_") for c in ip):
+                return None
+
+        peer_id = str(info.get("peer_id", info.get("node_id", "")) or "").strip()[:160]
+        user_id = str(info.get("user_id", info.get("name", "")) or "").strip()[:128]
+        wallet_addr = str(info.get("wallet_addr", info.get("vsd_address", "")) or "").strip()[:160]
+        advertised_registered = str(info.get("registered_name", "") or "").strip()[:128]
+        is_seed_node = (info.get("seed_node", info.get("is_seed_node", False)) is True)
+        try:
+            chain_height = int(info.get("chain_height", -1))
+        except (TypeError, ValueError, OverflowError):
+            chain_height = -1
+        key = peer_id or f"endpoint:{ip.casefold()}:{port}"
+        now = time.time()
+        registered_name = ""
+        # Wallet/account IDs may be advertised as ``username#suffix`` while the
+        # confirmed on-chain registration uses the bare username. Test the
+        # advertised canonical name, full user ID, and bare prefix, but only
+        # label it registered when the canonical ownership record's wallet
+        # exactly matches the advertised VSD address.
+        name_candidates = []
+        for raw_name in (advertised_registered, user_id,
+                         user_id.split("#", 1)[0] if "#" in user_id else ""):
+            candidate = str(raw_name or "").strip()
+            if candidate and candidate.casefold() not in {n.casefold() for n in name_candidates}:
+                name_candidates.append(candidate)
+        claim_cache = getattr(self, "_node_directory_claim_cache", None)
+        if claim_cache is None:
+            self._node_directory_claim_cache = {}
+            claim_cache = self._node_directory_claim_cache
+        if wallet_addr:
+            for candidate_name in name_candidates:
+                claim_key = (candidate_name.casefold(), wallet_addr)
+                cached_claim = claim_cache.get(claim_key, ...)
+                if cached_claim is ...:
+                    try:
+                        claim = self.storage.resolve_name_claim(candidate_name.casefold())
+                        claim_wallet = str((claim or {}).get("wallet_addr", "") or "")
+                        # Never mark an advertised name as registered if its
+                        # ownership address is missing or does not match.
+                        if claim and claim_wallet and claim_wallet == wallet_addr:
+                            cached_claim = str(claim.get("user_id", candidate_name) or candidate_name)
+                        else:
+                            cached_claim = ""
+                    except Exception:
+                        cached_claim = ""
+                    if len(claim_cache) > max(100, int(getattr(self, "_node_directory_max", 5000)) * 2):
+                        claim_cache.clear()
+                    claim_cache[claim_key] = cached_claim
+                if cached_claim:
+                    registered_name = str(cached_claim)
+                    break
+
+        item = {
+            "peer_id": peer_id,
+            "ip": ip,
+            "port": port,
+            "user_id": user_id,
+            "registered_name": registered_name,
+            "wallet_addr": wallet_addr,
+            "chain_height": chain_height,
+            "seed_node": is_seed_node,
+            "verified": bool(verified),
+            "source": "handshake" if verified else str(source or "pex")[:24],
+            "last_seen": now,
+        }
+        lock = getattr(self, "_node_directory_lock", None)
+        if lock is None:
+            self._node_directory_lock = threading.RLock()
+            lock = self._node_directory_lock
+        with lock:
+            directory = getattr(self, "_node_directory", None)
+            if directory is None:
+                self._node_directory = {}
+                directory = self._node_directory
+            prior = directory.get(key)
+            if prior:
+                # An unverified PEX announcement must not overwrite the endpoint
+                # or identity data learned directly from an authenticated session.
+                if prior.get("verified") and not verified:
+                    item["ip"] = prior.get("ip", ip)
+                    item["port"] = prior.get("port", port)
+                    item["user_id"] = prior.get("user_id", user_id)
+                    item["registered_name"] = prior.get("registered_name", registered_name)
+                    item["wallet_addr"] = prior.get("wallet_addr", wallet_addr)
+                    item["chain_height"] = max(
+                        int(prior.get("chain_height", -1)), chain_height)
+                    item["verified"] = True
+                    item["source"] = prior.get("source", "handshake")
+                    item["last_seen"] = float(prior.get("last_seen", now))
+                else:
+                    item["verified"] = bool(verified or prior.get("verified"))
+                    if item["verified"] and prior.get("registered_name") and not item["registered_name"]:
+                        item["registered_name"] = prior["registered_name"]
+                    if item["verified"] and not wallet_addr:
+                        item["wallet_addr"] = prior.get("wallet_addr", "")
+            directory[key] = item
+            max_entries = max(100, int(getattr(self, "_node_directory_max", 5000)))
+            if len(directory) > max_entries:
+                # Retain live/directly authenticated entries preferentially.
+                live_ids = set(getattr(self, "peers", {}).keys())
+                excess = len(directory) - max_entries
+                evictable = sorted(
+                    ((k, v) for k, v in directory.items()
+                     if k not in live_ids and not v.get("verified")),
+                    key=lambda pair: float(pair[1].get("last_seen", 0.0)))
+                for old_key, _ in evictable[:excess]:
+                    directory.pop(old_key, None)
+        return dict(item)
+
+    def get_network_directory(self, refresh_sources: bool = True) -> List[dict]:
+        """Return the locally known network directory (connected + PEX-known).
+
+        A decentralized PEX directory is eventually learned, not a central
+        guarantee that every node currently online is visible to every client.
+        """
+        now = time.time()
+        ttl = max(3600, int(getattr(self, "_node_directory_ttl_secs", 30 * 86400)))
+        with self._lock:
+            live_peers = list(self.peers.items())
+        live_ids = set()
+        for pid, peer in live_peers:
+            if not getattr(peer, "connected", False):
+                continue
+            live_ids.add(pid)
+            self._remember_node_info({
+                "peer_id": pid, "ip": getattr(peer, "ip", ""),
+                "port": getattr(peer, "port", 0),
+                "user_id": getattr(peer, "user_id", ""),
+                "wallet_addr": getattr(peer, "wallet_addr", ""),
+                "registered_name": getattr(peer, "registered_name", ""),
+                "chain_height": getattr(peer, "chain_height", -1),
+                "seed_node": getattr(peer, "is_seed_node", False),
+            }, verified=True, source="handshake")
+
+        # The DHT and durable peer cache give the directory useful offline-known
+        # endpoints as well as peers learned through the live PEX conversation.
+        if refresh_sources:
+            try:
+                for item in self.router.all_peers():
+                    self._remember_node_info(item, verified=False, source="dht")
+            except Exception:
+                pass
+            # Reload the durable peer cache at most once per minute. The seed may
+            # have hundreds/thousands of peers making PEX requests simultaneously.
+            do_storage_refresh = False
+            refresh_lock = getattr(self, "_node_directory_lock", self._lock)
+            with refresh_lock:
+                last_refresh = float(getattr(self, "_node_directory_storage_refresh_at", 0.0))
+                if now - last_refresh >= 60.0:
+                    self._node_directory_storage_refresh_at = now
+                    do_storage_refresh = True
+            if do_storage_refresh:
+                try:
+                    for item in self.storage.get_peers(limit=1000):
+                        self._remember_node_info(item, verified=False, source="storage")
+                except Exception:
+                    pass
+
+        with self._node_directory_lock:
+            directory = getattr(self, "_node_directory", {})
+            for key, item in list(directory.items()):
+                if now - float(item.get("last_seen", now)) > ttl:
+                    # Do not expire a currently connected endpoint.
+                    if key not in live_ids and item.get("peer_id") not in live_ids:
+                        directory.pop(key, None)
+            result = [dict(v) for v in directory.values()]
+
+        for item in result:
+            pid = item.get("peer_id", "")
+            item["connected"] = bool(pid in live_ids)
+            item["status"] = "CONNECTED" if item["connected"] else (
+                "VERIFIED" if item.get("verified") else "DISCOVERED")
+        # Put live nodes first, then verified known nodes, then unverified PEX.
+        result.sort(key=lambda v: (
+            not bool(v.get("connected")),
+            not bool(v.get("verified")),
+            str(v.get("registered_name") or v.get("user_id") or "").casefold(),
+            str(v.get("ip", "")), int(v.get("port", 0)),
+        ))
+        return result
+
+    def _network_directory_page(self, cursor: int = 0, limit: int = 100,
+                                exclude_peer_id: str = "") -> tuple:
+        """Build a stable paginated PEX page from the local known directory."""
+        try:
+            cursor = max(0, int(cursor))
+        except (TypeError, ValueError):
+            cursor = 0
+        try:
+            limit = max(1, min(int(limit), self._PEX_PAGE_SIZE))
+        except (TypeError, ValueError):
+            limit = self._PEX_PAGE_SIZE
+        rows = self.get_network_directory()
+        rows = [r for r in rows if r.get("peer_id") not in {self.node_id, exclude_peer_id}]
+        rows.sort(key=lambda r: (str(r.get("peer_id") or ""),
+                                 str(r.get("ip", "")), int(r.get("port", 0))))
+        total = len(rows)
+        page = rows[cursor:cursor + limit]
+        encoded = [{
+            "peer_id": str(r.get("peer_id", "")),
+            "ip": str(r.get("ip", "")),
+            "port": int(r.get("port", 0)),
+            "user_id": str(r.get("user_id", "")),
+            "registered_name": str(r.get("registered_name", "")),
+            "wallet_addr": str(r.get("wallet_addr", "")),
+            "chain_height": int(r.get("chain_height", -1)),
+            "seed_node": r.get("seed_node") is True,
+        } for r in page]
+        next_cursor = cursor + len(page) if cursor + len(page) < total else None
+        return encoded, total, next_cursor
+
+    def _allow_pex_auto_dial(self) -> bool:
+        """Rate-limit seed PEX dials without limiting incoming valid peers."""
+        if not self._is_seed_node_mode():
+            return True
+        lock = getattr(self, "_pex_dial_lock", None)
+        if lock is None:
+            self._pex_dial_lock = threading.Lock()
+            lock = self._pex_dial_lock
+        with lock:
+            times = getattr(self, "_pex_dial_times", None)
+            if times is None:
+                self._pex_dial_times = deque()
+                times = self._pex_dial_times
+            now = time.monotonic()
+            while times and now - times[0] >= 60.0:
+                times.popleft()
+            maximum = max(1, int(getattr(self, "_pex_seed_dials_per_minute", 12)))
+            if len(times) >= maximum:
+                return False
+            times.append(now)
+            return True
+
+    def _should_auto_sync_peer(self, peer) -> bool:
+        """Choose one canonical side for initial sync; seed avoids equal/lower peers."""
+        try:
+            local_height = int(self.blockchain.height())
+            remote_height = int(getattr(peer, "chain_height", -1))
+        except Exception:
+            return not self._is_seed_node_mode()
+        if local_height >= 0 and remote_height == local_height:
+            local_tip = self._local_chain_tip_hash()
+            remote_tip = str(getattr(peer, "chain_tip_hash", "") or "").strip().lower()
+            if local_tip and remote_tip and hmac.compare_digest(local_tip, remote_tip):
+                # Identical cryptographic tips commit to the same ancestor chain.
+                # Skip replaying the entire history; bounded periodic overlap
+                # audits still run, and any later height/tip difference can sync.
+                return False
+        if self._is_seed_node_mode() and remote_height <= local_height:
+            return False
+        if bool(getattr(peer, "is_seed_node", False)) and not self._is_seed_node_mode():
+            # Bootstrap clients prefer the designated seed on equal-height
+            # connections. This gives the comparison one canonical direction.
+            return remote_height >= local_height
+        if remote_height > local_height:
+            return True
+        if remote_height < local_height:
+            # The shorter chain should request from the longer chain. The longer
+            # side must not issue a competing reverse sync request.
+            return False
+        if remote_height < 0:
+            return self.node_id < str(getattr(peer, "peer_id", ""))
+        # Same-height peers use one deterministic requester to avoid duplicated
+        # full-chain fork audits; consensus validation is unchanged.
+        return self.node_id < str(getattr(peer, "peer_id", ""))
 
     def _register_peer(self, peer: PeerConnection, peer_id: str,
                         pub_hex: str, user_id: str,
-                        initiator: bool = False):
+                        initiator: bool = False,
+                        admission_token: Optional[str] = None,
+                        local_outbound: Optional[bool] = None,
+                        wallet_addr: str = ""):
+
         """Register a fully-handshaked peer and start background post-connect tasks.
 
         Parameters
         ----------
         initiator : bool
-            True  — we are the OUTBOUND (connecting) side.  We fire the
-                    one-time full-chain sync request from_idx=1, because the
-                    remote may have a chain we haven't seen yet.
-            False — we are the INBOUND (accepting) side.  The remote will
-                    fire its own sync request to us, so we don't duplicate it.
-                    (Previously both sides fired from_idx=1 simultaneously,
-                    wasting bandwidth and causing confusion in the logs.)
+            Legacy sync-trigger flag. Current callers deliberately pass True
+            on both sides; the per-peer sync guard deduplicates simultaneous requests.
+        admission_token : str, optional
+            Reservation made before ACCEPT. A successful registration consumes it.
+        local_outbound : bool, optional
+            True when this endpoint initiated the transport connection; used for
+            deterministic duplicate-socket arbitration.
         """
-        # AUDIT-FIX (self-connect): this is the ONE place every handshaked
-        # peer (TCP inbound, TCP outbound, UDP) gets registered, so it's
-        # the only choke point guaranteed to run *after* peer_id is known.
-        # The pre-dial guard in _try_add_peer only catches literal loopback
-        # IPs, plus an already-known peer_id -- neither applies to a DNS
-        # seed (e.g. visold.duckdns.org) that currently resolves
-        # to our own public IP, so that guard is a no-op for this exact
-        # case and the connection previously sailed through a full
-        # PoW+TLS+ECDSA handshake before anything noticed. Reject by
-        # identity here, unconditionally, before any peer-list/storage
-        # side effects happen.
+        # Every transport must carry a reservation acquired before ACCEPT. The
+        # fallback keeps internal callers safe, while TCP/UDP pass the preflight
+        # token so capacity and subnet checks cannot race with ACCEPT.
         if peer_id == self.node_id:
             log.warning(
                 f"Refusing self-connection from "
@@ -1717,80 +2662,115 @@ class P2PNetwork:
                 peer.close()
             except Exception:
                 pass
+            self._release_peer_admission(admission_token)
             return
-        with self._lock:
-            # ── Fix #6: Anti-eclipse — IP subnet diversity enforcement ─────────
-            # Count how many connected peers share the same /24 (IPv4) or /48
-            # (IPv6) subnet.  If a single subnet already contributes more than
-            # MAX_PEERS_PER_SUBNET of the total peer slots, reject this peer.
-            # This limits the damage an adversary can do by controlling many IPs
-            # in the same subnet and clustering them into our peer set (eclipse).
-            MAX_PEERS_PER_SUBNET = max(3, Config.MAX_PEERS // 8)
-            peer_subnet = self._peer_subnet(peer.ip)
-            subnet_count = sum(
-                1 for p in self.peers.values()
-                if self._peer_subnet(p.ip) == peer_subnet and p.connected
-            )
-            if subnet_count >= MAX_PEERS_PER_SUBNET:
-                log.debug(
-                    f"Anti-eclipse: rejecting {peer.ip} — subnet {peer_subnet} "
-                    f"already has {subnet_count}/{MAX_PEERS_PER_SUBNET} peers")
-                peer.close()
-                return
 
-            # AUDIT-FIX-21: duplicate-registration race. Two independent
-            # handshakes for the SAME peer_id can complete concurrently —
-            # e.g. simultaneous mutual connect_to()/_handle_inbound() (both
-            # sides dial each other around the same time, routine while
-            # under MIN_PEERS), or a race between the TCP and UDP transports
-            # (_udp_connect_to / _udp_handle_inbound register into this same
-            # dict). Previously `self.peers[peer_id] = peer` below was a bare
-            # overwrite with no check for an existing entry, so the loser's
-            # socket/session was never closed (its message-loop thread ran
-            # forever, blocked on recv — a leak), and when that orphaned
-            # connection eventually disconnected, _on_peer_disconnect()'s
-            # unconditional pop-by-key evicted whichever connection was
-            # *currently* registered — silently dropping a live, healthy
-            # peer from gossip/routing. See AUDIT-FIX-21 in
-            # _on_peer_disconnect() for the other half of this fix.
-            #
-            # Fix: the new connection just proved key ownership via a fresh
-            # ECDSA handshake, so it always wins. Close the superseded
-            # connection here, under this same lock, so by the time its
-            # message loop notices and calls _on_peer_disconnect(), that
-            # function's own identity check (added there) will correctly
-            # see it's no longer the current registration and skip the
-            # identity-level cleanup instead of evicting the new one.
-            _existing_peer = self.peers.get(peer_id)
-            if _existing_peer is not None and _existing_peer is not peer:
-                log.info(
-                    f"Peer {peer_id[:12]}... reconnected via a new session "
-                    f"[{_format_peer_addr(peer.ip, peer.port)}] — closing "
-                    f"previous session "
-                    f"[{_format_peer_addr(_existing_peer.ip, _existing_peer.port)}]")
+        if admission_token is None:
+            direction = bool(local_outbound) if local_outbound is not None else False
+            admission_token = self._reserve_peer_admission(
+                peer_id, peer.ip, local_outbound=direction)
+            if admission_token is None:
                 try:
-                    _existing_peer.connected = False
-                    _existing_peer.close()
+                    peer.close()
                 except Exception:
                     pass
+                return
+
+        with self._lock:
+            reservations = getattr(self, "_peer_admission_reservations", {})
+            reservation = reservations.pop(admission_token, None)
+            if not reservation or reservation.get("peer_id") != peer_id:
+                log.debug("[PeerAdmission] stale/missing reservation for %s; closing",
+                          peer_id[:12])
+                try:
+                    peer.close()
+                except Exception:
+                    pass
+                return
+
+            if local_outbound is None:
+                local_outbound = bool(reservation.get("local_outbound"))
+            peer.local_outbound = bool(local_outbound)
+            peer.user_id = str(user_id or getattr(peer, "user_id", "") or "")
+            peer.wallet_addr = str(wallet_addr or getattr(peer, "wallet_addr", "") or "")
+            preferred_outbound = self.node_id < peer_id
+
+            # Simultaneous mutual dials can create two physical sockets. Both
+            # endpoints use the same rule: the lower node_id's outbound socket
+            # wins. This prevents each end retaining a different socket and
+            # reporting CONNECTED without being able to exchange messages.
+            existing = self.peers.get(peer_id)
+            if existing is not None and existing is not peer:
+                if getattr(existing, "connected", False):
+                    existing_direction = getattr(existing, "local_outbound", None)
+                    new_direction = bool(local_outbound)
+                    if existing_direction == preferred_outbound:
+                        try:
+                            peer.close()
+                        except Exception:
+                            pass
+                        return
+                    if new_direction != preferred_outbound:
+                        try:
+                            peer.close()
+                        except Exception:
+                            pass
+                        return
+                    log.info(
+                        "Peer %s: replacing non-canonical duplicate session with "
+                        "canonical direction (%s)", peer_id[:12],
+                        "outbound" if new_direction else "inbound")
+                    existing.connected = False
+                    try:
+                        existing.close()
+                    except Exception:
+                        pass
+                self.peers.pop(peer_id, None)
                 self._eager_peers.discard(peer_id)
 
-            if len(self.peers) >= Config.MAX_PEERS:
-                if self.peers:
-                    worst = min(self.peers.values(), key=lambda p: p.reputation)
-                    worst.close()
-                    self.peers.pop(worst.peer_id, None)
-                    self._eager_peers.discard(worst.peer_id)
+            # Clean dead map entries so stale sessions do not consume capacity.
+            for stale_id, stale_peer in list(self.peers.items()):
+                if not getattr(stale_peer, "connected", False):
+                    self.peers.pop(stale_id, None)
+                    self._eager_peers.discard(stale_id)
+
+            capacity = self._peer_capacity_limit()
+            if capacity is not None and len(self.peers) >= capacity:
+                log.warning("[PeerAdmission] peer table reached MAX_PEERS=%s during registration",
+                            capacity)
+                try:
+                    peer.close()
+                except Exception:
+                    pass
+                return
+
             self.peers[peer_id] = peer
             self._eager_peers.add(peer_id)  # Plumtree: start as eager
         info = {"peer_id": peer_id, "ip": peer.ip, "port": peer.port,
-                "pub_hex": pub_hex, "user_id": user_id}
+                "pub_hex": pub_hex, "user_id": user_id,
+                "wallet_addr": str(wallet_addr or getattr(peer, "wallet_addr", "") or ""),
+                "chain_height": int(getattr(peer, "chain_height", -1)),
+                "registered_name": ""}
         self.router.update(peer_id, info)
         self.storage.save_peer(peer_id, peer.ip, peer.port)
+        remembered = self._remember_node_info(info, verified=True, source="handshake")
+        if remembered:
+            try:
+                peer.registered_name = remembered.get("registered_name", "")
+            except Exception:
+                pass
         log.info(f"Peer connected: {peer_id[:12]}... "
                  f"[{_format_peer_addr(peer.ip, peer.port)}]")
         # ── LIVE-UI: push instant peer-connect notification ───────────────────
         _push_peer_notif("connected", peer.ip, peer.port)
+        # Ask for peer exchange immediately instead of waiting up to one complete
+        # PEX_INTERVAL. This helps a newly joined node extend beyond its seed.
+        try:
+            if peer.connected:
+                peer.send({"type": MSG_GET_PEERS, "cursor": 0,
+                           "limit": self._PEX_PAGE_SIZE})
+        except Exception as _pex_err:
+            log.debug("Immediate peer exchange request failed: %s", _pex_err)
 
         # BUG-FIX: Auto-sync chain on peer connect.
         # Without this, two nodes that were mining independently would never
@@ -1821,7 +2801,19 @@ class P2PNetwork:
             if p._auto_sync_active.is_set():
                 return   # another thread already owns sync for this peer
             p._auto_sync_active.set()
+            _sync_gate_acquired = False
             try:
+                if not self._should_auto_sync_peer(p):
+                    log.debug("[AutoSync] Deferred initial sync for %s; another peer/side owns this comparison",
+                              peer_id[:12])
+                    return
+                gate = getattr(self, "_auto_sync_gate", None)
+                if gate is not None:
+                    _sync_gate_acquired = gate.acquire(blocking=False)
+                    if not _sync_gate_acquired:
+                        log.debug("[AutoSync] Global sync coordinator busy; deferring peer %s to heartbeat",
+                                  peer_id[:12])
+                        return
                 time.sleep(0.5)   # allow message loop to start first
                 if not p.connected:
                     return
@@ -1892,43 +2884,39 @@ class P2PNetwork:
                         return
                     cur_h = self.blockchain.height()
 
-                    # BUG-FIX (v7.0.0.6) — Two problems with the old
-                    # from_idx = max(0, cur_h):
-                    #
-                    # Problem A (fork detection): The first attempt must
-                    # always start at from_idx=0 so that independently-
-                    # mined chains are detected at block 1. The old code
-                    # used cur_h, which on a node at height 50 skipped
-                    # blocks 0-49, making any fork below the tip invisible
-                    # to accept_chain()'s fork-choice logic.
-                    #
-                    # Problem B (off-by-one): After partial progress
-                    # (e.g. height advanced to 50), from_idx=max(0,50)=50
-                    # re-requested block 50 (already stored).  The next
-                    # block needed is 51, so the correct value is cur_h+1.
-                    #
-                    # Fix: attempt 0 always starts at genesis (from_idx=0).
-                    # Subsequent attempts (when we've already received some
-                    # blocks) request from cur_h+1 to avoid duplicating
-                    # the already-applied tip block.
-                    # BUG-FIX (sync-fix-2): subsequent attempts used
-                    # cur_h+1 even when height had NOT advanced.  When
-                    # both nodes have equal-height independent forks,
-                    # cur_h stays at start_h and attempt 1+ send
-                    # from_idx=cur_h+1 — a range the peer doesn't have
-                    # (it only has blocks 0..cur_h), yielding 0 blocks
-                    # served.  Fix: keep requesting from 0 until real
-                    # height progress is observed; only advance from_idx
-                    # once the height has actually moved past start_h.
-                    if attempt == 0 or cur_h <= start_h:
-                        from_idx = 0
-                    else:
-                        from_idx = max(0, cur_h + 1)
+                    # Select the request start based on what history this node
+                    # can actually serve/verify. Archival chains can compare from
+                    # genesis; rolling-pruned chains must compare the recent
+                    # retained overlap instead of replaying unavailable bodies.
+                    # Preserve the genesis-level fork check only while our
+                    # local database still has archival block bodies. Once the
+                    # local prefix is pruned, replaying 0..199 is guaranteed to
+                    # fail against another rolling-pruned peer and can trigger
+                    # a useless snapshot-recovery loop. Instead, compare the
+                    # newest contiguous full-body overlap (up to 199 blocks)
+                    # and leave one slot in the 200-block page for the next
+                    # block above our tip. This still detects forks inside the
+                    # retained overlap; deeper forks without bodies require the
+                    # authenticated checkpoint path and must fail closed.
+                    from_idx = self._auto_sync_request_start(cur_h, start_h)
                     to_idx = from_idx + 199
                     try:
-                        self._sync_request(
+                        _sync_request_id = self._sync_request(
                             p, from_idx, to_idx,
                             kind="auto-sync", force=False)
+                        if not _sync_request_id:
+                            with p._sync_state_lock:
+                                _pending_sync = getattr(p, "_sync_pending", None)
+                            if _pending_sync:
+                                log.info(
+                                    f"[AutoSync] Yielding to in-flight "
+                                    f"{_pending_sync.get('kind', 'chain-sync')} request "
+                                    f"for peer {peer_id[:12]}")
+                            else:
+                                log.warning(
+                                    f"[AutoSync] Chain request {from_idx}-{to_idx} "
+                                    f"was not sent to peer {peer_id[:12]}")
+                            return
                         log.info(
                             f"[AutoSync] Requested chain blocks "
                             f"{from_idx}-{to_idx} from {peer_id[:12]} "
@@ -1994,6 +2982,34 @@ class P2PNetwork:
                                 f"from new tip.")
                             last_h = new_h
                             continue
+                    # A pruned node may receive a range that is entirely an
+                    # exact match for its retained canonical suffix. That is a
+                    # successful no-op, not a sync failure. Stop rather than
+                    # requesting the same overlap six times. A mismatching fork
+                    # never takes this path because accept_chain records it as
+                    # rejected.
+                    if _sync_request_id:
+                        try:
+                            with p._sync_state_lock:
+                                _last_result = getattr(p, "_sync_last_result", None)
+                                _last_result = dict(_last_result) if isinstance(_last_result, dict) else None
+                            if (_last_result
+                                    and _last_result.get("request_id") == _sync_request_id
+                                    and _last_result.get("ok") is True
+                                    and not _last_result.get("needs_next_page", False)
+                                    and int(getattr(p, "chain_height", -1)) <= int(new_h)):
+                                if _last_result.get("reason") == "Already have all these blocks":
+                                    log.info(
+                                        f"[AutoSync] Recent canonical overlap matched peer "
+                                        f"{peer_id[:12]} at height {new_h}; peer tip is not ahead, "
+                                        "no historical replay needed")
+                                else:
+                                    log.info(
+                                        f"[AutoSync] Sync with peer {peer_id[:12]} completed; "
+                                        f"peer tip is not ahead of local height {new_h}")
+                                return
+                        except Exception:
+                            pass
                     if new_h > start_h:
                         # Made some progress overall; stop quietly.
                         return
@@ -2009,27 +3025,19 @@ class P2PNetwork:
                 # BUG-FIX (sync-fix-4): always release the dedup flag so that
                 # the periodic heartbeat or a future reconnect can trigger a
                 # fresh sync if needed.
+                if _sync_gate_acquired:
+                    try:
+                        self._auto_sync_gate.release()
+                    except Exception:
+                        pass
                 p._auto_sync_active.clear()
         threading.Thread(target=_auto_sync_on_connect,
                          args=(peer, initiator), daemon=True).start()
 
     @staticmethod
     def _peer_subnet(ip: str) -> str:
-        """
-        Return the /24 subnet for IPv4 or /48 subnet for IPv6.
-        Used for anti-eclipse diversity enforcement (Fix #6).
-        """
-        try:
-            if ':' in ip:
-                # IPv6 — use first 48 bits (3 groups of 16)
-                parts = ip.split(':')
-                return ':'.join(parts[:3])
-            else:
-                # IPv4 — use first 24 bits (/24)
-                parts = ip.split('.')
-                return '.'.join(parts[:3])
-        except Exception:
-            return ip
+        """Canonical /24 IPv4 or /48 IPv6 key for peer diversity checks."""
+        return P2PNetwork._ip_subnet(_normalize_ip(str(ip or "")))
 
     # ── SECTION 6F: Soft Ban — Consecutive Failure Escalation (v6.0.0) ─────────
     # Implements the three-strikes probabilistic filter that replaces the naive
@@ -2406,6 +3414,82 @@ class P2PNetwork:
 
         return None
 
+    def _auto_sync_request_start(self, current_height: int,
+                                 initial_height: int) -> int:
+        """Select a sync start without replaying unavailable pruned bodies."""
+        try:
+            current = int(current_height)
+            initial = int(initial_height)
+        except (TypeError, ValueError):
+            return 0
+        if current > initial:
+            return max(0, current + 1)
+        if self._has_pruned_local_history():
+            return self._recent_full_body_sync_start(current)
+        # Archival nodes retain the genesis-level fork check. If no progress
+        # occurs, retries continue checking from genesis so independently
+        # mined forks remain visible.
+        return 0
+
+    def _has_pruned_local_history(self) -> bool:
+        """Return True when genesis/metadata shows this node is not archival.
+
+        This is deliberately a cheap check: the watermark is authoritative for
+        normal operation, with block 0's persisted marker as a legacy fallback.
+        """
+        try:
+            watermark = self.storage.get_meta("rolling_pruned_until")
+            if watermark is not None and int(watermark) > 0:
+                return True
+        except Exception:
+            pass
+        try:
+            genesis = self.blockchain.get_block(0)
+            if genesis is not None:
+                if bool(getattr(genesis, "is_pruned", False)):
+                    return True
+                to_dict = getattr(genesis, "to_dict", None)
+                if callable(to_dict) and bool(to_dict().get("pruned", False)):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _recent_full_body_sync_start(self, current_height: int) -> int:
+        """Choose a recent overlapping request start safe for pruned peers.
+
+        At most 199 canonical blocks are overlapped, reserving one of the 200
+        request slots for the first block above our tip. The rolling-window
+        setting bounds the lookback, and a short read-only scan skips any
+        remaining pruned/missing prefix rows. This does not authorize a fork:
+        accept_chain still requires exact hashes for the overlap and normal
+        consensus validation for every new/replacement block.
+        """
+        try:
+            height = max(0, int(current_height))
+        except (TypeError, ValueError):
+            return 0
+        try:
+            window = max(1, int(Config.ROLLING_PRUNE_WINDOW))
+        except (TypeError, ValueError):
+            window = 600
+        lookback = min(198, max(0, window - 1))
+        start = max(0, height - lookback)
+        for idx in range(start, height + 1):
+            try:
+                block = self.blockchain.get_block(idx)
+                if block is None or bool(getattr(block, "is_pruned", False)):
+                    start = idx + 1
+                    continue
+                to_dict = getattr(block, "to_dict", None)
+                if callable(to_dict) and bool(to_dict().get("pruned", False)):
+                    start = idx + 1
+            except Exception:
+                # A height we cannot read is not a safe overlap anchor. Start
+                # after it instead of replaying a possibly pruned body.
+                start = idx + 1
+        return min(height, max(0, start))
+
     def _sync_request(self, peer: 'PeerConnection', from_idx: int,
                       to_idx: int, *, kind: str = "heartbeat",
                       force: bool = False) -> Optional[str]:
@@ -2641,12 +3725,30 @@ class P2PNetwork:
         blocks behind the node actually was.
         """
         try:
+            try:
+                with peer._sync_state_lock:
+                    peer._sync_last_result = {
+                        "request_id": request_id,
+                        "ok": bool(ok),
+                        "reason": str(reason),
+                        "local_height": int(self.blockchain.height()),
+                        "needs_next_page": bool(needs_next_page),
+                        "completed_at": time.monotonic(),
+                    }
+            except Exception:
+                pass
             if ok:
                 self._sync_finish(peer, request_id)
-                log.info(
-                    f"[ChainSync] Applied {len(blocks)} block(s) "
-                    f"from {peer.peer_id[:12]} — "
-                    f"height now {self.blockchain.height()}")
+                if str(reason) == "Already have all these blocks":
+                    log.info(
+                        f"[ChainSync] Verified canonical overlap from "
+                        f"{peer.peer_id[:12]} — no new blocks needed; "
+                        f"height remains {self.blockchain.height()}")
+                else:
+                    log.info(
+                        f"[ChainSync] Applied {len(blocks)} block(s) "
+                        f"from {peer.peer_id[:12]} — "
+                        f"height now {self.blockchain.height()}")
                 if needs_next_page and peer.connected:
                     # Signal to _auto_sync_on_connect that full pagination
                     # is now in flight for this peer. The auto-sync loop
@@ -3252,24 +4354,83 @@ class P2PNetwork:
             pass
 
         elif mtype == MSG_GET_PEERS:
-            peers_list = [
-                {"ip": p.ip, "port": p.port, "peer_id": pid}
-                for pid, p in self.peers.items()
-                if p.connected and pid != peer.peer_id
-            ][:20]
-            peer.send({"type": MSG_PEERS, "peers": peers_list})
+            # PEX is a paginated gossip directory, not merely the current direct
+            # neighbours. It provides eventual discovery; it is not a central
+            # oracle for every node that may be online at this instant.
+            try:
+                page_cursor = max(0, int(msg.get("cursor", 0)))
+            except (TypeError, ValueError):
+                page_cursor = 0
+            try:
+                page_limit = max(1, min(int(msg.get("limit", self._PEX_PAGE_SIZE)),
+                                        self._PEX_PAGE_SIZE))
+            except (TypeError, ValueError):
+                page_limit = self._PEX_PAGE_SIZE
+            pex_page, pex_total, pex_next = self._network_directory_page(
+                page_cursor, page_limit, exclude_peer_id=peer.peer_id)
+            peer.send({"type": MSG_PEERS, "peers": pex_page,
+                       "cursor": page_cursor, "next_cursor": pex_next,
+                       "total": pex_total})
 
         elif mtype == MSG_PEERS:
-            # v6.9.9: process IPv6 peers before IPv4 peers so that on CGNAT
-            # networks IPv6 connection threads start first and are more likely
-            # to establish before the IPv4 attempts time out.
+            # Save every discovered endpoint for the searchable local directory,
+            # but dial only enough candidates to meet the ordinary peer target.
+            # A designated seed keeps exploring in small/rate-limited batches.
             pex_peers = msg.get("peers", [])
-            pex_ipv6  = [p for p in pex_peers if _is_ipv6_address(p.get("ip", ""))]
-            pex_ipv4  = [p for p in pex_peers if not _is_ipv6_address(p.get("ip", ""))]
-            for pinfo in (pex_ipv6 + pex_ipv4):
-                self._try_add_peer(pinfo.get("ip"), pinfo.get("port"), pinfo.get("peer_id",""))
+            if not isinstance(pex_peers, list):
+                pex_peers = []
+            for pinfo in pex_peers:
+                if isinstance(pinfo, dict):
+                    self._remember_node_info(pinfo, verified=False, source="pex")
+            try:
+                next_cursor = msg.get("next_cursor")
+                peer._pex_cursor = max(0, int(next_cursor)) if next_cursor is not None else 0
+            except (TypeError, ValueError):
+                peer._pex_cursor = 0
+
+            pex_ipv6 = [p for p in pex_peers
+                        if isinstance(p, dict) and _is_ipv6_address(str(p.get("ip", "")))]
+            pex_ipv4 = [p for p in pex_peers
+                        if isinstance(p, dict) and not _is_ipv6_address(str(p.get("ip", "")))]
+            candidates = pex_ipv6 + pex_ipv4
+            active_count = len(self.active_peer_count())
+            with self._pending_lock:
+                pending_count = len(self._pending_connections)
+            target = self.minimum_peer_target()
+            if target is None:
+                dial_budget = self._PEX_DIAL_BATCH
+            else:
+                dial_budget = min(self._PEX_DIAL_BATCH,
+                                  max(0, int(target) - active_count - pending_count))
+            dialed = 0
+            for pinfo in candidates:
+                if dialed >= dial_budget:
+                    break
+                ip = str(pinfo.get("ip", "") or "").strip()
+                try:
+                    port = int(pinfo.get("port"))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if not ip or not (1 <= port <= 65535):
+                    continue
+                pid = str(pinfo.get("peer_id", "") or "")
+                if pid in {self.node_id, peer.peer_id}:
+                    continue
+                if not self._allow_pex_auto_dial():
+                    break
+                self._try_add_peer(ip, port, pid)
+                dialed += 1
 
         elif mtype == MSG_TX:
+            try:
+                if msg.get("server_height") is not None:
+                    peer.chain_height = int(msg.get("server_height", peer.chain_height))
+                _server_tip = str(msg.get("server_tip_hash", "") or "").strip().lower()
+                if len(_server_tip) == 64 and all(c in "0123456789abcdef" for c in _server_tip):
+                    peer.chain_tip_hash = _server_tip
+            except (TypeError, ValueError):
+                pass
+
             # ── Route through StateEngine (single-writer) ─────────────────────
             # The network I/O thread posts a NEW_TX event and does NOT call
             # mempool.add() directly.  This prevents race conditions between
@@ -3967,61 +5128,125 @@ class P2PNetwork:
                     peer.send({"type": MSG_BLOCK, "block": _req_block.to_dict()})
 
         elif mtype == MSG_GET_CHAIN:
-            from_idx = msg.get("from_idx", 0)
-            to_idx   = msg.get("to_idx", self.blockchain.height())
-            chain    = []
-            # BUG-FIX (v7.0.0.0): Reduced per-response cap from 500 → 200 blocks.
-            # On Android/Pydroid3 with limited RAM, a 500-block response frequently
-            # exceeded MAX_MESSAGE_SIZE, causing the receiving peer to be banned for
-            # "oversized frame".  200 blocks × ~8 KB avg = ~1.6 MB typical payload,
-            # which stays safely under the 1 GB cap even on heavy-transaction chains.
-            # Pagination in the MSG_CHAIN handler fetches subsequent batches automatically.
-            #
-            # v7.0.1.1 (Partial-Sync Fix): The loop already skips missing indices
-            # (get_block returns None), so a request for blocks 0–199 when only
-            # 66 are mined correctly produces a 66-block response.  We now also
-            # include the server's current chain height in every MSG_CHAIN reply
-            # so the receiving peer can distinguish "partial page because server
-            # has no more blocks yet" (server_height == last_received_index) from
-            # "partial page but more blocks exist above the received range"
-            # (server_height > last_received_index), enabling smarter pagination.
-            _server_height = self.blockchain.height()
-            for i in range(from_idx, min(to_idx + 1, from_idx + 200)):
-                b = self.blockchain.get_block(i)
-                if b:
-                    chain.append(b.to_dict())
-            peer.send({
-                "type":          MSG_CHAIN,
-                "blocks":        chain,
-                "server_height": _server_height,   # v7.0.1.1: partial-sync signal
-                "request_id":    msg.get("request_id"),
-            })
-            # ── Dashboard visibility for INBOUND sync requests ───────────────
-            # Prior to this change the server-side sync path was completely
-            # silent: a peer could request thousands of blocks and the operator
-            # would see nothing on the dashboard.  We now emit one INFO log
-            # line (routed through _QueueHandler into the Recent Activity
-            # panel) AND push a dedicated formatted entry so operators can see
-            # in real time which peers are syncing from this node.
+            # A seed can have many peers, but every simultaneous initial-sync
+            # request must not trigger an unbounded number of DB scans. Bound
+            # concurrent scans globally; return a correlated busy hint when
+            # saturated so honest peers can retry without penalty.
+            serve_gate = getattr(self, "_chain_serve_semaphore", None)
+            acquired = bool(serve_gate and serve_gate.acquire(blocking=False))
+            if serve_gate is None:
+                acquired = True
+            if not acquired:
+                try:
+                    peer.send({
+                        "type": MSG_CHAIN, "blocks": [],
+                        "server_height": self.blockchain.height(),
+                        "server_tip_hash": self._local_chain_tip_hash(),
+                        "request_id": msg.get("request_id"),
+                        "busy": True, "retry_after_ms": 1500,
+                    })
+                except Exception:
+                    pass
+                return
             try:
-                log.info(
-                    f"[ChainServe] Peer {peer.peer_id[:12]} requested blocks "
-                    f"{from_idx}-{to_idx}; served {len(chain)} block(s) "
-                    f"(chain tip={_server_height})"
-                )
-                _push_sync_request_notif(
-                    peer.peer_id, from_idx, to_idx, len(chain)
-                )
-            except Exception:
-                pass
+                try:
+                    from_idx = max(0, int(msg.get("from_idx", 0)))
+                    to_idx = max(from_idx, int(msg.get("to_idx", self.blockchain.height())))
+                except (TypeError, ValueError, OverflowError):
+                    peer.send({"type": MSG_CHAIN, "blocks": [],
+                               "server_height": self.blockchain.height(),
+                               "server_tip_hash": self._local_chain_tip_hash(),
+                               "request_id": msg.get("request_id"),
+                               "busy": True, "retry_after_ms": 1500})
+                    return
+                # Bound every individual response to 200 blocks; pagination and
+                # block acceptance remain unchanged.
+                to_idx = min(to_idx, from_idx + 199)
+                chain = []
+                server_height = self.blockchain.height()
+                for index in range(from_idx, min(to_idx + 1, from_idx + 200)):
+                    block = self.blockchain.get_block(index)
+                    if block:
+                        chain.append(block.to_dict())
+                peer.send({
+                    "type": MSG_CHAIN,
+                    "blocks": chain,
+                    "server_height": server_height,
+                    "server_tip_hash": self._local_chain_tip_hash(),
+                    "request_id": msg.get("request_id"),
+                })
+                try:
+                    log.info(
+                        f"[ChainServe] Peer {peer.peer_id[:12]} requested blocks "
+                        f"{from_idx}-{to_idx}; served {len(chain)} block(s) "
+                        f"(chain tip={server_height})"
+                    )
+                    _push_sync_request_notif(
+                        peer.peer_id, from_idx, to_idx, len(chain)
+                    )
+                except Exception:
+                    pass
+            finally:
+                if serve_gate is not None:
+                    serve_gate.release()
 
         elif mtype == MSG_CHAIN:
-            # Authenticated fresh-node bootstrap uses MSG_GET_CHAIN as a
-            # header transport.  Route those explicitly-correlated responses
-            # to its private queue before normal full-block sync tries to apply
-            # intentionally-pruned records.
             _bootstrap_q = getattr(peer, "_bootstrap_header_queue", None)
-            if _bootstrap_q is not None:
+            _bootstrap_request_id = getattr(peer, "_bootstrap_header_request_id", None)
+            _msg_request_id = msg.get("request_id")
+            _is_bootstrap_response = bool(
+                _bootstrap_q is not None and _bootstrap_request_id
+                and _msg_request_id == _bootstrap_request_id
+            )
+            if msg.get("busy"):
+                if _is_bootstrap_response:
+                    try:
+                        _bootstrap_q.put(msg, timeout=0.2)
+                    except Exception:
+                        pass
+                    return
+                request_id = msg.get("request_id")
+                pending = None
+                with peer._sync_state_lock:
+                    current = getattr(peer, "_sync_pending", None)
+                    if current is not None and (not request_id or current.get("id") == request_id):
+                        pending = dict(current)
+                        peer._sync_pending = None
+                        peer._sync_last_result = {
+                            "request_id": current.get("id"), "ok": False,
+                            "reason": "remote chain-serving queue busy",
+                            "needs_next_page": False,
+                        }
+                        peer._pagination_active.clear()
+                        retry_count = int(getattr(peer, "_sync_busy_retries", 0)) + 1
+                        peer._sync_busy_retries = retry_count
+                    else:
+                        retry_count = 0
+                log.debug("[ChainSync] peer %s asked us to retry a busy response (attempt %s)",
+                          peer.peer_id[:12], retry_count)
+                if pending and retry_count <= 5 and peer.connected:
+                    try:
+                        delay = max(0.5, min(5.0, float(msg.get("retry_after_ms", 1500)) / 1000.0))
+                    except (TypeError, ValueError):
+                        delay = 1.5
+                    def _retry_busy_chain(_peer=peer, _pending=pending, _delay=delay):
+                        time.sleep(_delay)
+                        if not _peer.connected:
+                            return
+                        with _peer._sync_state_lock:
+                            if _peer._sync_pending is not None:
+                                return
+                        self._sync_request(
+                            _peer, _pending.get("from_idx", 0), _pending.get("to_idx", 199),
+                            kind=str(_pending.get("kind", "busy-retry")), force=False)
+                    threading.Thread(target=_retry_busy_chain, daemon=True).start()
+                return
+            else:
+                peer._sync_busy_retries = 0
+            # Only the exact request ID owned by authenticated bootstrap goes
+            # to its header queue. Unrelated sync responses must not be consumed
+            # by a concurrent snapshot/header download.
+            if _is_bootstrap_response:
                 try:
                     _bootstrap_q.put(msg, timeout=1)
                 except Exception:
@@ -4739,7 +5964,17 @@ class P2PNetwork:
                     # Cooldown expired — reset so next attempt is treated fresh
                     del self._outbound_fail[ip]
         with self._lock:
-            existing_ips = {(p.ip, p.port) for p in self.peers.values()}
+            # Remove disconnected entries before applying duplicate/capacity
+            # checks. A stale peer record must not make later Auto/manual dials
+            # appear as duplicates or consume a peer slot forever.
+            for stale_id, stale_peer in list(self.peers.items()):
+                if not getattr(stale_peer, "connected", False):
+                    self.peers.pop(stale_id, None)
+                    self._eager_peers.discard(stale_id)
+            existing_ips = {
+                (p.ip, p.port) for p in self.peers.values()
+                if getattr(p, "connected", False)
+            }
             # ── Self-connection guard ─────────────────────────────────────────
             # Block loopback IPs on our own port.  Note: Config.BIND_ADDRESS
             # ("::") is a bind wildcard, NOT a peer address — do not include it
@@ -4754,7 +5989,9 @@ class P2PNetwork:
                 return
             if (ip, port) in existing_ips:
                 return
-            if len(self.peers) >= Config.MAX_PEERS:
+            if self._peer_capacity_reached(sum(
+                    1 for p in self.peers.values()
+                    if getattr(p, "connected", False))):
                 return
         # ── Pending-connection dedup (Bug #3/#4 fix) ─────────────────────────
         # Prevent multiple concurrent threads from racing to the same endpoint.
@@ -5434,10 +6671,10 @@ class P2PNetwork:
         time.sleep(1)
         known = self.storage.get_peers(limit=20)
         for p in known:
-            if len(self.active_peer_count()) < Config.MIN_PEERS:
+            if self._below_minimum_peer_target(len(self.active_peer_count())):
                 self._try_add_peer(p["ip"], p["port"], p["peer_id"])
         for seed in Config.SEED_PEERS:
-            if len(self.active_peer_count()) >= Config.MIN_PEERS:
+            if not self._below_minimum_peer_target(len(self.active_peer_count())):
                 break
             try:
                 ip, port = _parse_peer_addr(seed)
@@ -5466,7 +6703,9 @@ class P2PNetwork:
                 targets = list(self.peers.values())
             for peer in targets:
                 if peer.connected:
-                    peer.send({"type": MSG_GET_PEERS})
+                    cursor = max(0, int(getattr(peer, "_pex_cursor", 0) or 0))
+                    peer.send({"type": MSG_GET_PEERS,
+                               "cursor": cursor, "limit": self._PEX_PAGE_SIZE})
 
     def _reconnect_loop(self):
         _sync_tick = 0
@@ -5474,12 +6713,18 @@ class P2PNetwork:
             import random as _rnd  # VSA-10: jittered reconnect
             time.sleep(Config.RECONNECT_INTERVAL * _rnd.uniform(0.75, 1.25))
             count = len(self.active_peer_count())
-            if count < Config.MIN_PEERS:
-                log.debug(f"Only {count} peers, reconnecting...")
+            if self._below_minimum_peer_target(count):
+                target = self.minimum_peer_target()
+                if target is None:
+                    log.debug(
+                        "Seed peer target is unbounded; exploring known peers...")
+                else:
+                    log.debug(f"Only {count}/{target} peers, reconnecting...")
                 known = self.storage.get_peers(limit=20)
                 random.shuffle(known)
                 for p in known:
-                    if len(self.active_peer_count()) >= Config.MIN_PEERS:
+                    if not self._below_minimum_peer_target(
+                            len(self.active_peer_count())):
                         break
                     with self._lock:
                         already = any(
@@ -5488,39 +6733,69 @@ class P2PNetwork:
                         )
                     if not already:
                         self._try_add_peer(p["ip"], p["port"], p["peer_id"])
-                if len(self.active_peer_count()) < Config.MIN_PEERS:
+                if self._below_minimum_peer_target(len(self.active_peer_count())):
                     self._bootstrap()
 
-            # Chain sync heartbeat — every 60 s (2 ticks of the 30 s loop).
-            #
-            # FIX — Full Chain Heartbeat Bug:
-            # The old code used from_idx=max(1, my_height-10), which on a short
-            # chain (e.g. height=5) effectively sent the entire chain every
-            # minute.  Each response is up to 500 blocks of JSON; on a 66-block
-            # chain that is megabytes of redundant data causing Socket Bloat,
-            # buffer fill, lag, timeout, and then the Blacklist Bug firing.
-            #
-            # Fix: the heartbeat now requests ONLY blocks strictly above our
-            # current tip (from_idx = my_height + 1).  The one-time full
-            # fork-choice sync (from_idx=1) already runs in _auto_sync_on_connect
-            # at peer registration; the heartbeat's only job is to pick up new
-            # blocks mined while we were connected.  This reduces heartbeat
-            # payload from O(chain_length) to O(new_blocks_since_last_tick).
+            # Chain sync heartbeat — send to ONE selected peer, not every peer.
+            # Pick the highest peer for missing blocks. Every tenth heartbeat
+            # checks a bounded recent overlap with one rotating peer. Consensus,
+            # block validation, chainwork and fork choice remain unchanged.
             _sync_tick += 1
             if _sync_tick >= 2:
                 _sync_tick = 0
-                my_height = self.blockchain.height()
-                hb_from   = max(0, my_height + 1)   # guard: height=-1 → request from 0
+                my_height = int(self.blockchain.height())
                 with self._lock:
                     connected_peers = [p for p in self.peers.values()
-                                       if p.connected]
-                for p in connected_peers:
+                                       if getattr(p, "connected", False)]
+                selected = None
+                ahead = []
+                for candidate in connected_peers:
                     try:
-                        self._sync_request(
-                            p, hb_from, hb_from + 199,
-                            kind="heartbeat", force=False)
-                    except Exception:
-                        pass
+                        remote_height = int(getattr(candidate, "chain_height", -1))
+                    except (TypeError, ValueError):
+                        remote_height = -1
+                    if remote_height > my_height:
+                        ahead.append((remote_height,
+                                      float(getattr(candidate, "reputation", 0.0)),
+                                      candidate))
+                request_kind = "heartbeat"
+                if ahead:
+                    selected = max(ahead, key=lambda row: (row[0], row[1]))[2]
+                    hb_from = max(0, my_height + 1)
+                elif connected_peers and my_height < 0:
+                    selected = connected_peers[
+                        self._sync_heartbeat_cursor % len(connected_peers)]
+                    self._sync_heartbeat_cursor += 1
+                    hb_from = 0
+                    request_kind = "heartbeat-bootstrap"
+                elif connected_peers:
+                    self._sync_heartbeat_round += 1
+                    if self._sync_heartbeat_round % 10 == 0:
+                        selected = connected_peers[
+                            self._sync_heartbeat_cursor % len(connected_peers)]
+                        self._sync_heartbeat_cursor += 1
+                        if self._has_pruned_local_history():
+                            hb_from = self._recent_full_body_sync_start(my_height)
+                        else:
+                            hb_from = max(0, my_height - 198)
+                        request_kind = "heartbeat-overlap-audit"
+                if selected is not None:
+                    gate = getattr(self, "_auto_sync_gate", None)
+                    gate_acquired = bool(gate and gate.acquire(blocking=False))
+                    if gate is None:
+                        gate_acquired = True
+                    if gate_acquired:
+                        try:
+                            self._sync_request(
+                                selected, hb_from, hb_from + 199,
+                                kind=request_kind, force=False)
+                        except Exception as sync_exc:
+                            log.debug("[SyncHeartbeat] request failed: %s", sync_exc)
+                        finally:
+                            if gate is not None:
+                                gate.release()
+                    else:
+                        log.debug("[SyncHeartbeat] auto-sync coordinator busy; skipping this tick")
 
     def _peer_decay_loop(self):
         while self._running:
@@ -6227,20 +7502,48 @@ class P2PNetwork:
                 while start <= target and peer.connected:
                     end = min(target, start + int(Config.BOOTSTRAP_HEADER_PAGE_SIZE) - 1)
                     req_id = "bootsnap-" + _uuid.uuid4().hex
+                    peer._bootstrap_header_request_id = req_id
+                    msg = None
                     try:
-                        peer.send({
-                            "type": MSG_GET_CHAIN,
-                            "from_idx": start,
-                            "to_idx": end,
-                            "request_id": req_id,
-                        })
-                        msg = header_q.get(timeout=30)
-                    except (_queue_mod.Empty, Exception) as exc:
+                        # A busy seed/server is backpressure, not chain data and
+                        # not evidence of a fork. Retry the same range/request ID
+                        # with a bounded delay and count.
+                        for busy_attempt in range(5):
+                            peer.send({
+                                "type": MSG_GET_CHAIN,
+                                "from_idx": start,
+                                "to_idx": end,
+                                "request_id": req_id,
+                            })
+                            deadline = time.monotonic() + 30.0
+                            while True:
+                                remaining = deadline - time.monotonic()
+                                if remaining <= 0:
+                                    raise _queue_mod.Empty
+                                candidate = header_q.get(timeout=remaining)
+                                if candidate.get("request_id") not in (None, req_id):
+                                    continue
+                                msg = candidate
+                                break
+                            if not msg.get("busy"):
+                                break
+                            if busy_attempt >= 4:
+                                break
+                            try:
+                                delay = max(0.5, min(5.0, float(msg.get("retry_after_ms", 1500)) / 1000.0))
+                            except (TypeError, ValueError):
+                                delay = 1.5
+                            time.sleep(delay)
+                        if msg is None:
+                            raise _queue_mod.Empty
+                    except Exception as exc:
                         log.warning("[BootstrapSync] Header page %d-%d failed: %s",
                                     start, end, exc)
                         failed = True
                         break
-                    if msg.get("type") != MSG_CHAIN:
+                    finally:
+                        peer._bootstrap_header_request_id = None
+                    if msg.get("type") != MSG_CHAIN or msg.get("busy"):
                         failed = True
                         break
                     page = msg.get("blocks") or []
@@ -6360,6 +7663,7 @@ class P2PNetwork:
                 return True
             return False
         finally:
+            peer._bootstrap_header_request_id = None
             peer._bootstrap_header_queue = None
 
     def _fast_sync_legacy(self, peer: 'PeerConnection') -> bool:

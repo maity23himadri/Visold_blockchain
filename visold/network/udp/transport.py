@@ -290,6 +290,15 @@ class UDPPeerConnection:
         self.ip        = ip
         self.port      = port
         self._session  = session
+        self.user_id   = ""
+        self.wallet_addr = ""
+        self.is_seed_node = False
+        self.registered_name = ""
+        self._bootstrap_header_queue = None
+        self._bootstrap_header_request_id = None
+        self._pex_cursor = 0
+        self.chain_height = -1
+        self.chain_tip_hash = ""
         self.reputation  = reputation
         self.fail_count  = 0
         self.last_seen   = time.time()

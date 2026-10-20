@@ -118,6 +118,8 @@ class ICEManager:
         self._puncher      = UDPHolePuncher()   # AUDIT-FIX-23: genuinely shared — see stun_bind()/punch()
         self._relay_bridge: Optional[RelayBridge] = None
         self._relay_proc   = None
+        self._relay_proc_lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
         self._stop_evt     = threading.Event()
         self._ready        = threading.Event()
         self._gather_lock  = threading.Lock()
@@ -129,27 +131,42 @@ class ICEManager:
         if not Config.ICE_ENABLED:
             self._ready.set()
             return
-        t = threading.Thread(target=self._gather_and_init,
-                             daemon=True, name="ice-gather")
-        t.start()
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(
+            target=self._gather_and_init, daemon=True, name="ice-gather")
+        self._thread.start()
 
     def stop(self):
-        """Shutdown ICE — terminate relay subprocess if running."""
+        """Stop ICE, reap its relay child process, and release punch sockets."""
         self._stop_evt.set()
-        if self._relay_proc is not None:
-            try:
-                self._relay_proc.terminate()
-            except Exception:
-                pass
-        # AUDIT-FIX-23: self._puncher's socket can now be long-lived (it's
-        # reused across the STUN query and the actual punch instead of a
-        # fresh throwaway one), so make sure it's actually released here.
+        # Serialize against relay startup so a child cannot appear after this
+        # method has checked for it. Always reap the child after terminate().
+        with self._relay_proc_lock:
+            proc = self._relay_proc
+            self._relay_proc = None
+            if proc is not None:
+                try:
+                    if proc.poll() is None:
+                        proc.terminate()
+                    try:
+                        proc.wait(timeout=2.0)
+                    except Exception:
+                        if proc.poll() is None:
+                            proc.kill()
+                        try:
+                            proc.wait(timeout=2.0)
+                        except Exception as exc:
+                            log.warning("ICE relay process did not reap cleanly: %s", exc)
+                except Exception as exc:
+                    log.debug("ICE relay shutdown: %s", exc)
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+            thread.join(timeout=2.0)
         try:
             self._puncher.close()
         except Exception:
             pass
-
-    # ── Candidate gathering ───────────────────────────────────────────────────
 
     def _gather_and_init(self):
         """Background: gather all ICE candidates then signal ready."""
@@ -246,8 +263,18 @@ class ICEManager:
             # socket.bind() is used to verify availability before committing.
             # The P2P port (node_port / 8338) is never touched.
             found_port = None
+            reserved_ports = {
+                self._node_port,
+                self._node_port + int(Config.RPC_PORT_OFFSET),
+            }
             for offset in range(1, 11):
                 candidate = self._node_port + offset
+                if candidate > 65535:
+                    break
+                # The +1 port is normally JSON-RPC. Never let the asynchronous
+                # ICE relay win a startup race and steal the RPC listener's port.
+                if candidate in reserved_ports:
+                    continue
                 # Use AF_INET6 with IPV6_V6ONLY=0 to probe dual-stack port
                 # availability — same family as the actual relay server socket.
                 try:
@@ -262,7 +289,7 @@ class ICEManager:
                     probe.bind((_probe_bind_any, candidate))  # nosec B104 – port availability probe only
                     found_port = candidate
                     break
-                except OSError:
+                except (OSError, OverflowError, ValueError):
                     log.debug(
                         f"ICE: relay port {candidate} busy — trying next…")
                 finally:
@@ -297,8 +324,12 @@ class ICEManager:
             # Launch the relay subprocess on the confirmed port, bound to the
             # node's local IP so remote peers can reach it without an SSH tunnel.
             try:
-                self._relay_proc = RelayBridge.start_relay_server(
-                    self._relay_port, bind_addr=self._local_ip)
+                # Don't launch a child after node shutdown. The lock serializes
+                # creation with stop(), which will terminate and reap any child.
+                with self._relay_proc_lock:
+                    if not self._stop_evt.is_set():
+                        self._relay_proc = RelayBridge.start_relay_server(
+                            self._relay_port, bind_addr=self._local_ip)
             except Exception as exc:
                 log.debug(f"ICE: relay server start error: {exc}")
 

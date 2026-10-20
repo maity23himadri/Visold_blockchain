@@ -66,12 +66,12 @@ class TLSManager:
     _ctx_client: Optional[ssl.SSLContext] = None
     _fingerprint: Optional[str] = None
     _lock = threading.Lock()
-    # IP-keyed TOFU store: maps peer IP address -> SHA-256 cert fingerprint (hex).
-    # Populated by verify_peer_fingerprint_by_ip() on first contact with each peer
-    # and checked on every subsequent connection.  Complements the peer_id-keyed
-    # store in NodeStorage (get/set_peer_tls_fp) which is populated after the
-    # JSON handshake resolves the node_id.
+    # Endpoint-keyed cache for TLS certificates observed on outbound P2P links.
+    # Keying only by IP was incorrect: multiple Visold nodes can share one IPv6
+    # address while listening on different ports, and each may have its own cert.
+    # Durable identity pinning remains keyed by peer_id in NodeStorage.
     _ip_fp_store: Dict[str, str] = {}
+    _bootstrap_fp_keys = set()
 
     @classmethod
     def ensure_cert(cls) -> bool:
@@ -138,7 +138,9 @@ class TLSManager:
                                 f"[TOFU] Skipping malformed pin for "
                                 f"{ip_or_host!r}: not hex")
                             continue
-                        cls._ip_fp_store[ip_or_host] = norm_fp
+                        pin_key = ip_or_host.strip().lower()
+                        cls._ip_fp_store[pin_key] = norm_fp
+                        cls._bootstrap_fp_keys.add(pin_key)
                 log.info(
                     f"[TOFU] Preloaded {len(pins)} bootstrap "
                     f"fingerprint pin(s) from "
@@ -349,6 +351,51 @@ class TLSManager:
             return False
 
     @classmethod
+    def endpoint_pin_key(cls, ip: str, port: int) -> str:
+        """Canonical key for a remote endpoint, including its listening port."""
+        host = str(ip).strip().lower()
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        if ":" in host:
+            return f"[{host}]:{int(port)}"
+        return f"{host}:{int(port)}"
+
+    @classmethod
+    def bootstrap_fingerprint_for_endpoint(cls, ip: str, port: int) -> Optional[str]:
+        """Return an operator pin for this exact endpoint or legacy IP-only pin.
+
+        Endpoint-form keys (for example ``[2001:db8::1]:8338``) are preferred.
+        Legacy IP-only keys remain supported as strict wildcard pins.
+        """
+        endpoint_key = cls.endpoint_pin_key(ip, port).lower()
+        host_key = str(ip).strip().strip("[]").lower()
+        with cls._lock:
+            if endpoint_key in cls._bootstrap_fp_keys:
+                return cls._ip_fp_store.get(endpoint_key)
+            if host_key in cls._bootstrap_fp_keys:
+                return cls._ip_fp_store.get(host_key)
+        return None
+
+    @classmethod
+    def record_verified_endpoint_fingerprint(cls, ip: str, port: int,
+                                             fingerprint: str) -> Optional[str]:
+        """Record a TLS cert only after its application identity was verified.
+
+        Returns a prior differing endpoint pin, if any.  This cache is diagnostic;
+        the persistent peer-id TLS pin remains the enforcement mechanism.
+        """
+        key = cls.endpoint_pin_key(ip, port).lower()
+        with cls._lock:
+            old = cls._ip_fp_store.get(key)
+            if key in cls._bootstrap_fp_keys:
+                # Operator-provided pins are never overwritten by TOFU.
+                return old if old and not hmac.compare_digest(old, fingerprint) else None
+            cls._ip_fp_store[key] = fingerprint
+            if old and not hmac.compare_digest(old, fingerprint):
+                return old
+        return None
+
+    @classmethod
     def verify_peer_fingerprint_by_ip(cls, ip: str, cert_der: bytes) -> bool:
         """TOFU verification keyed by peer IP address using a raw DER certificate.
 
@@ -360,11 +407,10 @@ class TLSManager:
         wrap_socket() returns, before any application-layer exchange begins.
 
         Behaviour:
-          - First connection from this IP: computes SHA-256 fingerprint, stores
-            it in the class-level _ip_fp_store dict, returns True (Trust On First Use).
-          - Subsequent connections: computes fingerprint and compares with stored
-            value using constant-time hmac.compare_digest().  Returns True on
-            match, False on mismatch (possible cert rotation or MITM attack).
+          - First connection from this IP: computes SHA-256 fingerprint and stores
+            it in the legacy IP-keyed slot.
+          - Subsequent calls for the same IP compare using constant-time
+            hmac.compare_digest().  This API cannot distinguish different ports.
           - cert_der is None or empty: returns False immediately.
           - Any exception during cert parsing: returns False (fail-closed).
 

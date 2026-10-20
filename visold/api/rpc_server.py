@@ -1331,5 +1331,24 @@ class RPCServer:
             log.warning(f"RPC server failed to start: {e}")
 
     def stop(self):
-        if self._server:
-            self._server.shutdown()
+        """Stop the RPC loop, release its bound socket, and join its worker."""
+        server = self._server
+        thread = self._thread
+        if server is None:
+            return
+        try:
+            if thread is not None and thread.is_alive():
+                server.shutdown()
+        except Exception as exc:
+            log.debug("RPC shutdown request: %s", exc)
+        try:
+            server.server_close()
+        except Exception as exc:
+            log.debug("RPC listener close: %s", exc)
+        if thread is not None and thread is not threading.current_thread():
+            try:
+                thread.join(timeout=2.0)
+            except Exception:
+                pass
+        self._server = None
+        self._thread = None

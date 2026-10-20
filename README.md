@@ -48,3 +48,8 @@ The TUI's full-screen frame is buffered and written in one operation; frequently
 changing dashboard rows are still updated incrementally. Actual responsiveness and
 background reliability should be measured on each supported Android device. A
 `tmux` session does not override Android's process-killing or power-management rules.
+
+
+### Seed peer target policy (2026-10-20)
+
+Only a node explicitly enabled with `VISOLD_SEED_NODE=1` or `seed_node: true` uses the unbounded peer-discovery target. Internally its `minimum_peer_target()` is `None`, which means discovery keeps exploring known and PEX-discovered candidates instead of stopping at a numeric peer count. Ordinary nodes retain `MIN_PEERS=3` and `MAX_PEERS=30`. The seed's unbounded target does not guarantee infinite real connections; reachable peers and device/network resources remain finite.

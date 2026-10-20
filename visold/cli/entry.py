@@ -155,4 +155,15 @@ Safety:
         traceback.print_exc()
         sys.exit(1)
     finally:
+        # Ensure menu Exit, SIGINT/SIGTERM, and fatal UI errors all use the same
+        # resource cleanup path. shutdown_node() is intentionally idempotent.
+        try:
+            cli = cli_ref.get("cli")
+            if cli is not None:
+                cli.shutdown_node()
+        except BaseException as _shutdown_exc:
+            try:
+                print(clr(f"Shutdown cleanup warning: {_shutdown_exc}", YELLOW), file=sys.stderr)
+            except Exception:
+                pass
         _restore_terminal()

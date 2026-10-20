@@ -59,6 +59,9 @@ from visold.kernel.events import Event, EventType
 from visold.kernel.logging_setup import _flush_log_queue, log
 from visold.kernel.messages import MSG_CHAIN, MSG_GET_CHAIN
 from visold.kernel.netutil import _format_peer_addr, _parse_peer_addr
+from visold.network.port_settings import (
+    load_saved_port_settings, probe_port_plan, save_port_settings, validate_p2p_port,
+)
 from visold.kernel.notifications import (
     _notify_buf,
     _notify_buf_lock,
@@ -301,6 +304,7 @@ class CLI:
         self.node: Optional[VisoldNode]             = None
         self.user_id: Optional[str]                 = None
         self._running                               = True
+        self._node_shutdown_done                    = False
         # Live-UI concurrency state
         self._ui_lock       = threading.Lock()          # serialises stdout writes
         self._input_pending_bytes = bytearray()          # preserves bytes after pasted multi-line input
@@ -1027,27 +1031,38 @@ class CLI:
         emit(self._live_line("Peers    :",
                              f"{len(connected)} active / {len(peers)} known", W=W))
         emit()
-        emit(f"  {clr('─── Connected Peers ' + '─' * max(0, W - 24), DIM)}")
+        emit(f"  {clr('─── Connected Peers (full endpoint + identity) ' + '─' * max(0, W - 44), DIM)}")
         if not connected:
-            emit(clr("  (no peers connected — use [4] Add Peer)", DIM))
+            emit(clr("  (no peers connected — use [4] Add Peer or [29] Network Directory)", DIM))
         else:
-            # Header row
-            emit(clr(f"  {'Dir':<4}{'Address':<28}{'Ht':>6}  {'Rep':>5}  Status", DIM))
-            for p in connected[:20]:
+            try:
+                dir_rows = n.network.get_network_directory(refresh_sources=False)
+                by_id = {str(row.get("peer_id", "")): row for row in dir_rows}
+            except Exception:
+                by_id = {}
+            for idx, p in enumerate(connected[:8], 1):
                 try:
-                    ip   = getattr(p, "ip", "?")
-                    port = getattr(p, "port", 0)
-                    out  = getattr(p, "outbound", False)
+                    ip = str(getattr(p, "ip", "?"))
+                    port = int(getattr(p, "port", 0) or 0)
+                    out = bool(getattr(p, "local_outbound", getattr(p, "outbound", False)))
                     dir_ = clr("OUT", CYAN) if out else clr("IN ", GREEN)
-                    ht_r = getattr(p, "last_known_height", None) or 0
-                    rep  = int(getattr(p, "reputation", 0))
-                    addr = f"{ip}:{port}"[:26]
-                    emit(f"  {dir_} {addr:<26}{ht_r:>6}  {rep:>5}  {clr('CONNECTED', GREEN)}")
+                    height = int(getattr(p, "chain_height", getattr(p, "last_known_height", -1)) or 0)
+                    rep = int(getattr(p, "reputation", 0))
+                    endpoint = _format_peer_addr(ip, port)
+                    row = by_id.get(str(getattr(p, "peer_id", "")), {})
+                    name = row.get("registered_name") or getattr(p, "registered_name", "") or getattr(p, "user_id", "") or "(no registered name / user ID advertised)"
+                    wallet = getattr(p, "wallet_addr", "") or row.get("wallet_addr", "") or "(not advertised)"
+                    emit(f"  {idx:02d} {dir_} {clr('CONNECTED', GREEN)}  height={height}  rep={rep}")
+                    emit(f"     IP:port : {endpoint}")
+                    emit(f"     Name/ID : {name}")
+                    emit(f"     VSD addr: {wallet}")
                 except Exception:
                     continue
+            if len(connected) > 8:
+                emit(clr(f"  … {len(connected) - 8} additional connected peers; open [29] Network Directory.", DIM))
         emit(f"  {clr('─' * max(10, W - 4), DIM)}")
         emit()
-        emit(clr("  Actions: [4] Add Peer   [2] Sync Chain", DIM))
+        emit(clr("  Actions: [4] Add Peer   [2] Sync Chain   [29] Network Directory", DIM))
 
     # ── Tab 4: Activity (scrollable log) ──────────────────────────────────────
     def _render_tab_activity(self, emit, get_row) -> None:
@@ -1505,6 +1520,8 @@ class CLI:
         # returns here.
         ("26", "L2 Dashboard ▶"),
         ("27", "MEV protection: OFF"),
+        ("28", "Network & Ports"),
+        ("29", "Network-wide Node Directory"),
         ("H",  "Help & Keyboard Tips"),
         ("B",  "Detach UI (keep node running)"),
         ("99", "Diagnose Sync (live trace)"),
@@ -2140,6 +2157,15 @@ class CLI:
         _sec("PRIVACY", YELLOW)
         _row1("27", YELLOW)
         _emit()
+        _sec("NETWORK & PORTS", CYAN)
+        _row1("28", CYAN)
+        _emit()
+        # Keep the directory as its own section, rather than pairing it with
+        # option 28.  This makes Option 29 visible on narrow terminal layouts
+        # and avoids hiding it behind the existing Network & Ports entry.
+        _sec("NETWORK-WIDE NODE DIRECTORY", CYAN)
+        _row1("29", CYAN)
+        _emit()
         _sec("HELP & SESSION", CYAN)
         _row2("H", CYAN, "B", GREEN)
         _emit()
@@ -2203,37 +2229,9 @@ class CLI:
             # Empty Enter in Activity tab = just refresh (no-op here)
             return
 
-        # ── Auto-sync on every dashboard interaction ───────────────────────────
-        # Whenever the user presses Enter (blank), types a menu number, or
-        # returns from any sub-menu, fire a lightweight background chain-sync
-        # request to all connected peers.  This ensures the local chain,
-        # balances, and mempool are always up-to-date before the user reads
-        # any output — without adding any delay to the UI.
-        def _bg_sync():
-            # Incremental sync: only request blocks above our current tip.
-            # Requesting from_idx=1 on every keypress sent the full chain
-            # (500 blocks) every time the user pressed Enter — causing large
-            # message timeouts and artificial peer disconnects.
-            # FIX: request only strictly new blocks (from_idx = my_h + 1)
-            # so this is a lightweight delta-sync, not a full-chain replay.
-            # max(0,...) guards the fresh-node case where height() == -1.
-            # v7.0.0.0: window reduced from 500 → 200 to match server cap.
-            try:
-                net  = self.node.network
-                my_h = self.node.blockchain.height()
-                fi   = max(0, my_h + 1)
-                with net._lock:
-                    peers = [p for p in net.peers.values() if p.connected]
-                for p in peers:
-                    try:
-                        net._sync_request(
-                            p, fi, fi + 199,
-                            kind="manual-dashboard", force=False)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        threading.Thread(target=_bg_sync, daemon=True).start()
+        # Chain sync is driven by role-aware connection bootstrap and a
+        # one-peer heartbeat. Do not issue sync requests for every menu key;
+        # that generated a fan-out request storm on high-peer-count seed nodes.
 
         actions = {
             # Numbers match visual reading order in _print_menu
@@ -2264,6 +2262,8 @@ class CLI:
             "25": self._vvm_inspect,
             "26": self._l2_dashboard,
             "27": self._toggle_mev_protection,
+            "28": self._network_ports,
+            "29": self._network_directory,
             "H":  self._show_tui_help,
             "h":  self._show_tui_help,
             "B":  self._detach_tui,
@@ -2346,6 +2346,7 @@ class CLI:
         print("  • To keep the node running while leaving this screen, use B")
         print("    inside a tmux session, or start with scripts/visold-termux.sh.")
         print("  • Ctrl+C exits through the normal shutdown path; B only detaches.")
+        print("  • Menu option 28 shows listener ports, IP candidates, and next-start port settings.")
 
     def _detach_tui(self):
         """Detach the current tmux client without shutting down the node."""
@@ -2367,6 +2368,252 @@ class CLI:
         except Exception as exc:
             print(clr(f"\n  Could not detach tmux client: {exc}", RED))
             print("  The node has not been intentionally stopped.")
+
+    def _network_ports(self):
+        """Show live network endpoints and safely persist next-start port settings."""
+        print(clr("\n  ── Network & Ports ──", CYAN))
+        node = self.node
+        net = getattr(node, "network", None)
+        ice = getattr(net, "_ice", None) if net is not None else None
+        active_port = int(getattr(net, "port", getattr(node, "port", Config.DEFAULT_PORT)))
+        rpc = getattr(node, "rpc", None)
+        rpc_port = int(getattr(rpc, "rpc_port", active_port + Config.RPC_PORT_OFFSET))
+        relay_port = int(getattr(ice, "_relay_port", active_port + Config.RELAY_PORT_OFFSET))
+
+        tcp_live = False
+        try:
+            tcp_live = bool(getattr(net, "_listen_sock", None))
+            tcp_sock = getattr(net, "_listen_sock", None)
+            if tcp_sock is not None:
+                tcp_address = tcp_sock.getsockname()
+                print(f"  P2P TCP listener : {tcp_address[0]}:{tcp_address[1]} ({'bound' if tcp_live else 'not bound'})")
+            else:
+                print(f"  P2P TCP listener : port {active_port} (status unknown)")
+        except Exception:
+            print(f"  P2P TCP listener : port {active_port} (status unavailable)")
+        try:
+            udp = getattr(net, "_udp", None)
+            udp_sock = getattr(udp, "_sock", None) if udp is not None else None
+            if udp_sock is not None:
+                udp_address = udp_sock.getsockname()
+                print(f"  P2P UDP listener : {udp_address[0]}:{udp_address[1]} (bound)")
+            else:
+                print(f"  P2P UDP listener : port {active_port} (status unknown)")
+        except Exception:
+            print(f"  P2P UDP listener : port {active_port} (status unavailable)")
+
+        rpc_server = getattr(rpc, "_server", None) if rpc is not None else None
+        if rpc_server is not None:
+            try:
+                rpc_addr = rpc_server.server_address
+                print(f"  JSON-RPC         : {rpc_addr[0]}:{rpc_addr[1]} (local-only; {'listening' if rpc_server else 'unknown'})")
+            except Exception:
+                print(f"  JSON-RPC         : localhost:{rpc_port} (server created)")
+        else:
+            print(f"  JSON-RPC         : localhost:{rpc_port} (not listening / failed to bind)")
+
+        relay_proc = getattr(ice, "_relay_proc", None) if ice is not None else None
+        relay_alive = False
+        if relay_proc is not None:
+            try:
+                relay_alive = relay_proc.poll() is None
+            except Exception:
+                relay_alive = True
+        relay_host = getattr(ice, "_local_ip", None) if ice is not None else None
+        print(f"  ICE relay        : {(relay_host or 'local interface')}:{relay_port} ({'process running' if relay_alive else 'not running'})")
+
+        local_ips = []
+        if ice is not None:
+            try:
+                local_ips = list(dict.fromkeys(ice._get_local_ips()))
+            except Exception:
+                local_ips = []
+        print(f"  Local IPs        : {', '.join(local_ips) if local_ips else 'not detected'}")
+
+        public_ip = getattr(ice, "_public_ip", None) if ice is not None else None
+        public_port = getattr(ice, "_public_port", None) if ice is not None else None
+        ready = False
+        if ice is not None:
+            try:
+                ready = bool(ice._ready.is_set())
+            except Exception:
+                pass
+        if public_ip and public_port:
+            print(f"  STUN candidate   : {public_ip}:{public_port} (UDP hole-punch mapping; not proof of inbound reachability)")
+        else:
+            print(f"  STUN candidate   : {'not available' if ready else 'gathering / not available yet'}")
+
+        upnp = getattr(net, "_upnp", None) if net is not None else None
+        mapped = bool(getattr(upnp, "_mapped", False)) if upnp is not None else False
+        wan_ip = None
+        if mapped:
+            # This is an operator-requested info view, so a short gateway query is
+            # acceptable; failure simply leaves the previously-known state shown.
+            try:
+                wan_ip = upnp.external_ip()
+            except Exception:
+                wan_ip = None
+        print(f"  UPnP TCP map     : {'mapped' if mapped else 'not confirmed'}" + (f" (WAN IP: {wan_ip})" if wan_ip else ""))
+        try:
+            peers = len(net.active_peer_count()) if net is not None else 0
+        except Exception:
+            peers = 0
+        print(f"  Connected peers  : {peers}")
+
+        saved_port, saved_mode = load_saved_port_settings()
+        live_mode = str(getattr(Config, "PORT_MODE", "auto")).lower()
+        print(f"  Active P2P port  : {active_port} (the listener currently running)")
+        print(f"  Next-start port  : {saved_port} | mode: {saved_mode.upper()}")
+        # Distinguish persisted next-start settings from the live process mode.
+        # A running node intentionally keeps its original listeners until restart.
+        print(f"  Live startup mode: {live_mode.upper()} (mode loaded by this running process)")
+        if saved_port != active_port or saved_mode != live_mode:
+            print("  Status           : RESTART REQUIRED to apply saved port/mode settings")
+        else:
+            print("  Status           : saved port/mode match this process configuration")
+        print("  Auto mode scans for a free port; Manual mode uses exactly the selected port.")
+        print("  RPC is local-only and uses P2P + 1. ICE relay scans for a free TCP port.")
+        print("  NAT note: UPnP/UDP punching are best-effort, not firewall bypass guarantees.")
+        print("  CGNAT/symmetric NAT may require a reachable public relay server.")
+        print("  Separate local node instances need separate VISOLD_DATA_DIR directories; changing ports alone does not separate their databases or wallets.")
+
+        action = self._read_input("  [1] Change next-start port/mode   [Enter] Return: ").strip().lower()
+        if action not in ("1", "change", "c"):
+            return
+        port_raw = self._read_input(f"  P2P port [current saved {saved_port}]: ").strip()
+        mode_raw = self._read_input(f"  Mode auto/manual [current {saved_mode}]: ").strip().lower()
+        try:
+            new_port = validate_p2p_port(port_raw or saved_port)
+            new_mode = mode_raw or saved_mode
+            if new_mode not in ("auto", "manual"):
+                raise ValueError("Mode must be 'auto' or 'manual'.")
+        except ValueError as exc:
+            print(clr(f"  Not saved: {exc}", RED))
+            return
+
+        own_ports = {active_port, rpc_port, relay_port}
+        blockers, relay_warnings = probe_port_plan(new_port, ignore_current_ports=own_ports)
+        rpc_blocked = any("local JSON-RPC TCP" in item for item in blockers)
+        if new_mode == "manual" and blockers:
+            print(clr("  Manual port plan failed; nothing was saved:", RED))
+            for item in blockers:
+                print(clr(f"    - {item}", RED))
+            if rpc_blocked:
+                print("  Important: the P2P TCP/UDP port may be free, but Visold also requires local JSON-RPC at P2P port + 1.")
+                print("  For example, P2P 8338 requires RPC 127.0.0.1:8339. Free that RPC port or choose a different P2P port.")
+            else:
+                print("  Choose another port, or use Auto mode if scan-to-bind is acceptable.")
+            return
+        if blockers and new_mode == "auto":
+            print(clr("  Note: the preferred P2P/RPC port plan has conflicts; Auto mode will scan for another usable pair at startup.", YELLOW))
+            if rpc_blocked:
+                print("  The P2P port itself may be free; its paired localhost RPC port is not.")
+            for item in blockers:
+                print(f"    - {item}")
+        for item in relay_warnings:
+            print(clr(f"  Note: {item}", YELLOW))
+        try:
+            path = save_port_settings(new_port, new_mode)
+        except (OSError, ValueError) as exc:
+            print(clr(f"  Could not save port settings: {exc}", RED))
+            return
+        print(clr(f"  Saved: P2P port {new_port}, mode {new_mode.upper()}.", GREEN))
+        print(f"  Config file: {path}")
+        print("  This running node remains on its current ports. Exit normally and restart Visold to apply the new settings.")
+        if new_mode == "manual":
+            print("  If the selected port becomes busy before restart, startup will fail clearly instead of silently switching ports.")
+        else:
+            print("  Auto mode may select a nearby free port; check this screen again after restart for the actual port.")
+
+    def _network_directory(self):
+        """Browse/search known PEX/DNS/storage nodes and manually connect to one."""
+        network = self.node.network
+        query = ""
+        page = 0
+        page_size = 15
+        while True:
+            try:
+                all_rows = network.get_network_directory()
+            except Exception as exc:
+                print(clr(f"\n  Could not load network directory: {exc}", RED))
+                return
+            if query:
+                needle = query.casefold()
+                rows = [r for r in all_rows if needle in " ".join(str(r.get(k, "") or "") for k in (
+                    "registered_name", "user_id", "wallet_addr", "ip", "port", "peer_id", "source"
+                )).casefold()]
+            else:
+                rows = list(all_rows)
+            pages = max(1, (len(rows) + page_size - 1) // page_size)
+            page = max(0, min(page, pages - 1))
+            start_idx = page * page_size
+            visible = rows[start_idx:start_idx + page_size]
+            connected_count = sum(1 for r in all_rows if r.get("connected"))
+            print(clr("\n  ── Network-wide Node Directory ──", YELLOW))
+            print(f"  Known locally: {len(all_rows)} | Connected now: {connected_count} | Matching: {len(rows)} | Page {page + 1}/{pages}")
+            print("  Directory entries are learned through live peers, PEX, DNS/bootstrap and the local cache.")
+            print("  PEX is decentralized/eventual: this list cannot guarantee every globally online node is already known.")
+            if query:
+                print(f"  Search: {query}")
+            if not visible:
+                print(clr("  No matching nodes found.", DIM))
+            for offset, row in enumerate(visible, 1):
+                endpoint = _format_peer_addr(str(row.get("ip", "")), int(row.get("port", 0) or 0))
+                state = str(row.get("status", "DISCOVERED"))
+                color = GREEN if state == "CONNECTED" else (CYAN if row.get("verified") else DIM)
+                name = row.get("registered_name") or row.get("user_id") or "(unnamed / no ID advertised)"
+                node_id = str(row.get("peer_id", "") or "")
+                print(clr(f"  [{offset:02d}] {state:<10} {endpoint}", color))
+                print(f"       Name/User ID: {name} | Height: {row.get('chain_height', -1)} | Source: {row.get('source', '?')}")
+                print(f"       VSD address: {row.get('wallet_addr') or '(not advertised)'} | Node ID: {node_id[:20] or '(unknown)'}")
+            action = self._read_input("  Number=connect | s [term]=search | n/p=page | c IP:port=connect | q=back: ").strip()
+            low = action.casefold()
+            if low in {"q", "quit", "exit", "0", ""}:
+                return
+            if low == "n":
+                page = min(pages - 1, page + 1)
+                continue
+            if low == "p":
+                page = max(0, page - 1)
+                continue
+            if low == "s" or low.startswith("s ") or low.startswith("search "):
+                if low == "s":
+                    query = self._read_input("  Search name/user ID/VSD address/IP/port/node ID: ").strip()
+                elif low.startswith("search "):
+                    query = action[7:].strip()
+                else:
+                    query = action[2:].strip()
+                page = 0
+                continue
+            if low.startswith("c ") or low.startswith("connect "):
+                endpoint_text = action.split(" ", 1)[1].strip()
+                try:
+                    ip, port = _parse_peer_addr(endpoint_text)
+                    print(clr(f"  Connecting to {_format_peer_addr(ip, port)}...", YELLOW))
+                    ok, message = self.node.add_peer_manual(ip, port)
+                    print(clr(f"  {message}", GREEN if ok else RED))
+                except Exception as exc:
+                    print(clr(f"  Invalid endpoint: {exc}", RED))
+                continue
+            if action.isdigit():
+                try:
+                    selected_idx = int(action) - 1
+                    row = visible[selected_idx]
+                except (ValueError, IndexError):
+                    print(clr("  Number is not in the current page.", RED))
+                    continue
+                try:
+                    ip = str(row.get("ip", ""))
+                    port = int(row.get("port", 0))
+                    print(clr(f"  Connecting to {_format_peer_addr(ip, port)}...", YELLOW))
+                    ok, message = self.node.add_peer_manual(ip, port)
+                    print(clr(f"  {message}", GREEN if ok else RED))
+                except Exception as exc:
+                    print(clr(f"  Could not connect: {exc}", RED))
+                continue
+            # Convenience: any other text becomes a directory search query.
+            query = action
+            page = 0
 
     def _add_peer(self):
         print(clr("\n  ── Add Peer ──", YELLOW))
@@ -3413,7 +3660,8 @@ class CLI:
         if bal < _min_investor_vsd and (not role or role["role"] == "none"):
             extra.append(
                 f"Accumulate {_min_investor_vsd:.0f} VSD to qualify as an Investor.")
-        if peers < Config.MIN_PEERS:
+        peer_target = n.network.minimum_peer_target()
+        if peer_target is not None and peers < peer_target:
             extra.append("Add more peers to improve network health.")
         if height < 10 and not (role and role["role"] in ("miner","investor")):
             extra.append("Register as a Miner to earn block rewards.")
@@ -4412,13 +4660,32 @@ class CLI:
 
         self._read_input(clr("\n  Press Enter to return to dashboard...", DIM))
 
+    def shutdown_node(self) -> None:
+        """Best-effort, idempotent shutdown used by Exit and process finalizers."""
+        self._stop_refresh_thread()
+        if self._node_shutdown_done:
+            return
+        # Mark first so an exception/signal cannot cause a duplicate teardown.
+        self._node_shutdown_done = True
+        node = self.node
+        if node is not None:
+            try:
+                node.stop()
+            except BaseException as exc:
+                # A failed component must not leave the TUI pretending the node
+                # is still interactive; Node.stop itself attempts every cleanup.
+                try:
+                    log.error("Node shutdown returned an error: %s", exc)
+                except Exception:
+                    pass
+
     def _exit(self):
         # Stop the live refresh thread before tearing down the node so it
         # cannot call into a half-stopped node and raise exceptions.
+        self._running = False
         self._stop_refresh_thread()
         print(clr("\n  Shutting down Visold node...", YELLOW))
-        if self.node:
-            self.node.stop()
+        self.shutdown_node()
         print(clr("  Goodbye!\n", CYAN))
-        self._running = False
-        sys.exit(0)
+        # Let the main loop finish naturally; main()'s finally block calls the
+        # idempotent shutdown hook as a safety net for every exit path.

@@ -78,6 +78,9 @@ class DNSSeeder:
 
     def stop(self):
         self._stop_evt.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+            thread.join(timeout=2.0)
 
     def _run(self):
         # Query immediately on startup, then on the configured interval.

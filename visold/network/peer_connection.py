@@ -57,6 +57,16 @@ class PeerConnection:
         self.ip          = ip
         self.port        = port
         self.sock        = sock
+        # Public reachability metadata learned during authenticated handshake.
+        self.user_id     = ""
+        self.wallet_addr = ""
+        self.is_seed_node = False
+        self.registered_name = ""
+        self._bootstrap_header_queue = None
+        self._bootstrap_header_request_id = None
+        self.chain_height = -1
+        self.chain_tip_hash = ""
+        self._pex_cursor = 0
         self.reputation  = reputation
         self.fail_count  = 0
         self.last_seen   = time.time()
@@ -84,6 +94,7 @@ class PeerConnection:
         self._sync_state_lock = threading.RLock()
         self._sync_request_seq = 0
         self._sync_pending = None
+        self._sync_last_result = None
         self._sync_last_reject_at = 0.0
         # ── Auto-sync dedup flag (sync-fix-4) ────────────────────────────────
         # Prevents two concurrent _auto_sync_on_connect threads from running

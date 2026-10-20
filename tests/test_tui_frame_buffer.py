@@ -28,6 +28,11 @@ def test_menu_can_render_into_a_frame_buffer(monkeypatch):
     assert any("Start Auto Mining" in line for line in lines)
     assert any("Help & Keyboard Tips" in line for line in lines)
     assert any("Detach UI (keep node running)" in line for line in lines)
+    assert any("Network & Ports" in line for line in lines)
+    assert any("[28]" in line for line in lines)
+    assert any("NETWORK-WIDE NODE DIRECTORY" in line for line in lines)
+    assert any("Network-wide Node Directory" in line for line in lines)
+    assert any("29" in line and "Network-wide Node Directory" in line for line in lines)
     # Supplying an emitter must not write directly to process stdout.
     assert lines
 
@@ -104,3 +109,28 @@ def test_background_detach_explains_requirement_outside_tmux(monkeypatch, capsys
     output = capsys.readouterr().out
     assert "requires a tmux session" in output
     assert "visold-termux.sh start" in output
+
+
+def test_option_29_dispatches_to_network_directory(monkeypatch):
+    cli = CLI()
+    cli._running = False  # Prevent the normal post-action Enter pause in a unit test.
+    called = []
+    monkeypatch.setattr(cli, "_network_directory", lambda: called.append(True))
+
+    cli._dispatch("29")
+
+    assert called == [True]
+
+
+def test_option_29_remains_visible_in_narrow_mobile_layout():
+    cli = CLI()
+    cli._layout = {"W": 40, "menu_cols": 1}
+    cli._term_width = lambda: 40
+    lines = []
+
+    cli._print_menu(emit=lines.append)
+
+    joined = "\n".join(lines)
+    assert "NETWORK-WIDE NODE DIRECTORY" in joined
+    assert "Network-wide Node Directory" in joined
+    assert any("Network-wide Node Directory" in line for line in lines)

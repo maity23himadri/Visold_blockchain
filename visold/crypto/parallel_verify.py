@@ -74,6 +74,29 @@ def _get_sig_pool() -> _futures.ProcessPoolExecutor:
     return _SIG_POOL
 
 
+def shutdown_signature_pool(wait: bool = True) -> None:
+    """Stop and reap the optional worker processes during node shutdown.
+
+    ProcessPoolExecutor workers are OS processes rather than daemon threads;
+    relying on interpreter atexit alone can make a Termux session appear busy
+    after the user selects Exit.  Detach the pool under the same lock used by
+    lazy creation, then shut it down outside the lock so no submit/shutdown
+    deadlock is introduced.  Safe to call when the pool was never created.
+    """
+    global _SIG_POOL
+    with _SIG_POOL_LOCK:
+        pool = _SIG_POOL
+        _SIG_POOL = None
+    if pool is None:
+        return
+    try:
+        pool.shutdown(wait=bool(wait), cancel_futures=True)
+    except TypeError:  # compatibility with older Python runtimes
+        pool.shutdown(wait=bool(wait))
+    except Exception as exc:
+        log.warning("SigPool shutdown error: %s", exc)
+
+
 def _par_verify_sig(pub_hex: str, sig_hex: str,
                     signing_bytes: bytes,
                     sender: Optional[str] = None,

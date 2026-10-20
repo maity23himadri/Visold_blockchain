@@ -531,6 +531,10 @@ class Config:
 
     # Network
     DEFAULT_PORT        = 8338
+    # Port selection policy: auto keeps the legacy scan-to-bind behavior; manual
+    # binds exactly the selected P2P port and fails clearly if it cannot be used.
+    PORT_MODE            = os.environ.get("VISOLD_PORT_MODE", "auto").strip().lower()
+    _PORT_SETTINGS_INITIALIZED = False  # persist selected port for this process lifetime
     # ── Outbound Port Enforcement ────────────────────────────────────────────
     # FORCE_OUTBOUND_DEST_PORT = False (fixed default).
     #
@@ -552,7 +556,12 @@ class Config:
     # IPV6_V6ONLY is cleared to 0.  '::1' is the IPv6 loopback address.
     BIND_ADDRESS        = "::"          # replaces 0.0.0.0 — dual-stack
     LOOPBACK_ADDRESS    = "::1"         # replaces 127.0.0.1 for self-checks
-    MAX_PEERS           = 30
+    MAX_PEERS           = 30            # ordinary nodes have a finite peer cap
+    # Only an explicitly designated bootstrap/seed node bypasses MAX_PEERS.
+    # Environment wins over config.json so operators can force either mode.
+    _SEED_NODE_ENV_OVERRIDE = "VISOLD_SEED_NODE" in os.environ
+    SEED_NODE_MODE = os.environ.get("VISOLD_SEED_NODE", "0").strip().lower() in (
+        "1", "true", "yes", "on")
     # SEC-FIX H-03 (Sybil Resistance — Peer Hashcash)
     # ───────────────────────────────────────────────
     # MAJOR-09: hashcash PoW for initial peer connections.
@@ -574,10 +583,11 @@ class Config:
     PEER_POW_DIFFICULTY_ADAPTIVE   = 4    # +bits when burst detected
     PEER_POW_BURST_RATE_PER_MIN    = 30   # connects/min from one /24 (or /48 v6)
                                           # before adaptive boost kicks in
-    MIN_PEERS           = 3    # BUG-FIX: was 15 — caused constant reconnect
-                               # hammering on small networks with only 1-2 real
-                               # peers, producing the CONNECTING→FAILED→CONNECTING
-                               # cycle visible in the dashboard.
+    MIN_PEERS           = 25    # desired peer target for ordinary nodes
+    # ``None`` means the designated seed has an unbounded desired peer target.
+    # It continues exploring known/PEX-discovered peers rather than stopping at
+    # a finite target; this is independent of its unlimited active-peer cap.
+    SEED_MIN_PEERS      = None
     PEER_STORAGE        = 1000
     GOSSIP_TTL          = 8
     PEER_TIMEOUT        = 15           # seconds
@@ -656,12 +666,13 @@ class Config:
     # Operator-pinned bootstrap fingerprints distributed out-of-band (e.g.
     # printed in release notes, signed in a release announcement, or
     # embedded in this file by the network operator).  Format:
-    #     { "ip-or-host": "sha256-cert-fingerprint-hex", ... }
-    # When non-empty, TLSManager preloads these into _ip_fp_store at startup
-    # so the very first TLS connection from a fresh node is authenticated
-    # against the operator's pin instead of TOFU-trusting whatever cert is
-    # presented.  Empty by default — networks that don't ship pins fall back
-    # to plain TOFU exactly as before.
+    #     { "[2001:db8::1]:8338": "sha256-cert-fingerprint-hex", ... }
+    # Exact endpoint keys (IP + listening port) are preferred because multiple
+    # nodes may share one IP but use different ports/certificates.  Legacy
+    # IP-only keys remain supported as strict wildcard pins.  On first contact,
+    # configured pins are checked against the actual TLS certificate and are
+    # never silently overwritten. Empty config uses peer-id TOFU after the
+    # signed application handshake.
     TLS_BOOTSTRAP_FINGERPRINTS: Dict[str, str] = {}
 
     # Transaction
@@ -1141,13 +1152,21 @@ class Config:
 
     @classmethod
     def ensure_dirs(cls):
-        # Allow env-var override for port
-        port_env = os.environ.get("VISOLD_PORT")
-        if port_env:
-            try:
-                cls.DEFAULT_PORT = int(port_env)
-            except ValueError:
-                pass
+        # Load the listen-port policy once per process.  The interactive port
+        # menu saves settings for the next restart; later ensure_dirs() calls
+        # must not silently change a live node's fallback behavior mid-session.
+        if not cls._PORT_SETTINGS_INITIALIZED:
+            port_env = os.environ.get("VISOLD_PORT")
+            if port_env:
+                try:
+                    p_env = int(port_env)
+                    if 1024 <= p_env <= 65533:
+                        cls.DEFAULT_PORT = p_env
+                except (ValueError, TypeError):
+                    pass
+            mode_env = os.environ.get("VISOLD_PORT_MODE", "auto").strip().lower()
+            if mode_env in ("auto", "manual"):
+                cls.PORT_MODE = mode_env
 
         os.makedirs(cls.DATA_DIR, exist_ok=True)
         cls.DB_PATH           = os.path.join(cls.DATA_DIR, "visold.db")
@@ -1172,12 +1191,19 @@ class Config:
                 import logging as _cfglog
                 _cl = _cfglog.getLogger("VISOLD.config")
 
-                if "port" in cfg:
-                    p = int(cfg["port"])
-                    if 1024 <= p <= 65535:
-                        cls.DEFAULT_PORT = p
-                    else:
-                        _cl.warning(f"config.json: port {p} out of range [1024,65535] — ignored")
+                if not cls._PORT_SETTINGS_INITIALIZED:
+                    if "port" in cfg:
+                        p = int(cfg["port"])
+                        if 1024 <= p <= 65533:
+                            cls.DEFAULT_PORT = p
+                        else:
+                            _cl.warning(f"config.json: port {p} out of range [1024,65533] — ignored")
+                    if "port_mode" in cfg:
+                        mode = str(cfg["port_mode"]).strip().lower()
+                        if mode in ("auto", "manual"):
+                            cls.PORT_MODE = mode
+                        else:
+                            _cl.warning("config.json: port_mode must be 'auto' or 'manual' — ignored")
 
                 if "max_peers" in cfg:
                     mp = int(cfg["max_peers"])
@@ -1185,6 +1211,15 @@ class Config:
                         cls.MAX_PEERS = mp
                     else:
                         _cl.warning(f"config.json: max_peers {mp} out of range [5,500] — ignored")
+
+                # A seed role must be explicit. A config-level value is used only
+                # when the operator did not set VISOLD_SEED_NODE in the environment.
+                if (not cls._SEED_NODE_ENV_OVERRIDE and "seed_node" in cfg):
+                    seed_value = cfg.get("seed_node")
+                    if isinstance(seed_value, bool):
+                        cls.SEED_NODE_MODE = seed_value
+                    else:
+                        _cl.warning("config.json: seed_node must be true or false — ignored")
 
                 # F-14 FIX: TLS cannot be disabled via config file (requires code change)
                 if "tls" in cfg and not bool(cfg["tls"]):
@@ -1217,6 +1252,17 @@ class Config:
                 _cfglog2.getLogger("VISOLD.config").warning(
                     f"config.json parse error: {e} — all config.json values ignored")
 
+
+        # Advertise the bootstrap capability only on an explicitly designated
+        # seed node. This is metadata; it does not grant elevated peer capacity
+        # to ordinary nodes that merely list a seed in SEED_PEERS.
+        if cls.SEED_NODE_MODE:
+            cls.NODE_CAPABILITIES = list(dict.fromkeys(
+                list(cls.NODE_CAPABILITIES) + ["bootstrap"]))
+
+        # Freeze selected port/mode for this process. Changes made by the
+        # operator are applied only after a clean restart.
+        cls._PORT_SETTINGS_INITIALIZED = True
 
         # ENV-var peer injection
         env_peers = os.environ.get("VISOLD_PEERS", "")
