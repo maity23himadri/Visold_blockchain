@@ -278,6 +278,11 @@ class P2PNetwork:
         # Plumtree-style: eager set (active) + lazy set (ihave hints)
         self._eager_peers: set = set()   # peer_ids for full gossip
         self._seen_msgs  = LRUCache(4096, ttl=3600)  # BUG-FIX (v7.0.1.0): 1-hour TTL
+        # Block gossip dedup needs an atomic in-flight claim as well as the
+        # completed-message cache.  In a full mesh, two peers can deliver the
+        # same compact block concurrently before either post() stores it.
+        self._block_gossip_lock = threading.Lock()
+        self._block_gossip_inflight: set = set()
         self._id_cache   = LRUCache(Config.LRU_CACHE_SIZE)
         self._server     = None
         self._server_thread: Optional[threading.Thread] = None
@@ -4120,6 +4125,59 @@ class P2PNetwork:
             # after an unexpected failure.
             peer._pagination_active.clear()
 
+    def _claim_block_gossip(self, block_hash: Optional[str]) -> bool:
+        """Atomically claim a block hash before posting/applying it.
+
+        Returns False when an identical block is already accepted or currently
+        being processed.  Missing hashes are left to normal block validation;
+        they are not cacheable gossip identities.
+        """
+        if not isinstance(block_hash, str) or not block_hash:
+            return True
+        lock = getattr(self, "_block_gossip_lock", None)
+        if lock is None:  # compatibility for lightweight test/pre-init objects
+            lock = threading.Lock()
+            self._block_gossip_lock = lock
+        inflight = getattr(self, "_block_gossip_inflight", None)
+        if inflight is None:
+            inflight = set()
+            self._block_gossip_inflight = inflight
+        with lock:
+            if self._seen_msgs.get(("BLOCK", block_hash)):
+                return False
+            if block_hash in inflight:
+                return False
+            inflight.add(block_hash)
+            return True
+
+    def _finish_block_gossip(self, block_hash: Optional[str], accepted: bool) -> None:
+        """Release an in-flight block claim; cache only after queue/apply success."""
+        if not isinstance(block_hash, str) or not block_hash:
+            return
+        lock = getattr(self, "_block_gossip_lock", None)
+        inflight = getattr(self, "_block_gossip_inflight", None)
+        if lock is None or inflight is None:
+            # Lightweight compatibility path; normal P2PNetwork instances have
+            # both initialized in __init__.
+            if accepted:
+                self._seen_msgs.put(("BLOCK", block_hash), True)
+            return
+        with lock:
+            inflight.discard(block_hash)
+            if accepted:
+                self._seen_msgs.put(("BLOCK", block_hash), True)
+
+    def _mark_block_gossip_seen(self, block_hash: Optional[str]) -> None:
+        """Mark an already-canonical locally broadcast block as seen."""
+        if not isinstance(block_hash, str) or not block_hash:
+            return
+        lock = getattr(self, "_block_gossip_lock", None)
+        if lock is None:
+            self._seen_msgs.put(("BLOCK", block_hash), True)
+            return
+        with lock:
+            self._seen_msgs.put(("BLOCK", block_hash), True)
+
     def _handle_message(self, peer: PeerConnection, msg: dict):
         mtype = msg.get("type", "")
 
@@ -4168,7 +4226,9 @@ class P2PNetwork:
             MSG_CHUNK_MANIFEST,
             MSG_GET_CHUNK,
             MSG_CHUNK_DATA,
-            MSG_CMPCTBLOCK,
+            # MSG_CMPCTBLOCK is block gossip and MUST pass through the
+            # canonical block-hash dedup branch below.  Skipping it causes
+            # every mesh peer to re-relay the same block indefinitely.
             MSG_GETBLOCKTXN,
             MSG_BLOCKTXN,
             # Your new Parallel Downloader messages:
@@ -4695,11 +4755,17 @@ class P2PNetwork:
             # (or after the test-fallback apply_block succeeds).  If post()
             # refuses, we log loudly and leave the dedup cache empty so the
             # next gossip copy from another peer gets a fresh attempt.
+            _bh = None
+            _block_claimed = False
             try:
                 block_data = msg.get("block")
                 if block_data:
                     _bh = (block_data.get("block_hash")
                            if isinstance(block_data, dict) else None)
+                    if _bh:
+                        _block_claimed = self._claim_block_gossip(_bh)
+                        if not _block_claimed:
+                            return
                     if self._state_engine is not None:
                         evt = Event(
                             EventType.NEW_BLOCK,
@@ -4708,11 +4774,13 @@ class P2PNetwork:
                         )
                         accepted = self._state_engine.post(evt, timeout=5.0)
                         if accepted:
-                            # Block is now in the StateEngine queue —
-                            # safe to dedup further re-gossip copies.
-                            if _bh:
-                                self._seen_msgs.put(("BLOCK", _bh), True)
+                            # Reserve atomically across concurrent mesh deliveries;
+                            # completed queue admission makes later copies redundant.
+                            self._finish_block_gossip(_bh, True)
+                            _block_claimed = False
                         else:
+                            self._finish_block_gossip(_bh, False)
+                            _block_claimed = False
                             log.warning(
                                 f"[INBOUND-DROP] MSG_BLOCK from "
                                 f"{peer.peer_id[:12]} REFUSED by StateEngine "
@@ -4722,11 +4790,11 @@ class P2PNetwork:
                         # Fallback for tests / pre-engine startup.
                         block = Block.from_dict(block_data)
                         ok, reason = self.blockchain.apply_block(block)
+                        self._finish_block_gossip(_bh, bool(ok))
+                        _block_claimed = False
                         if ok:
                             self._mark_peer_height_verified(peer.peer_id, [block])
                             log.info(f"Accepted block #{block.index} from {peer.peer_id[:12]}")
-                            if _bh:
-                                self._seen_msgs.put(("BLOCK", _bh), True)
                             # ── LIVE-UI: push instant block notification ──────────
                             _push_block_notif(block.index, block.miner_address, source="network")
                             self._gossip(msg, exclude=peer.peer_id)
@@ -4736,6 +4804,9 @@ class P2PNetwork:
                                 self._broadcast_invalid_alert(peer.peer_id)
             except Exception as e:
                 log.debug(f"Block parse error: {e}")
+            finally:
+                if _block_claimed:
+                    self._finish_block_gossip(_bh, False)
 
         # ═══════════════════════════════════════════════════════════════════
         # v7.5.0 COMPACT-BLOCK PROTOCOL
@@ -4806,6 +4877,8 @@ class P2PNetwork:
                 q.put(msg)
         
         elif mtype == MSG_CMPCTBLOCK:
+            _cbh = ""
+            _cmpct_claimed = False
             # ── Receiver logic ─────────────────────────────────────────────
             # 1. Extract header + short_ids from the wire message.
             # 2. Try to match every short_id against our in-memory mempool.
@@ -4901,6 +4974,13 @@ class P2PNetwork:
                         log.debug(f"[CMPCT] Reconstruction error (fast path): {_re_err}")
                         return
 
+                    # Claim only after reconstruction + merkle verification.  This
+                    # atomically suppresses concurrent copies arriving via several
+                    # mesh neighbours without poisoning retries on reconstruction failure.
+                    if not self._claim_block_gossip(_cbh):
+                        return
+                    _cmpct_claimed = bool(_cbh)
+
                     # ── Post to StateEngine (deferred dedup put) ───────────
                     if self._state_engine is not None:
                         _evt = Event(
@@ -4910,7 +4990,8 @@ class P2PNetwork:
                         )
                         _accepted = self._state_engine.post(_evt, timeout=5.0)
                         if _accepted:
-                            self._seen_msgs.put(("BLOCK", _cbh), True)
+                            self._finish_block_gossip(_cbh, True)
+                            _cmpct_claimed = False
                             log.debug(
                                 f"[CMPCT] Fast-path block #{_hdr.get('index')} "
                                 f"from {peer.peer_id[:12]} posted to StateEngine"
@@ -4925,9 +5006,10 @@ class P2PNetwork:
                         try:
                             _blk = Block.from_dict(_block_dict)
                             _ok, _reason = self.blockchain.apply_block(_blk)
+                            self._finish_block_gossip(_cbh, bool(_ok))
+                            _cmpct_claimed = False
                             if _ok:
                                 self._mark_peer_height_verified(peer.peer_id, [_blk])
-                                self._seen_msgs.put(("BLOCK", _cbh), True)
                                 _push_block_notif(_blk.index, _blk.miner_address, source="network")
                                 self._gossip(msg, exclude=peer.peer_id)
                             else:
@@ -4970,6 +5052,9 @@ class P2PNetwork:
 
             except Exception as _cmpct_err:
                 log.debug(f"[CMPCT] MSG_CMPCTBLOCK handler error: {_cmpct_err}", exc_info=True)
+            finally:
+                if _cmpct_claimed:
+                    self._finish_block_gossip(_cbh, False)
 
         elif mtype == MSG_GETBLOCKTXN:
             # ── Sender services a missing-tx request ───────────────────────
@@ -5061,6 +5146,8 @@ class P2PNetwork:
                 log.debug(f"[CMPCT] MSG_GETBLOCKTXN handler error: {_gbt_err}", exc_info=True)
 
         elif mtype == MSG_BLOCKTXN:
+            _fill_bh = ""
+            _bktxn_claimed = False
             # ── Receiver fills in missing transactions and finalises block ──
             # The sender replies with:
             #   { "type": "BLOCKTXN",
@@ -5162,6 +5249,12 @@ class P2PNetwork:
                 with self._compact_stash_lock:
                     self._compact_stash.pop(_fill_bh, None)
 
+                # Claim immediately before processing so simultaneous completed
+                # replies/copies cannot enqueue the same canonical block twice.
+                if not self._claim_block_gossip(_fill_bh):
+                    return
+                _bktxn_claimed = True
+
                 # ── Post to StateEngine ────────────────────────────────────
                 if self._state_engine is not None:
                     _evt = Event(
@@ -5171,7 +5264,8 @@ class P2PNetwork:
                     )
                     _accepted = self._state_engine.post(_evt, timeout=5.0)
                     if _accepted:
-                        self._seen_msgs.put(("BLOCK", _fill_bh), True)
+                        self._finish_block_gossip(_fill_bh, True)
+                        _bktxn_claimed = False
                         log.debug(
                             f"[CMPCT] Slow-path block #{_hdr.get('index')} "
                             f"from {peer.peer_id[:12]} posted to StateEngine "
@@ -5187,8 +5281,9 @@ class P2PNetwork:
                     try:
                         _blk = Block.from_dict(_block_dict)
                         _ok, _reason = self.blockchain.apply_block(_blk)
+                        self._finish_block_gossip(_fill_bh, bool(_ok))
+                        _bktxn_claimed = False
                         if _ok:
-                            self._seen_msgs.put(("BLOCK", _fill_bh), True)
                             _push_block_notif(_blk.index, _blk.miner_address, source="network")
                         else:
                             log.debug(f"[CMPCT] BLOCKTXN pre-engine apply rejected: {_reason}")
@@ -5197,6 +5292,9 @@ class P2PNetwork:
 
             except Exception as _bktxn_err:
                 log.debug(f"[CMPCT] MSG_BLOCKTXN handler error: {_bktxn_err}", exc_info=True)
+            finally:
+                if _bktxn_claimed:
+                    self._finish_block_gossip(_fill_bh, False)
 
         elif mtype == MSG_GET_BLOCK:
             _req_idx = msg.get("index")
@@ -6613,6 +6711,10 @@ class P2PNetwork:
             "short_ids": short_ids,      # list[str], one per non-CB tx
             "ttl":       Config.GOSSIP_TTL,
         }
+        # Locally mined or already-accepted canonical blocks are their own
+        # gossip origin.  Remember the hash immediately before fan-out so a
+        # copy returning through a mesh cycle cannot be re-queued at the origin.
+        self._mark_block_gossip_seen(getattr(block, "block_hash", None))
         self._gossip(msg, exclude=exclude)
 
     def broadcast_genesis(self):
