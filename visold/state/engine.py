@@ -348,7 +348,17 @@ class StateEngine:
             return self._handle_new_tx(pl, event.source_peer_id)
 
         elif et == EventType.NEW_BLOCK:
-            return self._handle_new_block(pl, event.source_peer_id)
+            ok, reason = self._handle_new_block(pl, event.source_peer_id)
+            if ok and self._network is not None and event.source_peer_id:
+                try:
+                    # The helper checks that the incoming hash is the hash
+                    # currently stored at this canonical height; mere queueing
+                    # or a remote index is never considered verified progress.
+                    self._network._mark_peer_height_verified(
+                        event.source_peer_id, [pl.get("block")])
+                except Exception:
+                    pass
+            return ok, reason
 
         elif et == EventType.MINE_RESULT:
             return self._handle_mine_result(pl)

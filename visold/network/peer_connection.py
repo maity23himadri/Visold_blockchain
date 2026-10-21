@@ -64,7 +64,12 @@ class PeerConnection:
         self.registered_name = ""
         self._bootstrap_header_queue = None
         self._bootstrap_header_request_id = None
-        self.chain_height = -1
+        # Peer-reported height is an untrusted advertisement used only for
+        # sync discovery.  It must never be treated as validated chain progress.
+        self.chain_height = -1  # backward-compatible alias: advertised height
+        self.advertised_chain_height = -1
+        self.verified_chain_height = -1  # advanced only after canonical block verification
+        self.verified_chain_hash = ""
         self.chain_tip_hash = ""
         self._pex_cursor = 0
         self.reputation  = reputation
@@ -111,14 +116,10 @@ class PeerConnection:
         self._fork_sync_buffer_bytes: int = 0
         self._fork_sync_target_height: int = -1
 
-        # ── v7.6.0 Peer chain-height & capability cache ──────────────────────
-        # Populated from MSG_HELLO, MSG_ACCEPT, and MSG_BLOCK / MSG_CMPCTBLOCK.
-        # MiningSafetyGuard's best_peer_height_fn reads this to decide whether
-        # the local node is sufficiently synced to start mining.  -1 means
-        # "unknown" (peer hasn't told us yet); the safety guard treats that
-        # as not-behind so a brand-new connection cannot deadlock mining.
-        self.chain_height: int           = -1
-        self.capabilities: List[str]     = []
+        # Chain-height fields are initialized above. `chain_height` is only
+        # the compatibility alias for the advertised sync target; mining safety
+        # and PEX use independently verified progress, never this value.
+        self.capabilities: List[str] = []
 
         # ── Prioritized outbound queue (v7.1.0) ──────────────────────────────
         # Without this, all send() calls are synchronous and serialized — a

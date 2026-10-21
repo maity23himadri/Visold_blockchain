@@ -645,6 +645,7 @@ class P2PNetwork:
             final_peer.wallet_addr = peer_wallet_addr
             final_peer.is_seed_node = peer_is_seed_node
             final_peer.chain_height = peer_chain_height
+            final_peer.advertised_chain_height = peer_chain_height
             final_peer.chain_tip_hash = peer_chain_tip_hash
             # Register capabilities
             if peer_hello_caps and hasattr(self, "_capability_router"):
@@ -826,6 +827,7 @@ class P2PNetwork:
             final_peer.wallet_addr = remote_wallet_addr
             final_peer.is_seed_node = remote_is_seed_node
             final_peer.chain_height = accept_chain_height
+            final_peer.advertised_chain_height = accept_chain_height
             final_peer.chain_tip_hash = accept_chain_tip_hash
 
             if remote_caps and hasattr(self, "_capability_router"):
@@ -1623,6 +1625,7 @@ class P2PNetwork:
             peer.wallet_addr = peer_wallet_addr
             peer.is_seed_node = peer_is_seed_node
             peer.chain_height = peer_chain_height
+            peer.advertised_chain_height = peer_chain_height
             peer.chain_tip_hash = peer_chain_tip_hash
             # BUG-FIX (v7.0.0.1): Transfer any bytes already buffered by
             # recv_line() during the handshake into the new peer object.
@@ -1949,6 +1952,7 @@ class P2PNetwork:
             peer.wallet_addr = remote_wallet_addr
             peer.is_seed_node = remote_is_seed_node
             peer.chain_height = accept_chain_height
+            peer.advertised_chain_height = accept_chain_height
             peer.chain_tip_hash = accept_chain_tip_hash
             # BUG-FIX (v7.0.0.1): Same _recv_buf transfer as the inbound path.
             # recv_line() was called multiple times during the outbound handshake
@@ -1992,6 +1996,7 @@ class P2PNetwork:
                     peer.capabilities = list(accept_caps)
                 if accept_chain_height >= 0:
                     peer.chain_height = int(accept_chain_height)
+                    peer.advertised_chain_height = int(accept_chain_height)
             except Exception:
                 pass
 
@@ -2332,6 +2337,72 @@ class P2PNetwork:
                     current["accepted"] = False
         return sent
 
+    def _current_verified_peer_height(self, peer) -> int:
+        """Return verified peer progress only while its proof hash remains canonical.
+
+        A reorganization can invalidate a previously verified tip. Recheck the
+        stored proof hash when mining safety reads the height, so old-branch
+        evidence cannot keep the sync gate pinned after a reorg.
+        """
+        try:
+            height = int(getattr(peer, "verified_chain_height", -1))
+            proof_hash = str(getattr(peer, "verified_chain_hash", "") or "")
+            if height < 0 or not proof_hash:
+                return -1
+            canonical = self.storage.get_block(height)
+            canonical_hash = str(getattr(canonical, "block_hash", "") or "") if canonical else ""
+            if canonical_hash != proof_hash:
+                peer.verified_chain_height = -1
+                peer.verified_chain_hash = ""
+                return -1
+            return height
+        except Exception:
+            return -1
+
+    def _mark_peer_height_verified(self, peer_id: str, blocks) -> int:
+        """Advance a peer's verified height only for blocks matching our canonical DB.
+
+        A successful queue post, handshake, block index, or remote server_height
+        is not proof. The local canonical hash must match the supplied block at
+        that index. Prior proof is discarded if a reorg made its hash noncanonical.
+        Returns the highest matching index in this input, or -1 when none match.
+        """
+        if not peer_id or not blocks:
+            return -1
+        try:
+            with self._lock:
+                peer = self.peers.get(peer_id)
+            if peer is None:
+                return -1
+            previous = self._current_verified_peer_height(peer)
+            highest = -1
+            highest_hash = ""
+            for candidate in blocks:
+                try:
+                    if isinstance(candidate, dict):
+                        idx = candidate.get("index", -1)
+                        candidate_hash = str(candidate.get("block_hash", "") or "")
+                    else:
+                        idx = getattr(candidate, "index", -1)
+                        candidate_hash = str(getattr(candidate, "block_hash", "") or "")
+                    if not isinstance(idx, int) or idx < 0 or not candidate_hash:
+                        continue
+                    canonical = self.storage.get_block(idx)
+                    if canonical is None:
+                        continue
+                    canonical_hash = str(getattr(canonical, "block_hash", "") or "")
+                    if canonical_hash and canonical_hash == candidate_hash and idx > highest:
+                        highest = idx
+                        highest_hash = canonical_hash
+                except Exception:
+                    continue
+            if highest > previous:
+                peer.verified_chain_height = highest
+                peer.verified_chain_hash = highest_hash
+            return highest
+        except Exception:
+            return -1
+
     def _remember_node_info(self, info: dict, *, verified: bool = False,
                             source: str = "pex") -> Optional[dict]:
         """Remember a discovered endpoint for the operator's network directory.
@@ -2375,6 +2446,13 @@ class P2PNetwork:
             chain_height = int(info.get("chain_height", -1))
         except (TypeError, ValueError, OverflowError):
             chain_height = -1
+        # Only local, direct-session callers may supply this internal field;
+        # untrusted PEX/DHT/storage entries never get to assert verified progress.
+        try:
+            verified_chain_height = (int(info.get("verified_chain_height", -1))
+                                     if verified else -1)
+        except (TypeError, ValueError, OverflowError):
+            verified_chain_height = -1
         key = peer_id or f"endpoint:{ip.casefold()}:{port}"
         now = time.time()
         registered_name = ""
@@ -2424,6 +2502,7 @@ class P2PNetwork:
             "registered_name": registered_name,
             "wallet_addr": wallet_addr,
             "chain_height": chain_height,
+            "verified_chain_height": verified_chain_height,
             "seed_node": is_seed_node,
             "verified": bool(verified),
             "source": "handshake" if verified else str(source or "pex")[:24],
@@ -2450,11 +2529,21 @@ class P2PNetwork:
                     item["wallet_addr"] = prior.get("wallet_addr", wallet_addr)
                     item["chain_height"] = max(
                         int(prior.get("chain_height", -1)), chain_height)
+                    item["verified_chain_height"] = max(
+                        int(prior.get("verified_chain_height", -1)),
+                        verified_chain_height)
                     item["verified"] = True
                     item["source"] = prior.get("source", "handshake")
                     item["last_seen"] = float(prior.get("last_seen", now))
                 else:
                     item["verified"] = bool(verified or prior.get("verified"))
+                    if prior.get("verified") and not verified:
+                        item["verified_chain_height"] = int(
+                            prior.get("verified_chain_height", -1))
+                    elif verified:
+                        item["verified_chain_height"] = max(
+                            int(prior.get("verified_chain_height", -1)) if prior else -1,
+                            verified_chain_height)
                     if item["verified"] and prior.get("registered_name") and not item["registered_name"]:
                         item["registered_name"] = prior["registered_name"]
                     if item["verified"] and not wallet_addr:
@@ -2494,7 +2583,9 @@ class P2PNetwork:
                 "user_id": getattr(peer, "user_id", ""),
                 "wallet_addr": getattr(peer, "wallet_addr", ""),
                 "registered_name": getattr(peer, "registered_name", ""),
-                "chain_height": getattr(peer, "chain_height", -1),
+                "chain_height": getattr(peer, "advertised_chain_height",
+                                         getattr(peer, "chain_height", -1)),
+                "verified_chain_height": getattr(peer, "verified_chain_height", -1),
                 "seed_node": getattr(peer, "is_seed_node", False),
             }, verified=True, source="handshake")
 
@@ -2569,7 +2660,10 @@ class P2PNetwork:
             "user_id": str(r.get("user_id", "")),
             "registered_name": str(r.get("registered_name", "")),
             "wallet_addr": str(r.get("wallet_addr", "")),
-            "chain_height": int(r.get("chain_height", -1)),
+            # A PEX relay cannot attest to another node's chain tip. Do not
+            # propagate third-party height claims; the recipient will obtain
+            # an advertisement directly from that peer's authenticated session.
+            "chain_height": -1,
             "seed_node": r.get("seed_node") is True,
         } for r in page]
         next_cursor = cursor + len(page) if cursor + len(page) < total else None
@@ -2601,7 +2695,8 @@ class P2PNetwork:
         """Choose one canonical side for initial sync; seed avoids equal/lower peers."""
         try:
             local_height = int(self.blockchain.height())
-            remote_height = int(getattr(peer, "chain_height", -1))
+            remote_height = int(getattr(peer, "advertised_chain_height",
+                                         getattr(peer, "chain_height", -1)))
         except Exception:
             return not self._is_seed_node_mode()
         if local_height >= 0 and remote_height == local_height:
@@ -2749,7 +2844,9 @@ class P2PNetwork:
         info = {"peer_id": peer_id, "ip": peer.ip, "port": peer.port,
                 "pub_hex": pub_hex, "user_id": user_id,
                 "wallet_addr": str(wallet_addr or getattr(peer, "wallet_addr", "") or ""),
-                "chain_height": int(getattr(peer, "chain_height", -1)),
+                "chain_height": int(getattr(peer, "advertised_chain_height",
+                                             getattr(peer, "chain_height", -1))),
+                "verified_chain_height": int(getattr(peer, "verified_chain_height", -1)),
                 "registered_name": ""}
         self.router.update(peer_id, info)
         self.storage.save_peer(peer_id, peer.ip, peer.port)
@@ -2997,7 +3094,8 @@ class P2PNetwork:
                                     and _last_result.get("request_id") == _sync_request_id
                                     and _last_result.get("ok") is True
                                     and not _last_result.get("needs_next_page", False)
-                                    and int(getattr(p, "chain_height", -1)) <= int(new_h)):
+                                    and int(getattr(p, "advertised_chain_height",
+                                                    getattr(p, "chain_height", -1))) <= int(new_h)):
                                 if _last_result.get("reason") == "Already have all these blocks":
                                     log.info(
                                         f"[AutoSync] Recent canonical overlap matched peer "
@@ -3738,6 +3836,8 @@ class P2PNetwork:
             except Exception:
                 pass
             if ok:
+                # Credit only block indexes whose hashes match our canonical DB.
+                self._mark_peer_height_verified(peer.peer_id, blocks)
                 self._sync_finish(peer, request_id)
                 if str(reason) == "Already have all these blocks":
                     log.info(
@@ -4422,15 +4522,8 @@ class P2PNetwork:
                 dialed += 1
 
         elif mtype == MSG_TX:
-            try:
-                if msg.get("server_height") is not None:
-                    peer.chain_height = int(msg.get("server_height", peer.chain_height))
-                _server_tip = str(msg.get("server_tip_hash", "") or "").strip().lower()
-                if len(_server_tip) == 64 and all(c in "0123456789abcdef" for c in _server_tip):
-                    peer.chain_tip_hash = _server_tip
-            except (TypeError, ValueError):
-                pass
-
+            # Transaction gossip is not an authenticated chain-tip statement.
+            # Ignore any incidental server_height/server_tip_hash fields here.
             # ── Route through StateEngine (single-writer) ─────────────────────
             # The network I/O thread posts a NEW_TX event and does NOT call
             # mempool.add() directly.  This prevents race conditions between
@@ -4585,20 +4678,9 @@ class P2PNetwork:
                 log.debug(f"[RateAudit-MSG] handler error: {exc}")
 
         elif mtype == MSG_BLOCK:
-            # ── v7.6.0 Track peer's chain_height from received blocks ─────
-            # Every inbound block tells us the peer is at least at height
-            # block.index.  This gives the MiningSafetyGuard a fresh view
-            # without a separate query message.  We only ratchet upward —
-            # never lower — so a peer can't fool us into thinking it has
-            # regressed.
-            try:
-                _b_data = msg.get("block")
-                if isinstance(_b_data, dict):
-                    _b_idx = _b_data.get("index", -1)
-                    if isinstance(_b_idx, int) and _b_idx > peer.chain_height:
-                        peer.chain_height = _b_idx
-            except Exception:
-                pass
+            # Do not update peer height from an unvalidated block payload.
+            # The block is queued below; validated peer progress is recorded
+            # only after StateEngine confirms the block is canonical.
             # ── Route through StateEngine (single-writer) ─────────────────────
             # v7.1.8 BUG-FIX (Bug 4 + Bug 5):
             #   • The pre-fix code IGNORED the return value of
@@ -4641,6 +4723,7 @@ class P2PNetwork:
                         block = Block.from_dict(block_data)
                         ok, reason = self.blockchain.apply_block(block)
                         if ok:
+                            self._mark_peer_height_verified(peer.peer_id, [block])
                             log.info(f"Accepted block #{block.index} from {peer.peer_id[:12]}")
                             if _bh:
                                 self._seen_msgs.put(("BLOCK", _bh), True)
@@ -4738,14 +4821,8 @@ class P2PNetwork:
                 _hdr       = msg.get("header", {})
                 _short_ids = msg.get("short_ids", [])
                 _cbh       = _hdr.get("block_hash", "") if isinstance(_hdr, dict) else ""
-                # ── v7.6.0 Track peer's chain_height from compact block hdr ─
-                try:
-                    if isinstance(_hdr, dict):
-                        _ci = _hdr.get("index", -1)
-                        if isinstance(_ci, int) and _ci > peer.chain_height:
-                            peer.chain_height = _ci
-                except Exception:
-                    pass
+                # Header index is untrusted until the reconstructed block is
+                # accepted by the canonical validation/application path.
                 # CMPCT-COINBASE FIX: extract the attached coinbase once here
                 # so both fast-path and BLOCKTXN-slow-path reconstruction use
                 # the same validated value.  The coinbase is REQUIRED because
@@ -4849,6 +4926,7 @@ class P2PNetwork:
                             _blk = Block.from_dict(_block_dict)
                             _ok, _reason = self.blockchain.apply_block(_blk)
                             if _ok:
+                                self._mark_peer_height_verified(peer.peer_id, [_blk])
                                 self._seen_msgs.put(("BLOCK", _cbh), True)
                                 _push_block_notif(_blk.index, _blk.miner_address, source="network")
                                 self._gossip(msg, exclude=peer.peer_id)
@@ -5294,25 +5372,9 @@ class P2PNetwork:
                 peer._pagination_active.clear()
                 return   # correlated empty response
 
-            # ── v7.6.0 Track peer's chain_height from received blocks ─────
-            # Update peer.chain_height to the highest index in this batch
-            # plus, if the response includes a server_height field, use
-            # that as the canonical max (it is the peer's actual tip).
-            try:
-                _server_height = msg.get("server_height", -1)
-                if isinstance(_server_height, int) and _server_height > peer.chain_height:
-                    peer.chain_height = _server_height
-                else:
-                    _max_idx = peer.chain_height
-                    for _b in blocks_data:
-                        if isinstance(_b, dict):
-                            _bi = _b.get("index", -1)
-                            if isinstance(_bi, int) and _bi > _max_idx:
-                                _max_idx = _bi
-                    if _max_idx > peer.chain_height:
-                        peer.chain_height = _max_idx
-            except Exception:
-                pass
+            # Keep server_height / received indexes local to this response for
+            # pagination only. Do not persist them as peer progress until the
+            # block batch is accepted and canonical hashes have been checked.
 
             # ── Capture pagination state before spawning apply thread ─────────
             _rcvd = len(blocks_data)
@@ -6751,7 +6813,8 @@ class P2PNetwork:
                 ahead = []
                 for candidate in connected_peers:
                     try:
-                        remote_height = int(getattr(candidate, "chain_height", -1))
+                        remote_height = int(getattr(candidate, "advertised_chain_height",
+                                                     getattr(candidate, "chain_height", -1)))
                     except (TypeError, ValueError):
                         remote_height = -1
                     if remote_height > my_height:

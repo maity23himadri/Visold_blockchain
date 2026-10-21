@@ -297,7 +297,12 @@ class UDPPeerConnection:
         self._bootstrap_header_queue = None
         self._bootstrap_header_request_id = None
         self._pex_cursor = 0
-        self.chain_height = -1
+        # Peer-reported height is an untrusted advertisement used only for
+        # sync discovery; validated progress is tracked separately.
+        self.chain_height = -1  # backward-compatible alias: advertised height
+        self.advertised_chain_height = -1
+        self.verified_chain_height = -1
+        self.verified_chain_hash = ""
         self.chain_tip_hash = ""
         self.reputation  = reputation
         self.fail_count  = 0
@@ -340,8 +345,8 @@ class UDPPeerConnection:
         self._fork_sync_buffer_bytes: int = 0
         self._fork_sync_target_height: int = -1
 
-        # Peer-advertised state used by sync/mining-safety code.
-        self.chain_height: int = -1
+        # Chain-height fields are initialized above; `chain_height` is only
+        # the peer-advertised sync target, never verified mining-safety input.
         self.capabilities: list = []
 
         # Priority queue shim — UDPPeerConnection does its own flow control

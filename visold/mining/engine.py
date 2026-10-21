@@ -52,6 +52,33 @@ if TYPE_CHECKING:  # annotation-only references (no runtime import, no cycle)
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 14: AUTO MINING ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
+def _best_verified_peer_height(network) -> int:
+    """Return the highest locally verified connected-peer height.
+
+    HELLO/ACCEPT, block indexes, compact headers and PEX records are claims,
+    not chain validation.  A missing verified height is deliberately treated
+    as unknown (-1), so untrusted large integers cannot lock the mining gate.
+    """
+    try:
+        if network is None or not getattr(network, "peers", None):
+            return -1
+        heights = []
+        for peer in list(network.peers.values()):
+            if getattr(peer, "connected", True) is False:
+                continue
+            try:
+                get_current = getattr(network, "_current_verified_peer_height", None)
+                height = (int(get_current(peer)) if callable(get_current)
+                          else int(getattr(peer, "verified_chain_height", -1)))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if height >= 0:
+                heights.append(height)
+        return max(heights) if heights else -1
+    except Exception:
+        return -1
+
+
 class MiningEngine:
     def __init__(self, blockchain: Blockchain, consensus: ConsensusEngine,
                  network: P2PNetwork, wallet: 'Wallet', storage: Storage,
@@ -114,22 +141,7 @@ class MiningEngine:
         # Safety guard — its three callables stay loose-coupled with the
         # network so a None-network test mode still works.
         def _best_peer_height() -> int:
-            try:
-                if self.network is None or not getattr(self.network, "peers", None):
-                    return -1
-                # Each PeerConnection records the peer-advertised chain_height
-                # in its `chain_height` attribute (set during HELLO/ACCEPT).
-                # We take the maximum of all currently-connected peers.
-                heights = []
-                for p in list(self.network.peers.values()):
-                    h = getattr(p, "chain_height", -1)
-                    try:
-                        heights.append(int(h))
-                    except (TypeError, ValueError):
-                        continue
-                return max(heights) if heights else -1
-            except Exception:
-                return -1
+            return _best_verified_peer_height(self.network)
 
         def _kick_fast_sync() -> None:
             try:
@@ -160,7 +172,8 @@ class MiningEngine:
                 best_peer = None
                 best_h    = -1
                 for p in list(self.network.peers.values()):
-                    h = getattr(p, "chain_height", -1)
+                    h = getattr(p, "advertised_chain_height",
+                                getattr(p, "chain_height", -1))
                     try:
                         h = int(h)
                     except (TypeError, ValueError):
