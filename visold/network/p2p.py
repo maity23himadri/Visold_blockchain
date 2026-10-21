@@ -304,12 +304,15 @@ class P2PNetwork:
         # same endpoint (Bug #3 / #4 fix).
         self._pending_connections: set = set()
         self._pending_lock = threading.Lock()
-        # Per-IP outbound fail tracking: ip → [fail_count, cooldown_until_ts]
-        # After Config.OUTBOUND_FAIL_LIMIT consecutive failures the reconnect
-        # loop skips this IP for Config.OUTBOUND_FAIL_COOLDOWN_SECS.
-        # Resets on successful connect or when cooldown expires.
-        self._outbound_fail: Dict[str, list] = {}
+        # Per-endpoint outbound fail tracking: (ip, port) ->
+        # [fail_count, cooldown_until_ts]. Mobile/CGNAT users can run several
+        # independent nodes on one IP, so one dead port must not cool down every
+        # healthy listener sharing that address.
+        self._outbound_fail: Dict[tuple, list] = {}
         self._outbound_fail_lock = threading.Lock()
+        # Known peer IDs also need in-flight de-duplication: one identity can be
+        # advertised at several old/new mobile endpoints simultaneously.
+        self._pending_peer_ids: set = set()
         # Per-peer message-rate buckets (v7.1.0 DoS protection).
         # Maps peer_id -> {"global": deque[ts], "types": {type: deque[ts]}}
         self._msg_rate: Dict[str, dict] = {}
@@ -2523,6 +2526,18 @@ class P2PNetwork:
                 self._node_directory = {}
                 directory = self._node_directory
             prior = directory.get(key)
+            if (prior and prior.get("verified") and not verified
+                    and (str(prior.get("ip", "")) != ip
+                         or int(prior.get("port", 0) or 0) != port)):
+                # Preserve the last directly-authenticated endpoint, but do not
+                # throw away a possible new mobile endpoint announced by PEX.
+                # Store the new address as a separate UNVERIFIED candidate. The
+                # peer must authenticate itself before this endpoint is trusted.
+                key = f"endpoint:{ip.casefold()}:{port}"
+                prior = directory.get(key)
+                item["chain_height"] = -1
+                item["verified_chain_height"] = -1
+                item["verified"] = False
             if prior:
                 # An unverified PEX announcement must not overwrite the endpoint
                 # or identity data learned directly from an authenticated session.
@@ -2554,6 +2569,13 @@ class P2PNetwork:
                     if item["verified"] and not wallet_addr:
                         item["wallet_addr"] = prior.get("wallet_addr", "")
             directory[key] = item
+            if verified and peer_id:
+                # Once this identity authenticates at the new endpoint, remove
+                # the now-redundant PEX candidate for this exact address.
+                endpoint_key = f"endpoint:{ip.casefold()}:{port}"
+                candidate = directory.get(endpoint_key)
+                if candidate and candidate.get("peer_id") == peer_id:
+                    directory.pop(endpoint_key, None)
             max_entries = max(100, int(getattr(self, "_node_directory_max", 5000)))
             if len(directory) > max_entries:
                 # Retain live/directly authenticated entries preferentially.
@@ -2578,10 +2600,16 @@ class P2PNetwork:
         with self._lock:
             live_peers = list(self.peers.items())
         live_ids = set()
+        live_endpoints = set()
+        live_identity_endpoints = set()
         for pid, peer in live_peers:
             if not getattr(peer, "connected", False):
                 continue
             live_ids.add(pid)
+            endpoint = (_normalize_ip(str(getattr(peer, "ip", "") or "")),
+                        int(getattr(peer, "port", 0) or 0))
+            live_endpoints.add(endpoint)
+            live_identity_endpoints.add((pid, endpoint[0], endpoint[1]))
             self._remember_node_info({
                 "peer_id": pid, "ip": getattr(peer, "ip", ""),
                 "port": getattr(peer, "port", 0),
@@ -2623,15 +2651,26 @@ class P2PNetwork:
             for key, item in list(directory.items()):
                 if now - float(item.get("last_seen", now)) > ttl:
                     # Do not expire a currently connected endpoint.
-                    if key not in live_ids and item.get("peer_id") not in live_ids:
+                    endpoint = (_normalize_ip(str(item.get("ip", "") or "")),
+                                int(item.get("port", 0) or 0))
+                    identity_endpoint = (str(item.get("peer_id", "") or ""),
+                                         endpoint[0], endpoint[1])
+                    is_live_endpoint = (
+                        identity_endpoint in live_identity_endpoints
+                        if identity_endpoint[0] else endpoint in live_endpoints)
+                    if key not in live_ids and not is_live_endpoint:
                         directory.pop(key, None)
             result = [dict(v) for v in directory.values()]
 
         for item in result:
             pid = item.get("peer_id", "")
-            item["connected"] = bool(pid in live_ids)
+            endpoint = (_normalize_ip(str(item.get("ip", "") or "")),
+                        int(item.get("port", 0) or 0))
+            item["connected"] = bool(
+                (pid and (pid, endpoint[0], endpoint[1]) in live_identity_endpoints)
+                or (not pid and endpoint in live_endpoints))
             item["status"] = "CONNECTED" if item["connected"] else (
-                "VERIFIED" if item.get("verified") else "DISCOVERED")
+                "OFFLINE" if item.get("verified") else "DISCOVERED")
         # Put live nodes first, then verified known nodes, then unverified PEX.
         result.sort(key=lambda v: (
             not bool(v.get("connected")),
@@ -2654,8 +2693,15 @@ class P2PNetwork:
             limit = self._PEX_PAGE_SIZE
         rows = self.get_network_directory()
         rows = [r for r in rows if r.get("peer_id") not in {self.node_id, exclude_peer_id}]
-        rows.sort(key=lambda r: (str(r.get("peer_id") or ""),
-                                 str(r.get("ip", "")), int(r.get("port", 0))))
+        # For identities with a changed mobile address, try the freshest
+        # advertised endpoint first. Otherwise an older verified-but-offline IP
+        # can be dialed first and the one-in-flight-per-ID guard then suppresses
+        # the newer reachable endpoint in the same PEX batch.
+        rows.sort(key=lambda r: (
+            str(r.get("peer_id") or ""),
+            -float(r.get("last_seen", 0.0) or 0.0),
+            str(r.get("ip", "")), int(r.get("port", 0)),
+        ))
         total = len(rows)
         page = rows[cursor:cursor + limit]
         encoded = [{
@@ -3928,8 +3974,8 @@ class P2PNetwork:
                                     f"[ChainSync] Watchdog: no "
                                     f"alternate peers available to "
                                     f"re-request blocks {_from}+; "
-                                    f"heartbeat will retry in "
-                                    f"{Config.RECONNECT_INTERVAL * 2}s")
+                                    f"heartbeat will retry on the next reconnect tick "
+                                    f"(about {Config.RECONNECT_INTERVAL}s, with jitter)")
 
                         threading.Thread(
                             target=_sync_watchdog,
@@ -6099,6 +6145,28 @@ class P2PNetwork:
                 f"(FORCE_OUTBOUND_DEST_PORT=True)")
             port = Config.DEFAULT_PORT
 
+        # Manual endpoint adds sometimes arrive without an identity. Recover a
+        # known ID from the directory when this exact endpoint is already known;
+        # this lets the connected-ID guard below prevent a duplicate dial.
+        if not peer_id:
+            directory_lock = getattr(self, "_node_directory_lock", None)
+            directory = getattr(self, "_node_directory", {})
+            if directory_lock is not None:
+                with directory_lock:
+                    for record in directory.values():
+                        if (_normalize_ip(str(record.get("ip", "") or "")) == ip
+                                and int(record.get("port", 0) or 0) == int(port)
+                                and record.get("peer_id")):
+                            peer_id = str(record["peer_id"])
+                            break
+            else:
+                for record in directory.values():
+                    if (_normalize_ip(str(record.get("ip", "") or "")) == ip
+                            and int(record.get("port", 0) or 0) == int(port)
+                            and record.get("peer_id")):
+                        peer_id = str(record["peer_id"])
+                        break
+
         # ── Soft Ban: skip outbound connections to currently-banned IPs ───────
         if self._is_ip_banned(ip):
             log.debug(
@@ -6107,22 +6175,6 @@ class P2PNetwork:
             _pa_push("OUT", ip, port, "BANNED")
             return
 
-        # ── Outbound fail cooldown: skip IPs with too many consecutive failures ─
-        _now = time.time()
-        with self._outbound_fail_lock:
-            _of = self._outbound_fail.get(ip)
-            if _of is not None:
-                if _of[0] >= Config.OUTBOUND_FAIL_LIMIT and _now < _of[1]:
-                    _remain = int(_of[1] - _now)
-                    log.debug(
-                        f"[OutboundCooldown] Skipping {ip} — failed "
-                        f"{_of[0]}x consecutively, cooling down "
-                        f"for {_remain}s more")
-                    _pa_push("OUT", ip, port, "COOLDOWN")
-                    return
-                elif _now >= _of[1] and _of[0] >= Config.OUTBOUND_FAIL_LIMIT:
-                    # Cooldown expired — reset so next attempt is treated fresh
-                    del self._outbound_fail[ip]
         with self._lock:
             # Remove disconnected entries before applying duplicate/capacity
             # checks. A stale peer record must not make later Auto/manual dials
@@ -6132,7 +6184,8 @@ class P2PNetwork:
                     self.peers.pop(stale_id, None)
                     self._eager_peers.discard(stale_id)
             existing_ips = {
-                (p.ip, p.port) for p in self.peers.values()
+                (_normalize_ip(str(getattr(p, "ip", "") or "")),
+                 int(getattr(p, "port", 0) or 0)) for p in self.peers.values()
                 if getattr(p, "connected", False)
             }
             # ── Self-connection guard ─────────────────────────────────────────
@@ -6147,18 +6200,53 @@ class P2PNetwork:
             # Also block by peer_id when we already know it
             if peer_id and peer_id == self.node_id:
                 return
+            # Node IDs survive address changes. Never dial an identity that is
+            # already authenticated, even if PEX still advertises an old IP or
+            # a second port for it.
+            if peer_id:
+                connected_identity = self.peers.get(peer_id)
+                if connected_identity is not None and getattr(
+                        connected_identity, "connected", False):
+                    return
             if (ip, port) in existing_ips:
                 return
             if self._peer_capacity_reached(sum(
                     1 for p in self.peers.values()
                     if getattr(p, "connected", False))):
                 return
+
+        # ── Endpoint-scoped outbound failure cooldown ──────────────────────
+        # Different services/nodes can share one mobile IPv6 address. A closed
+        # :8341 must not suppress healthy :8338/:8347 listeners at the same IP.
+        endpoint = (ip, int(port))
+        _now = time.time()
+        with self._outbound_fail_lock:
+            _of = self._outbound_fail.get(endpoint)
+            if _of is not None:
+                if _of[0] >= Config.OUTBOUND_FAIL_LIMIT and _now < _of[1]:
+                    _remain = max(1, int(_of[1] - _now))
+                    log.debug(
+                        f"[OutboundCooldown] Skipping "
+                        f"{_format_peer_addr(ip, port)} — failed "
+                        f"{_of[0]}x consecutively, cooling down "
+                        f"for {_remain}s more")
+                    _pa_push("OUT", ip, port, "COOLDOWN")
+                    return
+                elif _of[0] >= Config.OUTBOUND_FAIL_LIMIT and _now >= _of[1]:
+                    del self._outbound_fail[endpoint]
         # ── Pending-connection dedup (Bug #3/#4 fix) ─────────────────────────
         # Prevent multiple concurrent threads from racing to the same endpoint.
+        pending_peer_ids = getattr(self, "_pending_peer_ids", None)
+        if pending_peer_ids is None:
+            self._pending_peer_ids = set()
+            pending_peer_ids = self._pending_peer_ids
         with self._pending_lock:
-            if (ip, port) in self._pending_connections:
+            if ((ip, port) in self._pending_connections
+                    or (peer_id and peer_id in pending_peer_ids)):
                 return
             self._pending_connections.add((ip, port))
+            if peer_id:
+                pending_peer_ids.add(peer_id)
 
         if peer_id:
             row = self.storage._conn().execute(
@@ -6166,13 +6254,15 @@ class P2PNetwork:
             if row and row["blacklisted"]:
                 with self._pending_lock:
                     self._pending_connections.discard((ip, port))
+                    if peer_id:
+                        pending_peer_ids.discard(peer_id)
                 return
 
         threading.Thread(
-            target=self._connect_with_fallback, args=(ip, port), daemon=True).start()
+            target=self._connect_with_fallback, args=(ip, port, peer_id), daemon=True).start()
         _pa_push("OUT", ip, port, "CONNECTING")
 
-    def _connect_with_fallback(self, ip: str, port: int):
+    def _connect_with_fallback(self, ip: str, port: int, peer_id: str = ""):
         """
         Connection worker spawned by _try_add_peer.
 
@@ -6199,7 +6289,7 @@ class P2PNetwork:
                 _udp_ok = self._udp_connect_to(ip, port, deadline=_attempt_deadline)
                 if _udp_ok:
                     with self._outbound_fail_lock:
-                        self._outbound_fail.pop(ip, None)
+                        self._outbound_fail.pop((ip, int(port)), None)
                     _pa_push("OUT", ip, port, "CONNECTED(UDP)")
                     return
             except Exception as _udp_ex:
@@ -6209,18 +6299,20 @@ class P2PNetwork:
             if success:
                 # Reset outbound fail counter on first successful handshake
                 with self._outbound_fail_lock:
-                    self._outbound_fail.pop(ip, None)
+                    self._outbound_fail.pop((ip, int(port)), None)
                 _pa_push("OUT", ip, port, "CONNECTED")
                 return
             _pa_push("OUT", ip, port, "FAILED")
-            # Increment consecutive fail counter for this IP
+            # Increment consecutive fail counter for this endpoint only.
+            endpoint = (ip, int(port))
             with self._outbound_fail_lock:
-                rec = self._outbound_fail.setdefault(ip, [0, 0.0])
+                rec = self._outbound_fail.setdefault(endpoint, [0, 0.0])
                 rec[0] += 1
                 if rec[0] >= Config.OUTBOUND_FAIL_LIMIT:
                     rec[1] = time.time() + Config.OUTBOUND_FAIL_COOLDOWN_SECS
                     log.info(
-                        f"[OutboundCooldown] {ip} failed {rec[0]} consecutive "
+                        f"[OutboundCooldown] "
+                        f"{_format_peer_addr(ip, port)} failed {rec[0]} consecutive "
                         f"outbound attempts — pausing for "
                         f"{Config.OUTBOUND_FAIL_COOLDOWN_SECS}s")
             log.debug(
@@ -6256,6 +6348,8 @@ class P2PNetwork:
         finally:
             with self._pending_lock:
                 self._pending_connections.discard((ip, port))
+                if peer_id:
+                    getattr(self, "_pending_peer_ids", set()).discard(peer_id)
 
     def _gossip(self, msg: dict, exclude: Optional[str] = None, ttl: Optional[int] = None):
         """
@@ -6835,10 +6929,10 @@ class P2PNetwork:
         time.sleep(1)
         known = self.storage.get_peers(limit=20)
         for p in known:
-            if self._below_minimum_peer_target(len(self.active_peer_count())):
+            if self._below_minimum_peer_target(self._discovery_peer_count()):
                 self._try_add_peer(p["ip"], p["port"], p["peer_id"])
         for seed in Config.SEED_PEERS:
-            if not self._below_minimum_peer_target(len(self.active_peer_count())):
+            if not self._below_minimum_peer_target(self._discovery_peer_count()):
                 break
             try:
                 ip, port = _parse_peer_addr(seed)
@@ -6860,6 +6954,21 @@ class P2PNetwork:
         with self._lock:
             return [p for p in self.peers.values() if p.connected]
 
+    def _discovery_peer_count(self) -> int:
+        """Count active plus in-flight outbound peers for discovery budgeting.
+
+        Without counting pending dials, the reconnect/bootstrap loop can launch
+        one connection attempt for every stored port before any handshake has
+        time to finish, producing a burst against mobile peers with stale IPs.
+        """
+        active = len(self.active_peer_count())
+        pending_lock = getattr(self, "_pending_lock", None)
+        if pending_lock is None:
+            return active
+        with pending_lock:
+            pending = len(getattr(self, "_pending_connections", ()))
+        return active + pending
+
     def _pex_loop(self):
         while self._running:
             time.sleep(Config.PEX_INTERVAL)
@@ -6872,11 +6981,10 @@ class P2PNetwork:
                                "cursor": cursor, "limit": self._PEX_PAGE_SIZE})
 
     def _reconnect_loop(self):
-        _sync_tick = 0
         while self._running:
             import random as _rnd  # VSA-10: jittered reconnect
             time.sleep(Config.RECONNECT_INTERVAL * _rnd.uniform(0.75, 1.25))
-            count = len(self.active_peer_count())
+            count = self._discovery_peer_count()
             if self._below_minimum_peer_target(count):
                 target = self.minimum_peer_target()
                 if target is None:
@@ -6888,79 +6996,82 @@ class P2PNetwork:
                 random.shuffle(known)
                 for p in known:
                     if not self._below_minimum_peer_target(
-                            len(self.active_peer_count())):
+                            self._discovery_peer_count()):
                         break
                     with self._lock:
                         already = any(
-                            peer.ip == p["ip"] and peer.port == p["port"]
-                            for peer in self.peers.values()
+                            getattr(peer, "connected", False) and (
+                                (p.get("peer_id") and pid == p["peer_id"])
+                                or (_normalize_ip(str(getattr(peer, "ip", "") or ""))
+                                    == _normalize_ip(str(p["ip"]))
+                                    and int(getattr(peer, "port", 0) or 0)
+                                    == int(p["port"]))
+                            )
+                            for pid, peer in self.peers.items()
                         )
                     if not already:
                         self._try_add_peer(p["ip"], p["port"], p["peer_id"])
-                if self._below_minimum_peer_target(len(self.active_peer_count())):
+                if self._below_minimum_peer_target(self._discovery_peer_count()):
                     self._bootstrap()
 
             # Chain sync heartbeat — send to ONE selected peer, not every peer.
             # Pick the highest peer for missing blocks. Every tenth heartbeat
             # checks a bounded recent overlap with one rotating peer. Consensus,
             # block validation, chainwork and fork choice remain unchanged.
-            _sync_tick += 1
-            if _sync_tick >= 2:
-                _sync_tick = 0
-                my_height = int(self.blockchain.height())
-                with self._lock:
-                    connected_peers = [p for p in self.peers.values()
-                                       if getattr(p, "connected", False)]
-                selected = None
-                ahead = []
-                for candidate in connected_peers:
-                    try:
-                        remote_height = int(getattr(candidate, "advertised_chain_height",
-                                                     getattr(candidate, "chain_height", -1)))
-                    except (TypeError, ValueError):
-                        remote_height = -1
-                    if remote_height > my_height:
-                        ahead.append((remote_height,
-                                      float(getattr(candidate, "reputation", 0.0)),
-                                      candidate))
-                request_kind = "heartbeat"
-                if ahead:
-                    selected = max(ahead, key=lambda row: (row[0], row[1]))[2]
-                    hb_from = max(0, my_height + 1)
-                elif connected_peers and my_height < 0:
+            my_height = int(self.blockchain.height())
+            with self._lock:
+                connected_peers = [p for p in self.peers.values()
+                                   if getattr(p, "connected", False)]
+            selected = None
+            ahead = []
+            for candidate in connected_peers:
+                try:
+                    remote_height = int(getattr(candidate, "advertised_chain_height",
+                                                 getattr(candidate, "chain_height", -1)))
+                except (TypeError, ValueError):
+                    remote_height = -1
+                if remote_height > my_height:
+                    ahead.append((remote_height,
+                                  float(getattr(candidate, "reputation", 0.0)),
+                                  candidate))
+            request_kind = "heartbeat"
+            if ahead:
+                selected = max(ahead, key=lambda row: (row[0], row[1]))[2]
+                hb_from = max(0, my_height + 1)
+            elif connected_peers and my_height < 0:
+                selected = connected_peers[
+                    self._sync_heartbeat_cursor % len(connected_peers)]
+                self._sync_heartbeat_cursor += 1
+                hb_from = 0
+                request_kind = "heartbeat-bootstrap"
+            elif connected_peers:
+                self._sync_heartbeat_round += 1
+                if self._sync_heartbeat_round % 10 == 0:
                     selected = connected_peers[
                         self._sync_heartbeat_cursor % len(connected_peers)]
                     self._sync_heartbeat_cursor += 1
-                    hb_from = 0
-                    request_kind = "heartbeat-bootstrap"
-                elif connected_peers:
-                    self._sync_heartbeat_round += 1
-                    if self._sync_heartbeat_round % 10 == 0:
-                        selected = connected_peers[
-                            self._sync_heartbeat_cursor % len(connected_peers)]
-                        self._sync_heartbeat_cursor += 1
-                        if self._has_pruned_local_history():
-                            hb_from = self._recent_full_body_sync_start(my_height)
-                        else:
-                            hb_from = max(0, my_height - 198)
-                        request_kind = "heartbeat-overlap-audit"
-                if selected is not None:
-                    gate = getattr(self, "_auto_sync_gate", None)
-                    gate_acquired = bool(gate and gate.acquire(blocking=False))
-                    if gate is None:
-                        gate_acquired = True
-                    if gate_acquired:
-                        try:
-                            self._sync_request(
-                                selected, hb_from, hb_from + 199,
-                                kind=request_kind, force=False)
-                        except Exception as sync_exc:
-                            log.debug("[SyncHeartbeat] request failed: %s", sync_exc)
-                        finally:
-                            if gate is not None:
-                                gate.release()
+                    if self._has_pruned_local_history():
+                        hb_from = self._recent_full_body_sync_start(my_height)
                     else:
-                        log.debug("[SyncHeartbeat] auto-sync coordinator busy; skipping this tick")
+                        hb_from = max(0, my_height - 198)
+                    request_kind = "heartbeat-overlap-audit"
+            if selected is not None:
+                gate = getattr(self, "_auto_sync_gate", None)
+                gate_acquired = bool(gate and gate.acquire(blocking=False))
+                if gate is None:
+                    gate_acquired = True
+                if gate_acquired:
+                    try:
+                        self._sync_request(
+                            selected, hb_from, hb_from + 199,
+                            kind=request_kind, force=False)
+                    except Exception as sync_exc:
+                        log.debug("[SyncHeartbeat] request failed: %s", sync_exc)
+                    finally:
+                        if gate is not None:
+                            gate.release()
+                else:
+                    log.debug("[SyncHeartbeat] auto-sync coordinator busy; skipping this tick")
 
     def _peer_decay_loop(self):
         while self._running:

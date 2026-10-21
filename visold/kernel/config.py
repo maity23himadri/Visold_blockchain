@@ -595,7 +595,7 @@ class Config:
     PEER_MAX_FAIL       = 3
     PEER_DECAY_SECS     = 3600
     PEX_INTERVAL        = 60
-    RECONNECT_INTERVAL  = 30
+    RECONNECT_INTERVAL  = 60
     KAD_K               = 20            # k-bucket size
     KAD_BITS            = 160
 

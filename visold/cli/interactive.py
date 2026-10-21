@@ -2564,7 +2564,9 @@ class CLI:
                 name = row.get("registered_name") or row.get("user_id") or "(unnamed / no ID advertised)"
                 node_id = str(row.get("peer_id", "") or "")
                 print(clr(f"  [{offset:02d}] {state:<10} {endpoint}", color))
-                print(f"       Name/User ID: {name} | Height: {row.get('chain_height', -1)} | Source: {row.get('source', '?')}")
+                height = row.get("chain_height", -1)
+                height_label = "Height" if row.get("connected") else "Last height"
+                print(f"       Name/User ID: {name} | {height_label}: {height} | Source: {row.get('source', '?')}")
                 print(f"       VSD address: {row.get('wallet_addr') or '(not advertised)'} | Node ID: {node_id[:20] or '(unknown)'}")
             action = self._read_input("  Number=connect | s [term]=search | n/p=page | c IP:port=connect | q=back: ").strip()
             low = action.casefold()

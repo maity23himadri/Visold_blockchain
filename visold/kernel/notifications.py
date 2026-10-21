@@ -56,14 +56,30 @@ _peer_activity_buf: deque = deque(maxlen=500)
 
 
 _peer_activity_lock = threading.Lock()
+_peer_activity_last_status: dict = {}
 
 
 def _pa_push(dir_: str, ip: str, port: int, status: str) -> None:
-    """Append one peer-activity entry (thread-safe, never raises)."""
+    """Append one peer-activity entry, collapsing repeated cooldown notices.
+
+    A reconnect/PEX tick can inspect the same cooling-down endpoint many times.
+    Those checks are not new network events, so keep only the first COOLDOWN row
+    until the endpoint changes state again. Other status transitions (including
+    a new CONNECTING/FAILED cycle) remain visible.
+    """
     # BUG-FIX: removed inner `from datetime import datetime as _dt` that shadowed
     # the module-level alias and re-imported on every call. Use module-level datetime.
     try:
         with _peer_activity_lock:
+            key = (str(dir_), str(ip).casefold(), int(port))
+            previous = _peer_activity_last_status.get(key)
+            if status == "COOLDOWN" and previous == "COOLDOWN":
+                return
+            _peer_activity_last_status[key] = status
+            # Bound metadata independently from the ring buffer so a long-lived
+            # node discovering many transient endpoints cannot grow without end.
+            if len(_peer_activity_last_status) > 2048:
+                _peer_activity_last_status.pop(next(iter(_peer_activity_last_status)))
             _peer_activity_buf.append({
                 "ts":     datetime.now().strftime("%H:%M:%S"),
                 "dir":    dir_,
