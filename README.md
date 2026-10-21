@@ -53,6 +53,3 @@ background reliability should be measured on each supported Android device. A
 ### Seed peer target policy (2026-10-20)
 
 Only a node explicitly enabled with `VISOLD_SEED_NODE=1` or `seed_node: true` uses the unbounded peer-discovery target. Internally its `minimum_peer_target()` is `None`, which means discovery keeps exploring known and PEX-discovered candidates instead of stopping at a numeric peer count. Ordinary nodes retain `MIN_PEERS=3` and `MAX_PEERS=30`. The seed's unbounded target does not guarantee infinite real connections; reachable peers and device/network resources remain finite.
-
-### Peer retry and reconnect update (2026-10-21)
-This snapshot uses endpoint-scoped outbound cooldowns, suppresses duplicate in-flight dials by peer ID, and includes pending attempts in reconnect discovery budgeting. The base reconnect interval is 60 seconds. See [PEER_RETRY_FIX_REPORT_2026-10-21.md](PEER_RETRY_FIX_REPORT_2026-10-21.md) for implementation details, regression coverage, and limitations.

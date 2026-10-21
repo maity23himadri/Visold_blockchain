@@ -11,7 +11,7 @@
 ## Changes applied
 
 1. **Endpoint-scoped failure cooldown:** failure counters are now keyed by `(ip, port)`, not only `ip`. A failing `IP:port` no longer suppresses a healthy listener at another port on the same address.
-2. **Pending-dial deduplication:** repeated attempts to the same endpoint or advertised peer ID are suppressed while a dial is in flight. Distinct endpoints, including different ports on the same IP, remain eligible for parallel attempts; this snapshot does not impose a same-IP concurrency cap.
+2. **Bounded same-IP connection burst:** at most two outbound dials to one IP may be in flight at once (`Config.OUTBOUND_MAX_PENDING_PER_IP`). This is a concurrency limit, not an IP-wide ban; deferred endpoints can be retried on later discovery/reconnect ticks.
 3. **Peer-ID duplicate suppression:** do not dial an authenticated connected identity again, and do not have multiple outbound attempts for one advertised peer ID in flight at the same time.
 4. **Reconnect budgeting:** reconnect/bootstrap discovery counts pending attempts as well as connected peers, avoiding large bursts just because handshakes have not finished yet.
 5. **Cooldown activity deduplication:** Peer Activities now records a cooldown transition once per endpoint until the endpoint's state changes again.
@@ -21,7 +21,7 @@
 ## Validation
 
 - `py_compile` passed for the changed networking, configuration, notification, CLI and regression-test files.
-- In the repository checkout receiving this update, `py_compile` passed for the changed Python files and 78 focused tests passed across peer retry/cooldown, reconnect interval, directory, mesh admission, peer-height poisoning, block-relay deduplication, TUI, UDP recovery, peer security and port settings.
+- 76 focused/regression tests passed across peer retry/cooldown, directory, mesh admission, peer-height poisoning, block-relay deduplication, TUI, UDP recovery, peer security and port settings.
 - The remaining tests in `test_vsa_remaining_20261015.py` passed: **15 passed, 1 deselected**.
 - The full test suite did not finish within a 120-second test run. One test in the supplied baseline, `test_udp_initiator_opens_the_handshake_before_waiting_for_the_challenge`, fails on the original unmodified ZIP as well; it is unrelated to these peer retry changes.
 
