@@ -36,6 +36,22 @@ from visold.kernel.config import Config
 from visold.kernel.logging_setup import log
 
 
+def _configure_diagnostic_keylog(ctx: ssl.SSLContext) -> None:
+    """Enable TLS secrets only for an explicitly opted-in local diagnostic run."""
+    path = os.environ.get("VISOLD_TLS_KEYLOG_FILE")
+    if not path:
+        return
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.close(fd)
+        os.chmod(path, 0o600)
+        ctx.keylog_filename = path
+    except Exception as exc:
+        # Key logging is optional diagnostics. Never make node startup depend on it.
+        log.warning("[TLS_DIAGNOSTIC_KEYLOG] unavailable: %s",
+                    type(exc).__name__)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 1B: TLS MANAGER  (Problem #1 — P2P + RPC encryption)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -251,6 +267,7 @@ class TLSManager:
                     #     protects against MITM on outbound connections.
                     ctx.verify_mode     = ssl.CERT_NONE
                     # Do NOT call load_verify_locations — no shared CA exists.
+                    _configure_diagnostic_keylog(ctx)
                     cls._ctx_server = ctx
                 except Exception as e:
                     log.warning(f"TLS server context failed: {e}")
@@ -288,6 +305,7 @@ class TLSManager:
                     # in connect_to() handles post-handshake identity binding.
                     ctx.verify_mode     = ssl.CERT_NONE
                     # Do NOT call load_verify_locations — no shared CA exists.
+                    _configure_diagnostic_keylog(ctx)
                     cls._ctx_client = ctx
                 except Exception as e:
                     log.warning(f"TLS client context failed: {e}")

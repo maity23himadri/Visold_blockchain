@@ -159,10 +159,12 @@ def test_two_nodes_reconnect_after_A_prunes_and_compare_pruning_boundaries(tmp_p
             # first retained full-body height. B legitimately lacks bodies for imported
             # snapshot-header heights 11..24, so its body retention can be more
             # aggressive than A, but both nodes must prune the old prefix through
-            # the same rolling cutoff at this final chain height.
-            assert a_flags == list(range(16))
+            # a snapshot-aligned recoverability boundary at this final height.
+            # For A, raw cutoff=16 but the newest committed snapshot strictly
+            # below it is h=14, so the safe exclusive boundary is 15.
+            assert a_flags == list(range(15))
             assert b_flags == list(range(25))
-            assert a_mark == 16 and b_mark == 25
+            assert a_mark == 15 and b_mark == 25
             assert b_pruned_now == 0
             assert [B.get_block(h).is_pruned for h in range(0, 11)] == [True] * 11
             b_headers = [int(r[0]) for r in bst._conn().execute(
@@ -170,7 +172,7 @@ def test_two_nodes_reconnect_after_A_prunes_and_compare_pruning_boundaries(tmp_p
             assert b_headers == list(range(25)), b_headers
             a_headers = [int(r[0]) for r in ast._conn().execute(
                 "SELECT idx FROM block_headers ORDER BY idx").fetchall()]
-            assert a_headers == list(range(16)), a_headers
+            assert a_headers == list(range(15)), a_headers
 
             print("RESULT", {
                 "height_A": A.height(), "height_B": B.height(),
@@ -205,12 +207,14 @@ def test_two_nodes_reconnect_after_A_prunes_and_compare_pruning_boundaries(tmp_p
             assert B.latest_block().state_root == A.latest_block().state_root
             B._rolling_pruner._last_height = -1
             B._rolling_pruner.maybe_prune(B.height())
-            assert ast.get_meta("rolling_pruned_until") == "26"
-            assert bst.get_meta("rolling_pruned_until") == "26"
-            assert [A.get_block(h).is_pruned for h in range(26)] == [True] * 26
-            assert [B.get_block(h).is_pruned for h in range(26)] == [True] * 26
-            assert [A.get_block(h).is_pruned for h in range(26, 36)] == [False] * 10
-            assert [B.get_block(h).is_pruned for h in range(26, 36)] == [False] * 10
+            # tip=35 gives raw cutoff=26; snapshot h=24 is the last committed
+            # anchor strictly below it, so both converge on safe boundary 25.
+            assert ast.get_meta("rolling_pruned_until") == "25"
+            assert bst.get_meta("rolling_pruned_until") == "25"
+            assert [A.get_block(h).is_pruned for h in range(25)] == [True] * 25
+            assert [B.get_block(h).is_pruned for h in range(25)] == [True] * 25
+            assert [A.get_block(h).is_pruned for h in range(25, 36)] == [False] * 11
+            assert [B.get_block(h).is_pruned for h in range(25, 36)] == [False] * 11
         finally:
             bst.close(); ast.close()
             DifficultyEngine.invalidate_cache()

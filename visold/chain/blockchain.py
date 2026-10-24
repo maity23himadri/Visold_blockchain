@@ -129,6 +129,7 @@ class Blockchain:
         # v7.4.0: Rolling window pruner and state snapshot engine
         self._rolling_pruner   = RollingWindowPruner(storage)
         self._snapshot_engine  = StateSnapshotEngine(storage, self._rolling_pruner)
+        self._rolling_pruner.set_snapshot_engine(self._snapshot_engine)
         # Injected by VisoldNode after construction
         self._slash_evidence: Optional[Any] = None
         # ── v7.7.0 Rate defection auditor ────────────────────────────────────
@@ -2090,6 +2091,80 @@ class Blockchain:
                     "restore failed: %s — node should be restarted.", _cre)
 
     # ── Blockchain rollback ───────────────────────────────────────────────
+    def rollback_bootstrap_safety(self) -> dict:
+        """Return the current bootstrap-safe rollback envelope.
+
+        This is a read-only diagnostic used by the TUI and operators.  The
+        returned ``safe_floor`` is the lowest rollback target that preserves
+        this node's ability to bootstrap a fresh peer from an authenticated
+        snapshot plus a contiguous retained full-body suffix.  ``None`` means
+        the present pruned layout has no bootstrap-safe rollback target until
+        history is repaired from another peer.
+        """
+        current = int(self.height())
+        try:
+            watermark = int(self._rolling_pruner.get_pruned_watermark())
+        except Exception:
+            watermark = 0
+
+        # With no pruned prefix, genesis remains locally replayable and any
+        # ordinary rollback target down to 0 preserves bootstrap service.
+        if watermark <= 0:
+            return {
+                "current_height": current,
+                "pruned_watermark": 0,
+                "safe_floor": 0,
+                "max_safe_rollback": current,
+                "anchor_snapshot": None,
+                "reason": "full history is retained; rollback to genesis remains bootstrap-safe",
+            }
+
+        try:
+            manifest = self._snapshot_engine.get_servable_manifest()
+        except Exception:
+            manifest = []
+
+        candidates = []
+        for entry in manifest:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                h = int(entry.get("height", -1))
+            except Exception:
+                continue
+            # Snapshot H needs canonical H+1 both for commitment/authentication
+            # and as the first retained replay block.  If H+1 is below the
+            # watermark, a pruned gap exists after the snapshot.
+            first_replay = h + 1
+            if first_replay >= watermark and first_replay <= current:
+                candidates.append((first_replay, h))
+
+        if not candidates:
+            return {
+                "current_height": current,
+                "pruned_watermark": watermark,
+                "safe_floor": None,
+                "max_safe_rollback": 0,
+                "anchor_snapshot": None,
+                "reason": (
+                    f"no committed snapshot has a retained contiguous suffix at/after "
+                    f"the pruning watermark {watermark}; repair/sync history before rollback"
+                ),
+            }
+
+        safe_floor, anchor = min(candidates, key=lambda x: x[0])
+        return {
+            "current_height": current,
+            "pruned_watermark": watermark,
+            "safe_floor": safe_floor,
+            "max_safe_rollback": max(0, current - safe_floor),
+            "anchor_snapshot": anchor,
+            "reason": (
+                f"snapshot {anchor} remains authenticated by block {anchor + 1}, "
+                f"and retained full bodies are contiguous from {safe_floor} to the tip"
+            ),
+        }
+
     def rollback(self, target_height: int) -> Tuple[bool, str]:
         """Roll the chain back to *target_height*, deleting every block above it.
 
@@ -2139,6 +2214,32 @@ class Blockchain:
                     "transaction data required for an exact rollback is no "
                     "longer guaranteed to be available.")
 
+            # A legacy/prior-version node may already have pruned to an
+            # arbitrary rolling-window cutoff (for example watermark 890 with
+            # only snapshot 600). Exact local rollback to 892 is possible in
+            # that shape, but the resulting node cannot bootstrap another peer:
+            # snapshot 600 is followed by a missing 601..889 body gap. Reject
+            # such a rollback *before mutation*. New pruning aligns its watermark
+            # to committed snapshot boundaries, so normally this check is free.
+            if _pruned_until:
+                try:
+                    _servable = self._snapshot_engine.get_servable_manifest()
+                    _post_rb_recoverable = any(
+                        int(_e.get("height", -1)) + 1 >= _pruned_until
+                        and int(_e.get("height", -1)) + 1 <= target_height
+                        for _e in _servable if isinstance(_e, dict)
+                    )
+                except Exception:
+                    _post_rb_recoverable = False
+                if not _post_rb_recoverable:
+                    return False, (
+                        f"Rollback rejected: target height {target_height} would "
+                        f"leave an unrecoverable pruned suffix (watermark "
+                        f"{_pruned_until}) with no committed snapshot whose "
+                        "next block is still retained. Sync/repair from a peer "
+                        "or advance to a newer committed snapshot before rolling "
+                        "back this far.")
+
             # ── Verify the target block actually exists ────────────────
             target_block = self.storage.get_block(target_height)
             if target_block is None:
@@ -2147,7 +2248,28 @@ class Blockchain:
                     "storage — cannot rollback to a missing block.".format(
                         target_height))
 
+            # L2 pre-check, before any block is deleted (see reorg()).
+            try:
+                _l2_pre = getattr(self, "layer2", None)
+                if _l2_pre is not None:
+                    _l2_can, _l2_why = _l2_pre.can_rollback_to_height(target_height)
+                    if not _l2_can:
+                        return False, f"Rollback rejected: {_l2_why}"
+            except Exception as _l2_pre_e:
+                log.error(f"[ROLLBACK] L2 pre-check raised, continuing: {_l2_pre_e}")
+
             deleted = 0
+            # Rolling pruning runs on a background thread outside blockchain._lock.
+            # Never let it compact a block body while rollback is trying to undo
+            # that same block. Reject transiently if a prune pass is already in
+            # flight; the operator can retry once that bounded pass completes.
+            _prune_lock = getattr(self._rolling_pruner, "_running_lock", None)
+            _prune_guarded = bool(_prune_lock is not None and _prune_lock.acquire(blocking=False))
+            if _prune_lock is not None and not _prune_guarded:
+                return False, (
+                    "Rollback deferred: rolling pruning is currently in progress. "
+                    "Retry after the active prune pass completes.")
+
             # ── Roll back blocks from tip down to target + 1 ──────────
             # BUG FIX: previously called storage.delete_block(h) directly,
             # which only removed the block record from DB/KV but NEVER
@@ -2163,22 +2285,32 @@ class Blockchain:
             #   3. Restores VVM contract storage slots from the receipt delta.
             #   4. Re-adds transactions to the mempool for re-mining.
             #   5. Finally calls storage.delete_block() to remove the record.
-            for h in range(current, target_height, -1):
-                try:
-                    blk = self.storage.get_block(h)
-                    if blk is None:
-                        log.warning("rollback: block %d not found, skipping", h)
+            try:
+                for h in range(current, target_height, -1):
+                    try:
+                        blk = self.storage.get_block(h)
+                        if blk is None:
+                            log.warning("rollback: block %d not found, skipping", h)
+                            deleted += 1
+                            continue
+                        self._rollback_block(blk)
                         deleted += 1
-                        continue
-                    self._rollback_block(blk)
-                    deleted += 1
-                except Exception as exc:
-                    log.error("rollback: failed to rollback block %d: %s",
-                              h, exc)
-                    return False, (
-                        "Error rolling back block {}: {}. "
-                        "Rollback incomplete — {} blocks removed "
-                        "before failure.".format(h, exc, deleted))
+                    except Exception as exc:
+                        log.error("rollback: failed to rollback block %d: %s",
+                                  h, exc)
+                        return False, (
+                            "Error rolling back block {}: {}. "
+                            "Rollback incomplete — {} blocks removed "
+                            "before failure.".format(h, exc, deleted))
+            finally:
+                # A rollback moves the tip backwards, so the pruner's last-run
+                # height from the old tip must not suppress future prune triggers.
+                try:
+                    self._rolling_pruner._last_height = -1
+                except Exception:
+                    pass
+                if _prune_guarded:
+                    _prune_lock.release()
 
             # ── Recompute state_root from the surviving ledger ─────────
             # Now that balances have been correctly reversed, this root
@@ -2207,6 +2339,18 @@ class Blockchain:
                             f"failed: {msg_l2}")
             except Exception as _l2_rb_e:
                 log.error(f"[ROLLBACK] L2 tree rollback raised: {_l2_rb_e}")
+
+            # Rollback must also roll back bootstrap-serving metadata.  Snapshot
+            # blobs/manifests above the new tip belong to history that this node
+            # can no longer authenticate locally (H+1 is gone).  Leaving them
+            # advertised can send fresh peers into an impossible bootstrap and
+            # strand them at an older retained checkpoint.
+            try:
+                self._snapshot_engine.invalidate_snapshots_above(target_height)
+            except Exception as _snap_rb_exc:
+                log.error(
+                    "[ROLLBACK] Failed to invalidate snapshots above %d: %s",
+                    target_height, _snap_rb_exc)
 
             # ── Flush difficulty cache so next query reads fresh data ──
             try:
@@ -5207,7 +5351,7 @@ class Blockchain:
             # back needs its transaction bodies, which pruning may already have removed;
             # rollback() refuses the same case with the same comparison.
             _pruned_until = int(self._rolling_pruner.get_pruned_watermark())
-            if _pruned_until and (fork_height - 1) < _pruned_until:
+            if _pruned_until and fork_height < _pruned_until:
                 return False, (
                     f"Reorg rejected: fork height {fork_height} is below the "
                     f"rolling-prune watermark {_pruned_until}; the replaced blocks' "
@@ -5264,6 +5408,19 @@ class Blockchain:
                         f"tiebreak: {_new_tip_hash[:16]} >= "
                         f"{_old_tip_hash[:16]}")
 
+            # L2 pre-check, before anything is rolled back: if the L2
+            # checkpoint needed at the fork point has been evicted, L2 cannot
+            # follow this reorg.  Refuse it cleanly now, rather than roll L1
+            # back and then leave L2 wiped (or stale) against the escrow.
+            try:
+                _l2_pre = getattr(self, "layer2", None)
+                if _l2_pre is not None:
+                    _l2_can, _l2_why = _l2_pre.can_rollback_to_height(fork_height - 1)
+                    if not _l2_can:
+                        return False, f"Reorg rejected: {_l2_why}"
+            except Exception as _l2_pre_e:
+                log.error(f"[L2-REORG] pre-check raised, continuing: {_l2_pre_e}")
+
             # Rollback current chain from tip down to fork_height
             try:
                 for blk in reversed(_saved_old_blocks):
@@ -5298,6 +5455,10 @@ class Blockchain:
                         log.error(
                             f"[L2-REORG] rollback_to_height({safe_l1}) "
                             f"returned non-OK: {msg_rb}")
+                    elif msg_rb == "no-l2-state":
+                        log.debug(
+                            f"[L2-REORG] no L2 state to roll back "
+                            f"(height <= {safe_l1})")
                     else:
                         log.info(
                             f"[L2-REORG] L2 state rolled back to L1 height "

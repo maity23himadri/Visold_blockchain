@@ -45,3 +45,10 @@ Some existing pytest files contain intentionally real PoW-mining tests at the pr
 ## Deployment note
 
 The fork-choice implementation is consensus behavior. All nodes participating in the same network should run the fixed build together rather than mixing this implementation with nodes that still use the old linear-work fork-choice rule.
+
+### 6. Authenticated bootstrap could self-trigger `GET_CHAIN` rate limiting
+Authenticated bootstrap verifies snapshots by fetching the canonical header chain in 200-block pages. The pre-existing per-peer limiter allowed five `GET_CHAIN` requests per 10 seconds, while the bootstrap verifier could issue more than five pages immediately. The sixth request was silently dropped before the handler could reply. A valid height-1200 snapshot therefore timed out, the client fell back to height 600, and the subsequent block-601 request failed because that body was already pruned.
+
+**Fix:** the `GET_CHAIN` DoS quota is retained. A rate-limited request now receives a request-correlated `MSG_CHAIN` busy response with `retry_after_ms`, and authenticated bootstrap waits for the bucket to reopen before retrying the same page. The retry budget is per page rather than global across the entire header range, so increasing chain height does not recreate a fixed page-count ceiling.
+
+**Verification:** targeted backpressure regressions passed 2/2; the existing authenticated-pruning bootstrap regression passed; and an isolated real two-node run using the supplied V4 state synchronized a fresh node from height 0 to height 1256 with the same canonical tip hash as the source node.

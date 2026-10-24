@@ -23,16 +23,237 @@ Defines: PeerConnection
 Origin: visold_vsd_.py L31300-31628
 """
 
+import hashlib
+import ipaddress
 import json
+import os
+import ssl
 import socket
+import sys
 import threading
 import time
+import uuid
+import weakref
 from typing import Any, List, Optional
 
 from visold.kernel.config import Config
 from visold.kernel.logging_setup import log
 from visold.network.compression import CompressionEngine
 from visold.network.message_logger import P2PMessageLogger
+
+
+def _tcp_session_diagnostics(sock):
+    """Return an endpoint-derived TCP link ID and observed socket endpoints."""
+    def _format_endpoint(value):
+        try:
+            host, port = value[0], int(value[1])
+            raw_host = str(host).split("%", 1)[0]
+            try:
+                address = ipaddress.ip_address(raw_host)
+                if getattr(address, "ipv4_mapped", None) is not None:
+                    address = address.ipv4_mapped
+                canonical_host = address.compressed
+            except ValueError:
+                canonical_host = raw_host.lower()
+            if ":" in canonical_host:
+                return f"[{canonical_host}]:{port}"
+            return f"{canonical_host}:{port}"
+        except Exception:
+            return "?"
+
+    local = remote = "?"
+    if sock is not None:
+        try:
+            local = _format_endpoint(sock.getsockname())
+        except Exception:
+            pass
+        try:
+            remote = _format_endpoint(sock.getpeername())
+        except Exception:
+            pass
+    if local != "?" and remote != "?":
+        pair = "\0".join(sorted((local, remote))).encode("utf-8", "replace")
+        session_id = hashlib.sha256(pair).hexdigest()[:20]
+        kind = "tcp_endpoint_pair"
+    else:
+        session_id = uuid.uuid4().hex[:20]
+        kind = "local_fallback"
+    return session_id, kind, local, remote
+
+
+_TCP_STATE_NAMES = {
+    1: "ESTABLISHED",
+    2: "SYN_SENT",
+    3: "SYN_RECV",
+    4: "FIN_WAIT1",
+    5: "FIN_WAIT2",
+    6: "TIME_WAIT",
+    7: "CLOSED",
+    8: "CLOSE_WAIT",
+    9: "LAST_ACK",
+    10: "LISTEN",
+    11: "CLOSING",
+    12: "NEW_SYN_RECV",
+}
+
+
+def _tcp_transport_snapshot(sock):
+    """Return passive best-effort transport state for an EOF diagnostic."""
+    snapshot = {
+        "tcp_state": "unavailable",
+        "tcp_state_code": "?",
+        "ssl_pending": "unavailable",
+        "socket_timeout": "unavailable",
+        "socket_fd": "-1",
+        "socket_closed": "unknown",
+    }
+    if sock is None:
+        return snapshot
+
+    try:
+        snapshot["socket_fd"] = str(sock.fileno())
+    except Exception:
+        pass
+    try:
+        snapshot["socket_closed"] = str(bool(getattr(sock, "_closed")))
+    except Exception:
+        pass
+    try:
+        snapshot["socket_timeout"] = str(sock.gettimeout())
+    except Exception:
+        pass
+    try:
+        pending = getattr(sock, "pending", None)
+        if callable(pending):
+            snapshot["ssl_pending"] = str(int(pending()))
+    except Exception:
+        pass
+
+    if not sys.platform.startswith("linux"):
+        snapshot["tcp_state"] = "unsupported_platform"
+        return snapshot
+    tcp_info = getattr(socket, "TCP_INFO", None)
+    if tcp_info is None:
+        snapshot["tcp_state"] = "unsupported_option"
+        return snapshot
+    try:
+        info = sock.getsockopt(socket.IPPROTO_TCP, tcp_info, 104)
+        if not isinstance(info, (bytes, bytearray)) or not info:
+            snapshot["tcp_state"] = "unavailable_empty_info"
+            return snapshot
+        state = int(info[0])
+        snapshot["tcp_state_code"] = str(state)
+        snapshot["tcp_state"] = _TCP_STATE_NAMES.get(
+            state, f"UNKNOWN_{state}")
+    except Exception as exc:
+        snapshot["tcp_state"] = f"unavailable_{type(exc).__name__}"
+    return snapshot
+
+
+def _enable_strict_tls_eof_diagnostic(sock) -> bool:
+    """Expose unexpected TCP EOFs instead of suppressing them, only when opted in."""
+    if os.environ.get("VISOLD_TLS_STRICT_EOF_DIAGNOSTIC") != "1":
+        return False
+    try:
+        if not hasattr(sock, "suppress_ragged_eofs"):
+            return False
+        sock.suppress_ragged_eofs = False
+        return sock.suppress_ragged_eofs is False
+    except Exception:
+        return False
+
+
+def _log_peer_socket_action(sock, operation, detail="-"):
+    """Log TLS socket close/unwrap/shutdown calls outside normal peer cleanup."""
+    if getattr(sock, "_visold_peer_close_guard", False):
+        return
+    peer_ref = getattr(sock, "_visold_peer_close_audit_ref", None)
+    try:
+        peer = peer_ref() if peer_ref is not None else None
+    except Exception:
+        peer = None
+    if peer is None or str(getattr(peer, "peer_id", "unknown")) == "unknown":
+        return
+    try:
+        caller_frame = sys._getframe(2)
+        caller = f"{caller_frame.f_code.co_name}:{caller_frame.f_lineno}"
+        stack = []
+        frame = caller_frame
+        for _ in range(6):
+            stack.append(f"{frame.f_code.co_name}:{frame.f_lineno}")
+            frame = frame.f_back
+            if frame is None:
+                break
+        stack = ">".join(stack)
+    except Exception:
+        caller = stack = "unknown"
+    try:
+        fd_before = sock.fileno()
+    except Exception:
+        fd_before = -1
+    log.warning(
+        "[PeerRawSocketAction] ts_ns=%s operation=%s detail=%s session_id=%s "
+        "session_id_kind=%s socket_local=%s socket_remote=%s peer=%s "
+        "endpoint=%s:%s direction=%s connected=%s fd_before=%s "
+        "caller=%s stack=%s thread=%s",
+        time.time_ns(), operation, detail,
+        getattr(peer, "session_id", "unknown"),
+        getattr(peer, "_session_id_kind", "unknown"),
+        getattr(peer, "_diag_socket_local", "?"),
+        getattr(peer, "_diag_socket_remote", "?"),
+        str(getattr(peer, "peer_id", ""))[:12],
+        getattr(peer, "ip", "?"), getattr(peer, "port", "?"),
+        "outbound" if getattr(peer, "local_outbound", False)
+        else "inbound/unknown",
+        bool(getattr(peer, "connected", False)), fd_before,
+        caller, stack, threading.current_thread().name,
+    )
+
+
+def _install_peer_socket_action_audit(peer):
+    """Observe raw TLS close/unwrap calls on one peer socket, without altering them."""
+    sock = getattr(peer, "sock", None)
+    if not isinstance(sock, ssl.SSLSocket):
+        return
+    try:
+        sock._visold_peer_close_audit_ref = weakref.ref(peer)
+        if getattr(sock, "_visold_peer_close_audit_installed", False):
+            return
+        sock_ref = weakref.ref(sock)
+        real_close = type(sock).close
+        real_unwrap = type(sock).unwrap
+        real_shutdown = type(sock).shutdown
+
+        def _audited_close(*args, **kwargs):
+            target = sock_ref()
+            if target is not None:
+                _log_peer_socket_action(target, "close")
+                return real_close(target, *args, **kwargs)
+            return None
+
+        def _audited_unwrap(*args, **kwargs):
+            target = sock_ref()
+            if target is not None:
+                _log_peer_socket_action(target, "unwrap")
+                return real_unwrap(target, *args, **kwargs)
+            return None
+
+        def _audited_shutdown(*args, **kwargs):
+            target = sock_ref()
+            if target is not None:
+                detail = str(args[0]) if args else str(kwargs.get("how", "missing"))
+                _log_peer_socket_action(target, "shutdown", detail)
+                return real_shutdown(target, *args, **kwargs)
+            return None
+
+        # Instance-level wrappers avoid changing SSL behavior process-wide.
+        sock.close = _audited_close
+        sock.unwrap = _audited_unwrap
+        sock.shutdown = _audited_shutdown
+        sock._visold_peer_close_audit_installed = True
+    except Exception:
+        # Diagnostic instrumentation must never prevent a peer from being used.
+        return
 
 
 class PeerConnection:
@@ -57,6 +278,12 @@ class PeerConnection:
         self.ip          = ip
         self.port        = port
         self.sock        = sock
+        self._diag_strict_tls_eof = _enable_strict_tls_eof_diagnostic(sock)
+        (self.session_id, self._session_id_kind,
+         self._diag_socket_local, self._diag_socket_remote) = (
+             _tcp_session_diagnostics(sock))
+        self._last_rx_message_type = None
+        self._last_rx_message_ts_ns = None
         # Public reachability metadata learned during authenticated handshake.
         self.user_id     = ""
         self.wallet_addr = ""
@@ -76,6 +303,7 @@ class PeerConnection:
         self.fail_count  = 0
         self.last_seen   = time.time()
         self.connected   = sock is not None
+        _install_peer_socket_action_audit(self)
         self._lock       = threading.Lock()
         # trust_level is set by the handshake; defaults to HIGH until classified
         self.trust_level = trust_level if trust_level is not None else self.TRUST_HIGH
@@ -144,52 +372,94 @@ class PeerConnection:
         self.MAX_OUT_BYTES = 32 * 1024 * 1024  # 32 MB pending per peer
         self._out_bytes    = 0
         self._out_lock     = threading.Lock()
+        # Serializes writer startup, shutdown, and queue admission. Without this
+        # lifecycle lock, a sender could clear _writer_stop/start a new writer
+        # in the narrow race after a fatal send error had marked the transport
+        # unusable.
+        self._writer_lifecycle_lock = threading.Lock()
         self._writer_thread: Optional[threading.Thread] = None
         self._writer_stop  = threading.Event()
+        self._local_transport_failure_reason = None
         if self.connected:
             self._start_writer()
 
-    def _start_writer(self):
+    def _start_writer_locked(self) -> bool:
+        """Start the per-peer writer while holding _writer_lifecycle_lock."""
+        if self._writer_stop.is_set() or not self.connected:
+            return False
         if self._writer_thread and self._writer_thread.is_alive():
-            return
-        self._writer_stop.clear()
+            return True
         t = threading.Thread(target=self._writer_loop,
                              name=f"peer-writer-{self.peer_id[:8]}",
                              daemon=True)
         self._writer_thread = t
-        t.start()
+        try:
+            t.start()
+        except Exception:
+            self._writer_thread = None
+            log.exception("[PeerWriterStartFailure] peer=%s endpoint=%s:%s",
+                          str(self.peer_id)[:12], self.ip, self.port)
+            return False
+        return True
+
+    def _start_writer(self) -> bool:
+        with self._writer_lifecycle_lock:
+            return self._start_writer_locked()
+
+    def _abort_after_send_failure(self, reason: str, error=None) -> None:
+        """Fail closed after a socket write whose partial progress is unknown.
+
+        TCP sendall() does not report how many bytes were transmitted when it
+        raises. The stream can therefore no longer safely carry another frame.
+        Stop queue admission, discard the old session's queued frames, and
+        shutdown the socket to wake the reader; normal peer-loop cleanup owns
+        the final close and identity-level bookkeeping.
+        """
+        self.connected = False
+        self._local_transport_failure_reason = str(reason)
+        with self._writer_lifecycle_lock:
+            self._writer_stop.set()
+            with self._out_lock:
+                while True:
+                    try:
+                        self._out_queue.get_nowait()
+                    except Exception:
+                        break
+                self._out_bytes = 0
+
+        log.warning(
+            "[PeerTransportAbort] ts_ns=%s session_id=%s peer=%s endpoint=%s:%s "
+            "direction=%s reason=%s error=%s detail=%s action=shutdown",
+            time.time_ns(), getattr(self, "session_id", "unknown"),
+            str(getattr(self, "peer_id", ""))[:12], self.ip, self.port,
+            "outbound" if getattr(self, "local_outbound", False) else "inbound/unknown",
+            str(reason)[:96], type(error).__name__ if error is not None else "?",
+            str(error)[:200] if error is not None else "?",
+        )
+        sock = self.sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception as shutdown_exc:
+                # The original write failure remains the primary error. This
+                # follow-up is useful when shutdown cannot wake a blocked recv.
+                log.debug(
+                    "[PeerTransportAbortShutdownFailure] ts_ns=%s session_id=%s "
+                    "peer=%s reason=%s error=%s detail=%s",
+                    time.time_ns(), getattr(self, "session_id", "unknown"),
+                    str(getattr(self, "peer_id", ""))[:12], str(reason)[:96],
+                    type(shutdown_exc).__name__, str(shutdown_exc)[:200],
+                )
 
     def _writer_loop(self):
-        """Drain the priority queue and push to the socket.
-        A single blocked sendall on this thread does NOT block other peers
-        because each peer has its own writer thread + queue.
+        """Drain the priority queue using exactly one writer per TCP stream.
 
-        v7.1.8 BUG-FIX (Bug 1): the loop condition used to be
-            while not self._writer_stop.is_set() and self.connected:
-        but ``self.connected`` is flipped to False inside ``_raw_send`` on
-        ANY transient sendall exception (broken pipe, EAGAIN, slow peer
-        backpressure, transient ECONNRESET).  The next iteration the while
-        evaluated False and the writer thread DIED SILENTLY.
-
-        The reconnect machinery normally builds a NEW PeerConnection object
-        on reconnect rather than flipping ``.connected`` back to True on the
-        same instance, so the dead writer was never resurrected — every
-        subsequent send_priority() enqueued into a queue with no draining
-        thread.  ``broadcast_block`` logged "broadcast to N peers" but the
-        bytes never left the box.
-
-        Fix:
-          • Loop condition is now ``self._writer_stop`` ONLY.
-          • On _raw_send failure, the message is re-queued (priority
-            preserved) and we sleep briefly before retrying, giving the
-            socket a chance to recover.  After MAX_SEND_RETRIES consecutive
-            failures we drop the message (peer is genuinely dead) but the
-            thread keeps draining so subsequent enqueues don't pile up.
-          • The thread only exits when _writer_stop is explicitly set
-            (close_writer / close).
+        A failed sendall() makes the transmitted byte count unknowable. Retrying
+        that frame (or continuing with a later frame) on the same stream can
+        corrupt the application's newline-framed protocol. A transport write
+        failure therefore aborts this session; only a *pre-send encoding*
+        failure drops one message and leaves the healthy stream available.
         """
-        MAX_SEND_RETRIES = 3
-        consecutive_failures = 0
         while not self._writer_stop.is_set():
             try:
                 item = self._out_queue.get(timeout=1.0)
@@ -197,142 +467,231 @@ class PeerConnection:
                 continue
             if item is None:
                 break
-            pri, _seq, msg = item
-            if msg is None:                       # poison pill from close_writer
+            _pri, _seq, msg = item
+            if msg is None:  # poison pill from close_writer
                 break
-            # Maintain the byte-counter accounting symmetrically with enqueue.
-            try:
-                _est = len(json.dumps(msg)) if msg is not None else 0
-            except Exception:
-                _est = 0
-            with self._out_lock:
-                self._out_bytes = max(0, self._out_bytes - _est)
-            ok = self._raw_send(msg)
-            if ok:
-                consecutive_failures = 0
-                continue
-            # ── Send failed.  Decide: retry or drop. ─────────────────────
-            consecutive_failures += 1
-            if consecutive_failures >= MAX_SEND_RETRIES:
-                log.warning(
-                    f"[WRITER {self.peer_id[:8]}] dropping {msg.get('type','?')} "
-                    f"after {consecutive_failures} consecutive send failures")
-                consecutive_failures = 0          # reset counter, keep draining
-                continue
-            # Re-queue at the same priority and back off briefly.  Keeps
-            # block / consensus messages first in line on socket recovery.
-            try:
-                with self._out_seq_lock:
-                    self._out_seq += 1
-                    new_seq = self._out_seq
-                self._out_queue.put((pri, new_seq, msg))
-                with self._out_lock:
-                    self._out_bytes += _est
-            except Exception:
-                pass
-            time.sleep(0.2 * consecutive_failures)
-        log.debug(
-            f"[WRITER {self.peer_id[:8]}] exit "
-            f"stop={self._writer_stop.is_set()} connected={self.connected}")
 
-    def _raw_send(self, msg: dict) -> bool:
+            try:
+                est_bytes = len(json.dumps(msg))
+            except Exception:
+                est_bytes = 0
+            with self._out_lock:
+                self._out_bytes = max(0, self._out_bytes - est_bytes)
+
+            result = self._raw_send(msg)
+            if result is True:
+                continue
+            if result is None:
+                # Serialization/compression failed before touching the socket;
+                # drop only this invalid message and keep the transport alive.
+                continue
+
+            # False means sendall() raised after the write may have begun. The
+            # socket must not carry a retry or any subsequent application frame.
+            # _raw_send() already made the stream unusable, stopped queue
+            # admission, and shut down the socket before returning False.
+            break
+        log.debug(
+            "[WRITER %s] exit stop=%s connected=%s",
+            self.peer_id[:8], self._writer_stop.is_set(), self.connected,
+        )
+
+    def _raw_send(self, msg: dict) -> Optional[bool]:
+        """Send one framed message from the asynchronous writer.
+
+        Returns True on success, None when encoding failed before any socket
+        write (message dropped), and False when sendall failed and the stream
+        must be considered unusable. Never retry False on the same socket.
+        """
         try:
-            raw  = json.dumps(msg).encode()
+            raw = json.dumps(msg).encode()
             data = CompressionEngine.compress(raw) + b"\n"
+        except Exception as exc:
+            log.warning(
+                "[PeerEncodeFailure] ts_ns=%s session_id=%s peer=%s endpoint=%s:%s "
+                "direction=%s msg_type=%s error=%s detail=%s path=writer",
+                time.time_ns(), getattr(self, "session_id", "unknown"),
+                str(getattr(self, "peer_id", ""))[:12], self.ip, self.port,
+                "outbound" if getattr(self, "local_outbound", False) else "inbound/unknown",
+                str(msg.get("type", "<missing>"))[:64], type(exc).__name__, str(exc)[:240],
+            )
+            return None
+
+        send_error = None
+        try:
             with self._lock:
-                self.sock.sendall(data)
-            self.last_seen = time.time()
-            return True
-        except Exception:
-            # v7.1.8 BUG-FIX (Bug 1): we still flip ``connected`` so other
-            # paths (heartbeat, reconnect loop) notice the broken socket,
-            # but ``_writer_loop`` no longer uses this flag as a kill
-            # switch — it keeps draining and retries the message above.
+                # Recheck under the same lock used by every socket writer. A
+                # concurrent synchronous sender must not slip onto the stream
+                # after another writer has observed an ambiguous sendall failure.
+                if self._writer_stop.is_set() or not self.connected:
+                    return False
+                try:
+                    self.sock.sendall(data)
+                except Exception as exc:
+                    # Publish failure BEFORE releasing the write lock. Otherwise
+                    # a waiting synchronous sender could acquire the lock and
+                    # append a new frame in the small gap before abort cleanup.
+                    self.connected = False
+                    self._local_transport_failure_reason = "async_writer_sendall_failed"
+                    send_error = exc
+            if send_error is None:
+                self.last_seen = time.time()
+                return True
+        except Exception as exc:
+            # A failure in lock/socket wrapper logic is also terminal: we cannot
+            # prove whether application bytes reached the transport.
+            send_error = exc
             self.connected = False
-            return False
+            self._local_transport_failure_reason = "async_writer_sendall_failed"
+
+        log.warning(
+            "[PeerSendFailure] ts_ns=%s session_id=%s session_id_kind=%s "
+            "socket_local=%s socket_remote=%s peer=%s endpoint=%s:%s "
+            "direction=%s msg_type=%s error=%s detail=%s path=writer",
+            time.time_ns(), getattr(self, "session_id", "unknown"),
+            getattr(self, "_session_id_kind", "unknown"),
+            getattr(self, "_diag_socket_local", "?"),
+            getattr(self, "_diag_socket_remote", "?"),
+            str(getattr(self, "peer_id", ""))[:12],
+            getattr(self, "ip", "?"), getattr(self, "port", "?"),
+            "outbound" if getattr(self, "local_outbound", False) else "inbound/unknown",
+            str(msg.get("type", "<missing>"))[:64], type(send_error).__name__, str(send_error)[:240],
+        )
+        self._abort_after_send_failure("async_writer_sendall_failed", send_error)
+        return False
 
     def send_priority(self, msg: dict, priority: int = 1) -> bool:
-        """Enqueue ``msg`` for asynchronous send with the given priority.
-        CRITICAL (0) > NORMAL (1) > BULK (2).  Returns True if queued, False
-        on overflow (and in that case the lowest-priority pending msg is
-        evicted so the new critical message still goes through).
+        """Queue a message for the single writer, preserving priority ordering.
 
-        v7.1.8 BUG-FIX (Bug 1): even if ``self.connected`` is momentarily
-        False (transient send error mid-broadcast), we still allow the
-        message to be QUEUED — the writer thread will retry it once the
-        socket recovers, or the reconnect loop will rebuild the connection
-        and the new PeerConnection will take over.  Refusing to queue here
-        was the second half of the silent-broadcast-loss bug.
+        A disconnected or stopped session cannot be revived by enqueuing into
+        its old queue: reconnect creates a different PeerConnection object.
+        The lifecycle lock makes the stop check atomic with queue insertion.
         """
-        if self._writer_stop.is_set():
-            return False                          # peer is being torn down
-        if self._writer_thread is None or not self._writer_thread.is_alive():
-            self._start_writer()
         try:
             est_bytes = len(json.dumps(msg))
-        except Exception:
-            est_bytes = 0
+        except Exception as exc:
+            log.warning(
+                "[PeerQueueEncodeFailure] ts_ns=%s session_id=%s peer=%s "
+                "endpoint=%s:%s msg_type=%s error=%s detail=%s",
+                time.time_ns(), getattr(self, "session_id", "unknown"),
+                str(getattr(self, "peer_id", ""))[:12], self.ip, self.port,
+                str(msg.get("type", "<missing>"))[:64], type(exc).__name__, str(exc)[:200],
+            )
+            return False
+
         with self._out_seq_lock:
             self._out_seq += 1
             seq = self._out_seq
-        # Overflow policy: for CRITICAL, always admit by dropping a BULK/NORMAL.
-        # Check both queue length AND byte cap.
-        with self._out_lock:
-            over_count = self._out_queue.qsize() >= self.MAX_OUT_QUEUE
-            over_bytes = self._out_bytes + est_bytes > self.MAX_OUT_BYTES
-        if over_count or over_bytes:
-            if priority == self.PRI_CRITICAL:
-                try:
+
+        with self._writer_lifecycle_lock:
+            if self._writer_stop.is_set() or not self.connected:
+                return False
+            with self._out_lock:
+                over_count = self._out_queue.qsize() >= self.MAX_OUT_QUEUE
+                over_bytes = self._out_bytes + est_bytes > self.MAX_OUT_BYTES
+                if over_count or over_bytes:
+                    if priority != self.PRI_CRITICAL:
+                        return False
+                    # Preserve the existing critical-message overflow policy:
+                    # evict the least preferred queued item and keep ordering.
                     drained = []
                     while True:
-                        try: drained.append(self._out_queue.get_nowait())
-                        except Exception: break
+                        try:
+                            drained.append(self._out_queue.get_nowait())
+                        except Exception:
+                            break
                     drained.sort()
                     if drained:
                         evicted = drained.pop()
                         try:
-                            ev_bytes = len(json.dumps(evicted[2]))
+                            evicted_bytes = len(json.dumps(evicted[2]))
                         except Exception:
-                            ev_bytes = 0
-                        with self._out_lock:
-                            self._out_bytes = max(0, self._out_bytes - ev_bytes)
-                    for it in drained:
-                        self._out_queue.put_nowait(it)
-                except Exception:
-                    pass
-            else:
-                return False
-        self._out_queue.put((priority, seq, msg))
-        with self._out_lock:
-            self._out_bytes += est_bytes
-        return True
+                            evicted_bytes = 0
+                        self._out_bytes = max(0, self._out_bytes - evicted_bytes)
+                    for queued in drained:
+                        self._out_queue.put_nowait(queued)
+
+                # Start while holding the lifecycle lock so a concurrent fatal
+                # transport error cannot set stop and then have this path clear it.
+                if not self._start_writer_locked():
+                    return False
+                self._out_queue.put((priority, seq, msg))
+                self._out_bytes += est_bytes
+                return True
 
     def close_writer(self):
-        self._writer_stop.set()
-        try: self._out_queue.put_nowait((0, 0, None))      # wake the thread
-        except Exception: pass
+        with self._writer_lifecycle_lock:
+            if self._writer_stop.is_set():
+                return
+            self._writer_stop.set()
+            try:
+                self._out_queue.put_nowait((0, 0, None))  # wake the thread
+            except Exception:
+                pass
 
     def send(self, msg: dict) -> bool:
-        try:
-            # BUG-FIX v6.9.8: Compress only the bare JSON bytes — NOT the
-            # trailing \n.  Compressed binary payloads routinely contain the
-            # byte 0x0a (\n) internally; if \n is inside the compressed blob
-            # then recv_line's buf.split(b"\n", 1) splits mid-frame, producing
-            # a truncated/corrupt slice that fails decompression and JSON parse.
-            # Appending \n AFTER compression guarantees the delimiter is always
-            # the very last byte of the wire frame.
-            raw  = json.dumps(msg).encode()   # pure JSON, no trailing \n
-            data = CompressionEngine.compress(raw)
-            data = data + b"\n"               # frame delimiter AFTER compression
-            with self._lock:
-                self.sock.sendall(data)
-            self.last_seen = time.time()
-            # v7.1.7: outbound P2P message logging (no-op unless enabled).
-            P2PMessageLogger.log_out(self, msg, len(data))
-            return True
-        except Exception:
-            self.connected = False
+        # Do not let synchronous control/heartbeat paths reuse a session after
+        # its writer or peer cleanup has already declared it unusable.
+        if self._writer_stop.is_set() or not self.connected:
             return False
+        # Encode before touching the socket. An invalid local message should not
+        # disconnect a healthy peer because no bytes have been written.
+        try:
+            raw = json.dumps(msg).encode()
+            data = CompressionEngine.compress(raw) + b"\n"
+        except Exception as exc:
+            log.warning(
+                "[PeerEncodeFailure] ts_ns=%s session_id=%s peer=%s endpoint=%s:%s "
+                "direction=%s msg_type=%s error=%s detail=%s path=sync",
+                time.time_ns(), getattr(self, "session_id", "unknown"),
+                str(getattr(self, "peer_id", ""))[:12], self.ip, self.port,
+                "outbound" if getattr(self, "local_outbound", False) else "inbound/unknown",
+                str(msg.get("type", "<missing>"))[:64], type(exc).__name__, str(exc)[:240],
+            )
+            return False
+
+        send_error = None
+        try:
+            with self._lock:
+                # The state check belongs under the stream-write lock. This
+                # closes the race where another sender begins after a partial
+                # sendall failure but before the failed sender marks the stream.
+                if self._writer_stop.is_set() or not self.connected:
+                    return False
+                try:
+                    self.sock.sendall(data)
+                except Exception as exc:
+                    self.connected = False
+                    self._local_transport_failure_reason = "sync_sendall_failed"
+                    send_error = exc
+            if send_error is None:
+                self.last_seen = time.time()
+                # Logging is diagnostic-only and intentionally stays outside
+                # the socket-write exception handler.
+                P2PMessageLogger.log_out(self, msg, len(data))
+                return True
+        except Exception as exc:
+            # A wrapper/socket error with uncertain write progress also makes
+            # this stream unsafe for future framed messages.
+            send_error = exc
+            self.connected = False
+            self._local_transport_failure_reason = "sync_sendall_failed"
+
+        log.warning(
+            "[PeerSendFailure] ts_ns=%s session_id=%s session_id_kind=%s "
+            "socket_local=%s socket_remote=%s peer=%s endpoint=%s:%s "
+            "direction=%s msg_type=%s error=%s detail=%s path=sync",
+            time.time_ns(), getattr(self, "session_id", "unknown"),
+            getattr(self, "_session_id_kind", "unknown"),
+            getattr(self, "_diag_socket_local", "?"),
+            getattr(self, "_diag_socket_remote", "?"),
+            str(getattr(self, "peer_id", ""))[:12],
+            getattr(self, "ip", "?"), getattr(self, "port", "?"),
+            "outbound" if getattr(self, "local_outbound", False) else "inbound/unknown",
+            str(msg.get("type", "<missing>"))[:64], type(send_error).__name__, str(send_error)[:240],
+        )
+        self._abort_after_send_failure("sync_sendall_failed", send_error)
+        return False
 
     def recv_line(self, timeout: float = Config.PEER_TIMEOUT) -> Optional[dict]:
         # BUG-FIX v6.9.8: Use self._recv_buf (persistent across calls) instead
@@ -370,6 +729,35 @@ class PeerConnection:
         except Exception:
             return None
     def close(self):
+        # Diagnostic-only: record the immediate local caller before closing the
+        # socket. Paired-node logs can then distinguish an intentional local
+        # close from a peer EOF whose initiating side had no close record.
+        try:
+            _caller_frame = sys._getframe(1)
+            _close_caller = f"{_caller_frame.f_code.co_name}:{_caller_frame.f_lineno}"
+        except Exception:
+            _close_caller = "unknown"
+        try:
+            _fd_before = self.sock.fileno() if self.sock is not None else -1
+        except Exception:
+            _fd_before = -1
+        log.info(
+            "[PeerSocketClose] ts_ns=%s session_id=%s session_id_kind=%s "
+            "socket_local=%s socket_remote=%s peer=%s endpoint=%s:%s direction=%s "
+            "connected_before_close=%s fd_before=%s caller=%s thread=%s "
+            "last_rx_message_type=%s last_rx_message_ts_ns=%s",
+            time.time_ns(), getattr(self, "session_id", "unknown"),
+            getattr(self, "_session_id_kind", "unknown"),
+            getattr(self, "_diag_socket_local", "?"),
+            getattr(self, "_diag_socket_remote", "?"),
+            str(getattr(self, "peer_id", ""))[:12],
+            getattr(self, "ip", "?"), getattr(self, "port", "?"),
+            "outbound" if getattr(self, "local_outbound", False) else "inbound/unknown",
+            bool(getattr(self, "connected", False)), _fd_before,
+            _close_caller, threading.current_thread().name,
+            getattr(self, "_last_rx_message_type", None),
+            getattr(self, "_last_rx_message_ts_ns", None),
+        )
         # Stop the prioritized writer thread first so a pending send doesn't
         # race with socket close.
         try:
@@ -378,7 +766,17 @@ class PeerConnection:
             pass
         try:
             if self.sock:
-                self.sock.close()
+                try:
+                    self.sock._visold_peer_close_guard = True
+                except Exception:
+                    pass
+                try:
+                    self.sock.close()
+                finally:
+                    try:
+                        self.sock._visold_peer_close_guard = False
+                    except Exception:
+                        pass
         except Exception:
             pass
         self.connected = False

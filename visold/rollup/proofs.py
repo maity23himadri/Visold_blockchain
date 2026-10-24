@@ -525,7 +525,7 @@ class SubprocessSNARKBackend(IProofBackend):
             return False
         return True
 
-    def _run(self, binary: str, payload: dict, timeout: float) -> dict:
+    def _run(self, binary: str, payload: dict, timeout: float, *, key_flag: str, key_path: str) -> dict:
         """Invoke `binary` with one line of JSON on stdin, parse one line
         of JSON from stdout.  Raises ProofBackendError on any failure
         whose meaning is "the backend is broken" rather than "the proof
@@ -543,9 +543,11 @@ class SubprocessSNARKBackend(IProofBackend):
         except Exception as e:
             raise ProofBackendError(f"payload serialisation failed: {e}")
         try:
+            argv = [binary]
+            if key_flag and key_path:
+                argv.extend([key_flag, key_path])
             proc = _subprocess.run(
-                [binary, "--vk", self._vk_path] if "verif" in binary.lower()
-                else [binary, "--pk", self._pk_path],
+                argv,
                 input=line,
                 capture_output=True,
                 timeout=timeout,
@@ -587,7 +589,9 @@ class SubprocessSNARKBackend(IProofBackend):
             "batch_hash": batch_hash,
             "witness":    wit_hex,
         }
-        result = self._run(self._prover_bin, payload, self._PROVE_TIMEOUT_SECS)
+        result = self._run(
+            self._prover_bin, payload, self._PROVE_TIMEOUT_SECS,
+            key_flag="--pk", key_path=self._pk_path)
         if not result.get("ok"):
             raise ProofBackendError(
                 f"prover refused: {result.get('reason', 'unknown')}")
@@ -622,8 +626,9 @@ class SubprocessSNARKBackend(IProofBackend):
         except Exception:
             return False
         try:
-            result = self._run(self._verifier_bin, payload,
-                               self._VERIFY_TIMEOUT_SECS)
+            result = self._run(
+                self._verifier_bin, payload, self._VERIFY_TIMEOUT_SECS,
+                key_flag="--vk", key_path=self._vk_path)
         except ProofBackendError as e:
             try:
                 log.warning(f"[L2-PROOF] verifier subprocess error: {e}")

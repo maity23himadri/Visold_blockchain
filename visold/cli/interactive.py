@@ -4589,6 +4589,45 @@ class CLI:
         print(clr("  |  Current height: {:<10s}|".format(str(cur)), YELLOW))
         print(clr("  +============================+\n", RED))
 
+        # Bootstrap-serving safety envelope.  This is informational first,
+        # but the same invariant is enforced again by Blockchain.rollback().
+        try:
+            safety = bc.rollback_bootstrap_safety()
+        except Exception as exc:
+            safety = None
+            print(clr(
+                "  [!] Could not calculate bootstrap-safe rollback range: {}".format(exc),
+                YELLOW))
+
+        if safety is not None:
+            floor = safety.get("safe_floor")
+            watermark = int(safety.get("pruned_watermark", 0) or 0)
+            if floor is None:
+                print(clr("  [!] BOOTSTRAP SAFETY WARNING", RED))
+                print(clr(
+                    "      No rollback target is currently guaranteed to preserve "
+                    "fresh-peer bootstrap service.", RED))
+                print(clr("      {}".format(safety.get("reason", "history repair required")), YELLOW))
+                print(clr(
+                    "      Sync/repair from a healthy peer before rolling back.\n", YELLOW))
+            else:
+                max_depth = int(safety.get("max_safe_rollback", max(0, cur - int(floor))) or 0)
+                anchor = safety.get("anchor_snapshot")
+                print(clr("  Bootstrap-serving rollback guidance:", CYAN))
+                print(clr(
+                    "    Lowest safe target : {}".format(int(floor)), GREEN))
+                print(clr(
+                    "    Max safe rollback  : {} block(s)".format(max_depth), GREEN))
+                if anchor is not None:
+                    print(clr(
+                        "    Recovery anchor   : authenticated snapshot @{}".format(int(anchor)), DIM))
+                elif watermark == 0:
+                    print(clr(
+                        "    Recovery anchor   : full retained history / genesis", DIM))
+                print(clr(
+                    "    Meaning: rollback at or above this target keeps this node "
+                    "able to bootstrap fresh peers.\n", DIM))
+
         # ── Prompt for target height ──────────────────────────────────
         raw = self._read_input(clr("  Target height to rollback to: ", CYAN)).strip()
         try:
@@ -4603,6 +4642,24 @@ class CLI:
                 cur - 1), RED))
             self._read_input(clr("  Press Enter to return...", DIM))
             return
+
+        if safety is not None:
+            floor = safety.get("safe_floor")
+            if floor is None:
+                print(clr(
+                    "  [X] Rollback blocked by bootstrap-safety state: no safe target "
+                    "is currently available.", RED))
+                self._read_input(clr("  Press Enter to return...", DIM))
+                return
+            if target < int(floor):
+                print(clr(
+                    "  [X] Target {} is below the bootstrap-safe floor {}.".format(
+                        target, int(floor)), RED))
+                print(clr(
+                    "      Rolling back that far can leave this node unable to bootstrap "
+                    "fresh peers.", RED))
+                self._read_input(clr("  Press Enter to return...", DIM))
+                return
 
         blocks_to_delete = cur - target
         print(clr("\n  WARNING: This will DELETE {} block(s) "

@@ -180,6 +180,8 @@ def test_offline_receiver_reconnects_after_prune_restores_balance_mempool_and_re
     monkeypatch.setattr(Config, "SNAPSHOT_KEEP", 3)
     monkeypatch.setattr(Config, "SNAPSHOT_FAST_SYNC_ENABLED", True)
     monkeypatch.setattr(Config, "RECEIPT_RELAY_ENABLED", True)
+    monkeypatch.setattr(Config, "BOOTSTRAP_HEADER_RESPONSE_TIMEOUT_SECS", 1.0)
+    monkeypatch.setattr(Config, "BOOTSTRAP_HEADER_TIMEOUT_RETRIES", 3)
     DifficultyEngine.invalidate_cache()
 
     with patch.object(Blockchain, "get_difficulty", return_value=0.0), \
@@ -265,6 +267,7 @@ def test_offline_receiver_reconnects_after_prune_restores_balance_mempool_and_re
                     self._pagination_active = threading.Event()
                     self._snap_response_queue = None
                     self._bootstrap_header_queue = None
+                    self._legacy_silent_chain_drop_done = False
                 def send(self, msg):
                     mtype = msg.get("type")
                     if mtype == MSG_GET_SNAPSHOT_MANIFEST:
@@ -273,6 +276,11 @@ def test_offline_receiver_reconnects_after_prune_restores_balance_mempool_and_re
                             "manifest": source._snapshot_engine.get_manifest(),
                         })
                     elif mtype == MSG_GET_CHAIN:
+                        # Simulate legacy behavior: the first over-quota
+                        # GET_CHAIN disappears without busy/retry_after.
+                        if not self._legacy_silent_chain_drop_done:
+                            self._legacy_silent_chain_drop_done = True
+                            return
                         start = int(msg["from_idx"])
                         end = min(int(msg["to_idx"]), source.height())
                         blocks = [source.get_block(h).to_dict()

@@ -23,6 +23,7 @@ Defines: Sequencer
 Origin: visold_vsd_.py L25231-25767
 """
 
+import json
 import threading
 import time
 from typing import Dict, List, Optional, TYPE_CHECKING, Tuple
@@ -205,7 +206,8 @@ class Sequencer:
         return False
 
     def generate_batch_proof(self, batch: RollupBatch,
-                             compressed_data: bytes) -> bytes:
+                             compressed_data: bytes,
+                             pre_state_snapshot: dict) -> bytes:
         """Produce a proof that `batch.prev_root` transitions to
         `batch.new_root` when the contents of `compressed_data` are
         applied in order.
@@ -219,7 +221,29 @@ class Sequencer:
         """
         backend = ProofRegistry.get_configured()
         batch_h = RollupSubmission.batch_hash(compressed_data)
-        return backend.prove(batch.prev_root, batch.new_root, batch_h, b"")
+
+        # A real validity prover needs the actual transition witness.  Older
+        # code passed b"" here, which made a real SNARK backend impossible to
+        # implement despite the subprocess interface existing.  The witness is
+        # canonical JSON so external Rust/Go/C++/snarkjs provers can parse it
+        # without importing Visold Python code.  It deliberately includes the
+        # complete pre-state snapshot because the current L2 root is a sorted
+        # SHA-256 Merkle tree, not a circuit-friendly sparse tree with compact
+        # Merkle paths.  Future Poseidon/SMT migrations can replace this witness
+        # format under a new version without changing the backend interface.
+        witness_obj = {
+            "version": "visold_l2_witness_v1",
+            "previous_l2_root": batch.prev_root,
+            "new_l2_root": batch.new_root,
+            "batch_hash": batch_h,
+            "compressed_data": compressed_data.hex(),
+            "pre_state": pre_state_snapshot,
+            "transactions": [tx.to_dict() for tx in batch.txs],
+        }
+        witness = json.dumps(
+            witness_obj, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        return backend.prove(batch.prev_root, batch.new_root, batch_h, witness)
 
     def _seal_one(self) -> Optional[Tuple['Transaction', int, List[L2Transaction]]]:
         """Seal the current pending txs into a batch and return
@@ -377,7 +401,7 @@ class Sequencer:
                 self._seal_cycle_lock.release()
                 return None
 
-            proof_bytes = self.generate_batch_proof(batch, compressed)
+            proof_bytes = self.generate_batch_proof(batch, compressed, seal_snap)
             backend     = ProofRegistry.get_configured()
             submission  = RollupSubmission(
                 batch_id         = batch_id,

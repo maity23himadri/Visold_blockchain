@@ -88,7 +88,10 @@ def test_all_pruning_nodes_can_bootstrap_fresh_node_from_authenticated_snapshot(
         # Snapshot restore prunes the old local prefix through the rolling
         # cutoff rather than incorrectly setting the watermark to snapshot H.
         assert fresh_st.get_meta("rolling_pruned_until") == "5"
-        assert fresh.get_block(0).is_pruned is True
+        # Genesis remains the full local trust anchor; authenticated bootstrap
+        # installs 1..H as header-only and the positive watermark records that
+        # the historical prefix is non-archival.
+        assert fresh.get_block(0).is_pruned is False
         assert fresh.get_block(1).is_pruned is True
 
         # Replay protection is part of the authenticated snapshot, despite old

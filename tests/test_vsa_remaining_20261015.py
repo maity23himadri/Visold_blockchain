@@ -251,6 +251,11 @@ def test_udp_initiator_opens_the_handshake_before_waiting_for_the_challenge(monk
     net.node_id = "initiator-under-test"
     net.port = 19701
     net.wallet = SimpleNamespace(pub_hex="00", user_id="", priv=None)
+    # Keep this fixture focused on handshake ordering: the path builds HELLO
+    # using storage metadata and a local chain height before it calls peer.send.
+    net.storage = SimpleNamespace(get_meta=lambda _key: "")
+    net.blockchain = SimpleNamespace(height=lambda: 0)
+    net._local_chain_tip_hash = lambda: ""
 
     assert net._udp_connect_to("203.0.113.9", 19701) is False  # the fake peer never sends VERIFY
     assert events[0] == "HB", f"the handshake was not opened first: {events}"

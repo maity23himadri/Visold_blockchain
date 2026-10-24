@@ -640,6 +640,17 @@ class Config:
     # answered within this many seconds, the peer is considered zombie and
     # the request is re-issued to an alternate connected peer.
     CHAIN_SYNC_TIMEOUT_SECS = 30        # seconds before sync watchdog fires
+    # Authenticated snapshot header pagination may legitimately encounter the
+    # server's GET_CHAIN DoS bucket. Each page retries explicit correlated
+    # backpressure independently, so this bound does not depend on chain height.
+    BOOTSTRAP_HEADER_BUSY_RETRIES = int(os.environ.get(
+        "VISOLD_BOOTSTRAP_HEADER_BUSY_RETRIES", "8"))
+    # Compatibility with legacy peers that silently drop over-quota GET_CHAIN
+    # requests instead of returning correlated busy/retry_after backpressure.
+    BOOTSTRAP_HEADER_TIMEOUT_RETRIES = int(os.environ.get(
+        "VISOLD_BOOTSTRAP_HEADER_TIMEOUT_RETRIES", "3"))
+    BOOTSTRAP_HEADER_RESPONSE_TIMEOUT_SECS = float(os.environ.get(
+        "VISOLD_BOOTSTRAP_HEADER_RESPONSE_TIMEOUT_SECS", "30"))
 
     # SQLite busy timeout (v7.0.1.0 — Bug 1 fix)
     # WAL mode allows only one writer at a time.  Without a busy_timeout,

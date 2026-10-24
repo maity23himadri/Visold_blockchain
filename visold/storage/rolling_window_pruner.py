@@ -121,7 +121,61 @@ class RollingWindowPruner:
         self._storage       = storage
         self._last_height   = -1
         self._running_lock  = threading.Lock()
+        # Wired by Blockchain immediately after StateSnapshotEngine creation.
+        # Pruning fails closed (no new body deletion) until this is available,
+        # because recoverability must be anchored by a committed snapshot.
+        self._snapshot_engine = None
         self._ensure_header_table()
+
+    def set_snapshot_engine(self, snapshot_engine) -> None:
+        """Attach the snapshot engine used to enforce bootstrap recoverability."""
+        self._snapshot_engine = snapshot_engine
+
+    def _recoverability_aligned_cutoff(self, current_height: int) -> int:
+        """Return the exclusive prune boundary that preserves rollback/bootstrap liveness.
+
+        The raw rolling-window cutoff alone is unsafe: if it lands between two
+        committed snapshot anchors, pruning to that arbitrary height can delete
+        the replay suffix needed after a later rollback.  We therefore prune
+        only through ``S`` (exclusive boundary ``S+1``), where ``S`` is the
+        newest *servable/committed* bootstrap snapshot strictly below the raw
+        cutoff.  This guarantees every target at or above the persisted
+        watermark can still be reconstructed from a surviving authenticated
+        snapshot plus contiguous full bodies.
+
+        With the default 600-block window and 600-block bootstrap interval this
+        intentionally retains between ~600 and ~1199 full bodies.  The extra
+        bounded retention is the price of making pruning and rollback mutually
+        safe without weakening snapshot authentication.
+        """
+        raw_cutoff = max(0, int(current_height) - int(Config.ROLLING_PRUNE_WINDOW))
+        if raw_cutoff <= 0:
+            return 0
+        eng = self._snapshot_engine
+        if eng is None:
+            # RollingWindowPruner is also used directly by storage-level tools
+            # and unit tests. Blockchain production construction always wires
+            # StateSnapshotEngine immediately; preserve legacy raw-window
+            # compaction only for this standalone mode.
+            return raw_cutoff
+        try:
+            manifest = eng.get_servable_manifest()
+        except Exception as exc:
+            log.warning(
+                "RollingWindowPruner: cannot inspect servable snapshots; "
+                "skipping prune for recoverability safety: %s", exc)
+            return 0
+        anchors = []
+        for entry in manifest:
+            try:
+                h = int(entry.get("height", -1))
+            except Exception:
+                continue
+            if 0 < h < raw_cutoff:
+                anchors.append(h)
+        if not anchors:
+            return 0
+        return min(raw_cutoff, max(anchors) + 1)
 
     # ── Schema bootstrap ──────────────────────────────────────────────────────
     def _ensure_header_table(self):
@@ -233,7 +287,9 @@ class RollingWindowPruner:
         Cross-store paths deliberately fail closed if canonical compaction or
         projection cleanup cannot be completed.
         """
-        cutoff = max(0, int(current_height) - Config.ROLLING_PRUNE_WINDOW)
+        cutoff = self._recoverability_aligned_cutoff(current_height)
+        if cutoff <= 0:
+            return 0
         archived = 0
         pruned = 0
         _ARCHIVE_THRESHOLD = Config.ROLLING_PRUNE_ARCHIVE_THRESHOLD
@@ -264,8 +320,16 @@ class RollingWindowPruner:
                 if first_block is not None:
                     first_data = first_block.to_dict()
                     if not bool(first_data.get("pruned", False)):
-                        watermark = 0
-                        self._storage.set_meta("rolling_pruned_until", "0")
+                        # Authenticated bootstrap deliberately retains genesis as
+                        # a full trust anchor while installing 1..H header-only.
+                        # That valid shape must keep its positive watermark. Only
+                        # reset the legacy stale marker when block 1 is full too.
+                        second = self._storage.get_block(1)
+                        second_pruned = bool(
+                            second is not None and second.to_dict().get("pruned", False))
+                        if not second_pruned:
+                            watermark = 0
+                            self._storage.set_meta("rolling_pruned_until", "0")
             except Exception:
                 # On an uncertain read, do not move the watermark forward.
                 watermark = min(watermark, cutoff)
@@ -607,7 +671,8 @@ class RollingWindowPruner:
                 return 0
         processed = 0
         try:
-            cutoff = max(0, height - int(Config.ROLLING_PRUNE_WINDOW))
+            raw_cutoff = max(0, height - int(Config.ROLLING_PRUNE_WINDOW))
+            cutoff = raw_cutoff
             c = self._storage._conn()
 
             # Find the contiguous pruned prefix, while repairing any missing
@@ -619,6 +684,11 @@ class RollingWindowPruner:
             prefix_open = True
             all_prefix_boundary = 0  # actual contiguous pruned prefix through the tip
             all_prefix_open = True
+            # Bootstrap keeps genesis full but can install 1..H as one
+            # contiguous header-only range. Track that explicit genesis
+            # exception so the watermark still records historical unavailability.
+            genesis_exception_boundary = 0
+            genesis_exception_open = True
             first_full_at_or_after_cutoff = None
             scan_complete = True
             batch = []
@@ -660,6 +730,13 @@ class RollingWindowPruner:
                         all_prefix_boundary = idx + 1
                     else:
                         all_prefix_open = False
+                if idx == 0:
+                    genesis_exception_open = not is_pruned
+                elif genesis_exception_open:
+                    if is_pruned:
+                        genesis_exception_boundary = idx + 1
+                    else:
+                        genesis_exception_open = False
                 if idx >= cutoff and not is_pruned and first_full_at_or_after_cutoff is None:
                     first_full_at_or_after_cutoff = idx
 
@@ -702,8 +779,11 @@ class RollingWindowPruner:
             self._storage.set_meta("rolling_pruned_until", str(contiguous))
             metrics.set_gauge("rolling_pruned_until_height", float(contiguous))
 
-            target = cutoff
-            # Run bounded batches to completion.  The guard guarantees progress
+            target = self._recoverability_aligned_cutoff(height)
+            # Run bounded batches to completion only to the recoverability-safe
+            # boundary. Imported header-only history may already extend farther;
+            # that factual prefix is preserved by the reconciliation scan above.
+            # The guard guarantees progress
             # or exits, so a backend failure cannot cause an infinite loop.
             while self.get_pruned_watermark() < target:
                 before = self.get_pruned_watermark()
@@ -718,11 +798,35 @@ class RollingWindowPruner:
             # Preserve that fact for rollback guards and avoid reprocessing it as
             # though it were still a full-body range.
             if self.get_pruned_watermark() >= target:
-                final_boundary = (
-                    first_full_at_or_after_cutoff
-                    if first_full_at_or_after_cutoff is not None
-                    else height + 1
-                )
+                # Extend only through heights that are *actually* header-only
+                # after the safe compaction. This can join a newly-pruned local
+                # prefix to an imported bootstrap header-only suffix, but can
+                # never leap across a retained full body merely because the old
+                # raw rolling cutoff was farther ahead.
+                final_boundary = int(target)
+                scan = final_boundary
+                if scan == 0:
+                    try:
+                        g0 = self._storage.get_block(0)
+                        g1 = self._storage.get_block(1) if height >= 1 else None
+                        if (g0 is not None and not bool(g0.to_dict().get("pruned", False))
+                                and g1 is not None and bool(g1.to_dict().get("pruned", False))):
+                            scan = 1
+                            final_boundary = 1
+                    except Exception:
+                        pass
+                while scan <= height:
+                    try:
+                        blk = self._storage.get_block(scan)
+                        if blk is None or not bool(blk.to_dict().get("pruned", False)):
+                            break
+                    except Exception:
+                        break
+                    final_boundary = scan + 1
+                    scan += 1
+                final_boundary = max(
+                    final_boundary, int(all_prefix_boundary),
+                    int(genesis_exception_boundary))
                 self._storage.set_meta("rolling_pruned_until", str(final_boundary))
                 metrics.set_gauge(
                     "rolling_pruned_until_height", float(final_boundary))

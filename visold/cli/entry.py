@@ -149,6 +149,23 @@ Safety:
         cli.run()
     except SystemExit:
         pass
+    except EOFError:
+        # Standard input was closed (redirected from /dev/null, a detached or
+        # containerised process, or Ctrl-D) while the node was waiting for an
+        # answer.  This is an expected end-of-input condition, not a crash, so
+        # print one clear line instead of "Fatal error:" plus a traceback.
+        # The exit code stays 1: the node could not continue, and a service
+        # manager must be able to see that.  (Once an account exists, the main
+        # menu loop already tolerates a closed stdin and keeps running; only
+        # prompts that need an answer, such as first-run account setup, end here.)
+        # The finally block below still runs shutdown_node().
+        _restore_terminal()
+        print(clr("\nInput was closed while Visold was waiting for an answer, "
+                  "so it cannot continue.\n"
+                  "If this is the first run, start it once in an interactive "
+                  "terminal to create or restore your account.", YELLOW),
+              file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         _restore_terminal()
         print(clr(f"\nFatal error: {e}", RED))

@@ -466,7 +466,20 @@ class StateSnapshotEngine:
         self._storage.set_meta(self._MANIFEST, json.dumps(manifest))
 
     def _evict_old_snapshots(self, current_height: int):
-        """Keep only the most recent SNAPSHOT_KEEP snapshots."""
+        """Evict snapshots without breaking pruning/rollback recoverability.
+
+        A fixed ``SNAPSHOT_KEEP`` count is insufficient when the rolling-prune
+        window spans more snapshot intervals: an anchor that will be needed as
+        the prune boundary advances can be deleted before it becomes the active
+        floor.  Keep:
+          * the configured newest ``SNAPSHOT_KEEP`` entries;
+          * every snapshot inside the current rolling rollback horizon; and
+          * the newest snapshot immediately before that horizon.
+
+        This remains bounded by roughly ``window / interval + keep + 1`` and
+        guarantees the pruner always has the authenticated anchor ladder needed
+        to advance safely.
+        """
         try:
             raw = self._storage.get_meta(self._MANIFEST)
             if not raw:
@@ -474,41 +487,133 @@ class StateSnapshotEngine:
             manifest = json.loads(raw)
         except Exception:
             return
-        # A tip exactly on a snapshot boundary has not yet mined the NEXT
-        # block that commits that snapshot digest.  Keep at least two snapshots
-        # while rolling pruning is enabled so the previous, already-committed
-        # anchor remains available to a fresh bootstrapper.
-        keep = int(Config.SNAPSHOT_KEEP)
-        if Config.ROLLING_PRUNE_ENABLED:
-            keep = max(2, keep)
-        if len(manifest) <= keep:
+        if not isinstance(manifest, list) or not manifest:
             return
-        to_evict = manifest[: len(manifest) - keep]
-        for entry in to_evict:
-            h = entry.get("height", -1)
-            if h >= 0:
-                try:
-                    _key = f"{self._KEY_PREFIX}{h}"
-                    if self._storage._pgx_enabled:
-                        self._storage._pg_exec("DELETE FROM node_meta WHERE key=$1", _key)
-                    else:
-                        c = self._storage._conn()
-                        c.execute("DELETE FROM node_meta WHERE key=?", (_key,))
-                        c.commit()
-                except Exception:
-                    pass
-        # Update manifest
-        manifest = manifest[len(to_evict):]
-        self._storage.set_meta(self._MANIFEST, json.dumps(manifest))
+        manifest = [e for e in manifest if isinstance(e, dict) and "height" in e]
+        manifest.sort(key=lambda e: int(e.get("height", -1)))
+        keep_count = max(1, int(Config.SNAPSHOT_KEEP))
+        keep_heights = {int(e["height"]) for e in manifest[-keep_count:]}
+
+        if Config.ROLLING_PRUNE_ENABLED:
+            threshold = max(0, int(current_height) - int(Config.ROLLING_PRUNE_WINDOW))
+            below = []
+            for e in manifest:
+                h = int(e.get("height", -1))
+                if h >= threshold:
+                    keep_heights.add(h)
+                elif h >= 0:
+                    below.append(h)
+            if below:
+                keep_heights.add(max(below))
+
+        kept = []
+        for entry in manifest:
+            h = int(entry.get("height", -1))
+            if h in keep_heights:
+                kept.append(entry)
+                continue
+            try:
+                key = f"{self._KEY_PREFIX}{h}"
+                if self._storage._pgx_enabled:
+                    self._storage._pg_exec("DELETE FROM node_meta WHERE key=$1", key)
+                else:
+                    c = self._storage._conn()
+                    c.execute("DELETE FROM node_meta WHERE key=?", (key,))
+                    c.commit()
+            except Exception as exc:
+                # Fail closed: if blob deletion is uncertain, retain the manifest
+                # entry so maintenance can retry instead of silently orphaning it.
+                log.warning(
+                    "StateSnapshotEngine: snapshot eviction failed h=%d: %s", h, exc)
+                kept.append(entry)
+        kept.sort(key=lambda e: int(e.get("height", -1)))
+        self._storage.set_meta(self._MANIFEST, json.dumps(kept))
 
     # ── Retrieval for P2P serving ─────────────────────────────────────────────
     def get_manifest(self) -> list:
-        """Return list of available snapshot entries."""
+        """Return the locally persisted snapshot manifest."""
         try:
             raw = self._storage.get_meta(self._MANIFEST)
             return json.loads(raw) if raw else []
         except Exception:
             return []
+
+    def get_servable_manifest(self) -> list:
+        """Return only snapshots that this *current* canonical tip can serve.
+
+        A snapshot at H is bootstrap-authenticated by the commitment in H+1,
+        so a rolled-back node whose tip is <= H must never advertise it even if
+        stale metadata or a cached blob remains on disk.  Requiring the blob and
+        both canonical headers also makes serving fail closed after partial
+        metadata corruption.
+        """
+        try:
+            tip = int(self._storage.chain_height())
+        except Exception:
+            return []
+        out = []
+        for entry in self.get_manifest():
+            if not isinstance(entry, dict) or not entry.get("bootstrap_digest"):
+                continue
+            try:
+                h = int(entry.get("height", -1))
+            except (TypeError, ValueError):
+                continue
+            if h <= 0 or h + 1 > tip:
+                continue
+            if self.get_snapshot_blob(h) is None:
+                continue
+            try:
+                if not self._storage.get_block_header(h) or not self._storage.get_block_header(h + 1):
+                    continue
+            except Exception:
+                continue
+            out.append(entry)
+        out.sort(key=lambda e: int(e.get("height", -1)))
+        return out
+
+    def invalidate_snapshots_above(self, height: int) -> None:
+        """Remove cached/created snapshots that are no longer on the local tip.
+
+        Rollback changes canonical history availability.  Keeping a snapshot
+        above the new tip would make this node advertise state it can no longer
+        authenticate with a local H+1 commitment.
+        """
+        cutoff = int(height)
+        with self._snap_lock:
+            manifest = self.get_manifest()
+            kept = []
+            for entry in manifest:
+                try:
+                    h = int(entry.get("height", -1))
+                except Exception:
+                    continue
+                if h > cutoff:
+                    key = f"{self._KEY_PREFIX}{h}"
+                    try:
+                        if self._storage._pgx_enabled:
+                            self._storage._pg_exec("DELETE FROM node_meta WHERE key=$1", key)
+                        else:
+                            c = self._storage._conn()
+                            c.execute("DELETE FROM node_meta WHERE key=?", (key,))
+                            c.commit()
+                    except Exception as exc:
+                        log.warning("StateSnapshotEngine: failed deleting stale snapshot %d: %s", h, exc)
+                else:
+                    kept.append(entry)
+            kept.sort(key=lambda e: int(e.get("height", -1)))
+            self._storage.set_meta(self._MANIFEST, json.dumps(kept))
+            self._last_snap_h = int(kept[-1]["height"]) if kept else -1
+
+            for h_key, r_key in (("snap_restored_height", "snap_restored_root"),
+                                 ("bootstrap_checkpoint_height", "bootstrap_checkpoint_hash")):
+                try:
+                    raw = self._storage.get_meta(h_key)
+                    if raw not in (None, "") and int(raw) > cutoff:
+                        self._storage.set_meta(h_key, "")
+                        self._storage.set_meta(r_key, "")
+                except Exception:
+                    pass
 
     def get_snapshot_blob(self, height: int) -> Optional[bytes]:
         """Return raw compressed bytes for snapshot at `height`, or None."""
@@ -520,8 +625,34 @@ class StateSnapshotEngine:
             pass
         return None
 
+    def is_snapshot_servable(self, height: int) -> bool:
+        """Return True only when ``height`` is authenticated by this tip.
+
+        A cached blob alone is not enough: the current canonical chain must
+        still contain both H and H+1, and the manifest entry must carry the
+        committed bootstrap digest.  Direct snapshot/chunk requests use this
+        guard too, so callers cannot bypass manifest filtering by guessing a
+        stale rollback height.
+        """
+        try:
+            want = int(height)
+        except Exception:
+            return False
+        return any(
+            isinstance(e, dict) and int(e.get("height", -1)) == want
+            for e in self.get_servable_manifest()
+        )
+
+    def latest_servable_snapshot_height(self) -> int:
+        manifest = self.get_servable_manifest()
+        return int(manifest[-1]["height"]) if manifest else -1
+
     def latest_snapshot_height(self) -> int:
-        """Return height of the most recent available snapshot, or -1."""
+        """Return height of the most recent cached snapshot, or -1.
+
+        Network serving must use ``latest_servable_snapshot_height`` instead.
+        This raw helper remains for local maintenance/diagnostics.
+        """
         manifest = self.get_manifest()
         if not manifest:
             return -1
@@ -814,12 +945,32 @@ class StateSnapshotEngine:
                 "l2_tree", json.dumps(l2_tree, separators=(",", ":"), sort_keys=True))
             self._storage.set_meta("l2_last_batch_id", str(l2_last_batch))
             # Keep one authenticated rollback checkpoint rather than importing
-            # peer-local L2 history.
+            # peer-local L2 history.  It must use Layer2State's own entry
+            # format (l1_height / l1_block_hash / batch_id / l2_root /
+            # snapshot).  The earlier {"height", "tree", "last_batch_id"}
+            # shape was never read by Layer2State, so any later rollback
+            # onto this checkpoint raised KeyError.
+            try:
+                from visold.rollup.l2_state import L2StateTree
+                _l2_t = L2StateTree()
+                _l2_t.restore(l2_tree)
+                _l2_root = _l2_t.root()
+            except Exception as _l2_root_exc:
+                log.warning(
+                    f"bootstrap: could not compute L2 root for the "
+                    f"checkpoint: {_l2_root_exc}")
+                _l2_root = ""
             self._storage.set_meta(
                 "l2_history",
-                json.dumps([{"height": snap_h, "tree": l2_tree,
-                             "last_batch_id": l2_last_batch}],
+                json.dumps([{"l1_height": snap_h,
+                             "l1_block_hash": str(anchor.get("block_hash", "")),
+                             "batch_id": l2_last_batch,
+                             "l2_root": _l2_root,
+                             "snapshot": l2_tree}],
                            separators=(",", ":"), sort_keys=True))
+            # L2 state before the snapshot height is not retained, so a
+            # rollback below it must be refused rather than reset to empty.
+            self._storage.set_meta("l2_history_first_height", "0")
             self._storage.set_meta("cumulative_issued_sat", str(cumulative))
             # Do not set rolling_pruned_until=snap_h.  The local prefix can
             # still contain full bodies even though the imported suffix is
@@ -849,6 +1000,30 @@ class StateSnapshotEngine:
             self._storage.set_meta("snap_restored_root", str(payload.get("state_root", "")))
             self._storage.set_meta("bootstrap_restore_in_progress", "")
             self._storage.record_block_apply_result(snap_h, True)
+
+            # A successfully authenticated bootstrap snapshot is safe to relay.
+            # Persist the exact verified compressed bytes plus the digest that
+            # was independently recovered from the H+1 PoW commitment.  This
+            # makes bootstrap availability transitive: a node that joined via
+            # snapshot can later bootstrap other nodes once it has H+1/tip.
+            # Cache failure is non-consensus-critical because state/header
+            # installation is already complete; fail closed for serving via the
+            # manifest filter and surface the problem in logs.
+            try:
+                with self._snap_lock:
+                    self._storage.set_meta(f"{self._KEY_PREFIX}{snap_h}", blob.hex())
+                    self._update_manifest(
+                        snap_h, str(payload.get("state_root", "")), len(blob),
+                        str(anchor.get("block_hash", "")),
+                        bootstrap_digest=str(expected_digest),
+                    )
+                    self._last_snap_h = max(int(self._last_snap_h), snap_h)
+                    self._evict_old_snapshots(snap_h)
+            except Exception as _cache_exc:
+                log.error(
+                    "StateSnapshotEngine: authenticated snapshot h=%d installed "
+                    "but relay-cache persistence failed: %s", snap_h, _cache_exc)
+
             metrics.inc("snapshots_restored")
             log.info(
                 "StateSnapshotEngine: authenticated pruning bootstrap installed at height=%d",

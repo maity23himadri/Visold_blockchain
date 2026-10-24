@@ -386,6 +386,12 @@ class Layer2State:
         self._history: List[dict] = []
         self._history_max = getattr(
             Config, "L2_ROOT_HISTORY_DEPTH", self._DEFAULT_ROOT_HISTORY)
+        # Lowest L1 height of any checkpoint recorded since the last reset
+        # (None = none yet).  It survives eviction from _history, so a
+        # rollback can tell "there never was L2 state at or before that
+        # height" (empty is correct) from "there was, but its checkpoint has
+        # been evicted" (empty would destroy valid balances).
+        self._history_first_height: Optional[int] = None
         # Track last confirmed batch id so sequencer replay-protection is
         # enforceable here without coupling to the Sequencer object.
         self._last_batch_id: int = -1
@@ -404,6 +410,7 @@ class Layer2State:
     _META_TREE    = "l2_tree"
     _META_HISTORY = "l2_history"
     _META_BATCHID = "l2_last_batch_id"
+    _META_FIRST   = "l2_history_first_height"
 
     def _try_restore_from_storage(self) -> None:
         try:
@@ -417,11 +424,61 @@ class Layer2State:
             raw_b = self.storage.get_meta(self._META_BATCHID)
             if raw_b is not None and raw_b != "":
                 self._last_batch_id = int(raw_b)
+            # Databases written before this key existed simply have none.
+            # A blank or unreadable value must never discard the L2 state
+            # loaded above, so it is parsed on its own.
+            try:
+                raw_f = self.storage.get_meta(self._META_FIRST)
+                self._history_first_height = (
+                    int(raw_f) if raw_f not in (None, "") else None)
+            except (TypeError, ValueError):
+                self._history_first_height = None
+            self._upgrade_bootstrap_history()
         except Exception as e:
             log.warning(f"Layer2State: restore failed — starting empty: {e}")
             self._tree    = L2StateTree()
             self._history = []
             self._last_batch_id = -1
+            self._history_first_height = None
+
+    def _upgrade_bootstrap_history(self) -> None:
+        """Convert checkpoints left by the old snapshot-bootstrap import.
+
+        Before the import wrote this class's own entry format, a bootstrapped
+        node stored its single checkpoint as {"height", "tree",
+        "last_batch_id"}.  rollback_to_height() could not read that and
+        raised KeyError.  Such entries are converted in memory (they are
+        written back in the new format by the next persist).  L2 state before
+        the snapshot height was never retained, so the lowest known height
+        becomes 0 and a rollback below it is refused instead of reset.
+        This method never raises: an entry it cannot convert is left alone.
+        """
+        converted = False
+        upgraded: List[dict] = []
+        for e in self._history:
+            try:
+                if (isinstance(e, dict) and "snapshot" not in e
+                        and "tree" in e and "height" in e):
+                    tree = e["tree"]
+                    t = L2StateTree()
+                    t.restore(tree)
+                    e = {
+                        "l1_height": int(e["height"]),
+                        "l1_block_hash": "",
+                        "batch_id": int(e.get("last_batch_id", -1)),
+                        "l2_root": t.root(),
+                        "snapshot": tree,
+                    }
+                    converted = True
+            except Exception as ex:
+                log.warning(f"Layer2State: could not upgrade a bootstrap "
+                            f"checkpoint, leaving it unchanged: {ex}")
+            upgraded.append(e)
+        if converted:
+            self._history = upgraded
+            self._history_first_height = (
+                0 if self._history_first_height is None
+                else min(self._history_first_height, 0))
 
     def _persist(self) -> None:
         """Atomically persist the complete L2 state.
@@ -432,19 +489,74 @@ class Layer2State:
         Exceptions deliberately propagate to the mutating caller so it can
         restore its in-memory pre-mutation snapshot.
         """
+        # Remember the lowest checkpoint height BEFORE anything is evicted.
+        # It is only committed to memory after the write below succeeds, so
+        # a failed persist (whose caller restores its old history) cannot
+        # leave a first-height that belongs to a discarded checkpoint.
+        first = self._history_first_height
+        for _e in self._history:
+            _h = self._entry_height(_e)
+            first = _h if first is None else min(first, _h)
         # Bound history size before serialisation.
-        if len(self._history) > self._history_max:
-            self._history = self._history[-self._history_max:]
+        self._trim_history()
         values = {
             self._META_TREE: json.dumps(self._tree.snapshot()),
             self._META_HISTORY: json.dumps(self._history),
             self._META_BATCHID: str(self._last_batch_id),
+            self._META_FIRST: "" if first is None else str(int(first)),
         }
         try:
             self.storage.set_meta_batch(values)
         except Exception as e:
             log.error(f"Layer2State: atomic persist FAILED: {e}")
             raise
+        self._history_first_height = first
+
+    @staticmethod
+    def _entry_height(entry) -> int:
+        """L1 height of a checkpoint entry; -1 if absent or unreadable (the
+        same default rollback_to_height() uses)."""
+        try:
+            return int(entry.get("l1_height", -1))
+        except (AttributeError, TypeError, ValueError):
+            return -1
+
+    def _trim_history(self) -> None:
+        """Bound _history to self._history_max entries.
+
+        rollback_to_height() scans from the newest entry backwards and takes
+        the first one whose height is <= the requested height.  An entry
+        followed by a later entry of the same or lower height can therefore
+        never be selected, whatever height is asked for.  Several bridge
+        events inside one block each add an entry, so most of a busy
+        block's entries are exactly that.  They are dropped first (oldest
+        first), which cannot change any rollback result.  Only if that is
+        not enough are the oldest remaining entries evicted; the lowest
+        height ever recorded is kept in _history_first_height so a rollback
+        can still tell that valid state was evicted.
+        """
+        excess = len(self._history) - self._history_max
+        if excess <= 0:
+            return
+        heights = [self._entry_height(e) for e in self._history]
+        shadowed: List[int] = []
+        later_min: Optional[int] = None          # min height of entries after i
+        for i in range(len(heights) - 1, -1, -1):
+            if later_min is not None and later_min <= heights[i]:
+                shadowed.append(i)
+            later_min = heights[i] if later_min is None else min(later_min, heights[i])
+        shadowed.sort()                          # oldest first
+        drop = set(shadowed[:excess])
+        remaining = excess - len(drop)
+        if remaining > 0:
+            # Every shadowed entry is already gone; evict the oldest others.
+            for i in range(len(heights)):
+                if remaining == 0:
+                    break
+                if i not in drop:
+                    drop.add(i)
+                    remaining -= 1
+        self._history = [e for i, e in enumerate(self._history) if i not in drop]
 
     def _checkpoint(self, l1_height: int, l1_block_hash: str) -> None:
         """Record a full L2 checkpoint after an L1 bridge mutation.
@@ -497,6 +609,7 @@ class Layer2State:
                 # copy is sufficient.
                 "history":       list(self._history),
                 "last_batch_id": int(self._last_batch_id),
+                "history_first_height": self._history_first_height,
             }
 
     def restore_full(self, snap: dict) -> None:
@@ -513,6 +626,7 @@ class Layer2State:
                 log.error(f"Layer2State.restore_full: tree restore failed: {e}")
             self._history       = list(snap.get("history") or [])
             self._last_batch_id = int(snap.get("last_batch_id", -1))
+            self._history_first_height = snap.get("history_first_height")
             # Persist immediately so a crash between here and the next
             # mutating call cannot leave a divergent on-disk state.
             self._persist()
@@ -706,27 +820,103 @@ class Layer2State:
 
     # ── Reorg: roll L2 back to the most recent confirmed point whose L1
     # height is still canonical ───────────────────────────────────────────
+    def _rollback_plan(self, safe_l1_height: int):
+        """Decide, without changing anything, how a rollback would go.
+
+        Returns (kind, entry):
+          "restore" — entry is the newest checkpoint at/before the height.
+          "none"    — there is no L2 state at all; nothing to roll back.
+          "empty"   — no checkpoint at/before the height, and none ever
+                      existed there, so the correct state is empty.
+          "lost"    — no checkpoint is retained at/before the height, but one
+                      was recorded there and has been evicted.  The correct
+                      state can no longer be rebuilt, and resetting to empty
+                      would destroy valid balances while the L1 escrow keeps
+                      the money, so the caller must refuse.
+        Caller must hold self._lock.
+        """
+        for entry in reversed(self._history):
+            if int(entry.get("l1_height", -1)) <= int(safe_l1_height):
+                if not isinstance(entry.get("snapshot"), dict):
+                    # Unreadable checkpoint: it cannot be restored, and
+                    # guessing (reset or skip) could destroy valid balances.
+                    return "lost", None
+                return "restore", entry
+        first = self._history_first_height
+        if first is None:
+            # Database from before first-height tracking: use what is kept.
+            for _e in self._history:
+                _h = self._entry_height(_e)
+                first = _h if first is None else min(first, _h)
+        if first is not None and int(safe_l1_height) >= int(first):
+            return "lost", None
+        if (not self._history and self._last_batch_id == -1
+                and self._history_first_height is None
+                and self._tree.account_count() == 0):
+            return "none", None
+        return "empty", None
+
+    def can_rollback_to_height(self, safe_l1_height: int) -> Tuple[bool, str]:
+        """Read-only: could rollback_to_height() restore the right state?
+
+        Lets a caller refuse a reorg or rollback BEFORE it changes any L1
+        state, instead of discovering afterwards that L2 cannot follow.
+        """
+        with self._lock:
+            kind, _entry = self._rollback_plan(safe_l1_height)
+            if kind == "lost":
+                return False, (
+                    f"L2 checkpoint history cannot restore L1 height "
+                    f"{int(safe_l1_height)} (the checkpoint needed is "
+                    f"missing or unreadable); refusing to discard L2 balances")
+        return True, "OK"
+
     def rollback_to_height(self, safe_l1_height: int) -> Tuple[bool, str]:
         """Restore the latest complete L2 checkpoint at/before an L1 height.
 
         Every bridge mutation and every committed rollup now creates a
         checkpoint, so this no longer rewinds a post-batch deposit/withdrawal
         to an older batch snapshot.
+
+        Returns (True, "OK") after restoring a checkpoint, (True,
+        "no-l2-state") when there was no L2 state to roll back, (True,
+        "reset-to-empty") when L2 state existed only above the height, and
+        (False, reason) — with nothing changed — when the needed checkpoint
+        has been evicted.
         """
         with self._lock:
-            target = None
-            for entry in reversed(self._history):
-                if int(entry.get("l1_height", -1)) <= int(safe_l1_height):
-                    target = entry
-                    break
-            if target is None:
+            kind, target = self._rollback_plan(safe_l1_height)
+            if kind == "lost":
+                return False, (
+                    f"L2 checkpoint history cannot restore L1 height "
+                    f"{int(safe_l1_height)} (the checkpoint needed is "
+                    f"missing or unreadable); refusing to discard L2 balances")
+            if kind == "none":
+                log.debug(
+                    f"Layer2State.rollback_to_height({safe_l1_height}): "
+                    f"no L2 state, nothing to roll back")
+                return True, "no-l2-state"
+            if kind == "empty":
                 log.warning(
                     f"Layer2State.rollback_to_height({safe_l1_height}): "
                     f"no checkpoint at or before that height — resetting L2 tree")
-                self._tree = L2StateTree()
-                self._history = []
-                self._last_batch_id = -1
-                self._persist()
+                old_tree = self._tree.snapshot()
+                old_history = list(self._history)
+                old_batch_id = self._last_batch_id
+                old_first = self._history_first_height
+                try:
+                    self._tree = L2StateTree()
+                    self._history = []
+                    self._last_batch_id = -1
+                    self._history_first_height = None
+                    self._persist()
+                except Exception:
+                    self._tree = L2StateTree()
+                    self._tree.restore(old_tree)
+                    self._history = old_history
+                    self._last_batch_id = old_batch_id
+                    self._history_first_height = old_first
+                    raise
                 return True, "reset-to-empty"
 
             old_tree = self._tree.snapshot()
