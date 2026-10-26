@@ -1,0 +1,13 @@
+Visold full fixed codebase assembled from tested RPC fix archive plus pruning/recovery patch.
+Additional fix: TCP_INFO diagnostics now use socket capability rather than sys.platform, which recognizes Android/Termux correctly; diagnostic-only, no peer-flow change.
+Changes: RPC slow-method rate limiting and bounded connection handling; pruning integration test aligned with committed-snapshot policy; dry_run_state_root SQLite nonce-row presence restoration.
+Test-only portability adjustment: process-death rollback regression uses a low first-block difficulty only in its isolated child process so Android/Termux does not time out while doing unnecessary PoW work. Production consensus code/config defaults are unchanged by this test adjustment.
+No production pruning safety invariant intentionally relaxed.
+
+9876fbaf0ddb253168f67faf1e742f179568c8ce28eddaae0caac7e0db2f115f  visold/api/rpc_server.py
+1379bf03629eef8a82a53374dec04cd9caca07600b81e1924a687dd86915ed88  visold/chain/blockchain.py
+364c07a3ff542c64cb1b65790a142f40525a7a1bf7015ae80de8736c30a12004  tests/test_rpc_server_load_regressions_20261025.py
+146abe1e942707bbce21909a59c28e8fa5f497c37902b79ee8b5111b75bf020b  tests/test_pruned_resync_integration.py
+3adeb32a73dcc622ebc3a2f063883c9ac1aae15eb6cdc32a3a9640eae6a27c19  tests/test_consensus_hardening_regressions.py
+9abcf5905f068129d36ac84fb7c2d0924e96f69b1d43a77819f8f97c194f5e84  visold/network/peer_connection.py
+8a7cd2c9b40e0330a91474915660d557725ca500cf3ee7322f43399910a235ad  tests/test_tcp_eof_diagnostics_20261022.py

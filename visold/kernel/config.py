@@ -353,11 +353,16 @@ class Config:
     #     in TARGET_BLOCK_TIME seconds, the network needs:
     #         H_required = 2^(4·D) / TARGET_BLOCK_TIME      (hashes per second)
     #
-    # Each miner's individual cap is computed from the network total and its
-    # share of the observed actual-hashrate distribution, with a smoothing
-    # exponent that gives weaker miners "almost the same" opportunity:
+    # Local governor policy (advisory only):
     #     share_i = actual_i ^ HASHRATE_SHARE_EXPONENT
-    #     limit_i = H_required × share_i / Σ share_j
+    #     if local_actual < H_required: C_i = local_actual
+    #     otherwise C_i = min(local_actual,
+    #                         max(H_required, local_actual × share_i / Σ share_j))
+    # where share_i = local_actual_i ** HASHRATE_SHARE_EXPONENT and the sum
+    # includes fresh signed miner reports observed through mesh gossip. Reports
+    # authenticate their origin, not the truth of self-claimed hardware H/s;
+    # the observed set is not a guaranteed complete census. They only influence
+    # local sleep pacing and never affect consensus validity.
     #
     # The cap is enforced LOCALLY by sleeping between hash batches.  It is
     # NOT a consensus rule — block validation, PoW, difficulty, MTP, and
@@ -401,9 +406,9 @@ class Config:
     HASHRATE_DECAY_SECS           = 60     # additional age (s) over which report decays
                                             # to zero.  Total drop-out at
                                             # HASHRATE_FRESH_SECS + HASHRATE_DECAY_SECS = 90s.
-    HASHRATE_MIN_FLOOR            = 1.0    # H/s — minimum cap so a miner is never starved
+    HASHRATE_MIN_FLOOR            = 1.0    # legacy safety setting; startup now calibrates unthrottled
     HASHRATE_THROTTLE_BATCH_SIZE  = 1024   # nonces hashed per throttle pause
-    HASHRATE_HEADROOM_FACTOR      = 1.00   # multiplier on H_required when computing
+    HASHRATE_HEADROOM_FACTOR      = 1.00   # multiplier on local H_actual in weighted cap formula
                                             # the budget.  v7.6.3 — set to 1.00.
                                             # Earlier versions used 1.10 thinking
                                             # "10% headroom absorbs variance"; in
@@ -583,10 +588,27 @@ class Config:
     PEER_POW_DIFFICULTY_ADAPTIVE   = 4    # +bits when burst detected
     PEER_POW_BURST_RATE_PER_MIN    = 30   # connects/min from one /24 (or /48 v6)
                                           # before adaptive boost kicks in
-    MIN_PEERS           = 25    # desired peer target for ordinary nodes
-    # ``None`` means the designated seed has an unbounded desired peer target.
-    # It continues exploring known/PEX-discovered peers rather than stopping at
-    # a finite target; this is independent of its unlimited active-peer cap.
+    MIN_PEERS           = 25    # legacy/fallback target; numeric value is unchanged
+    # Adaptive topology is a separate soft steady-state goal.  The topology
+    # target intentionally does not rewrite MIN_PEERS or MAX_PEERS; MAX_PEERS
+    # remains the hard ordinary-node admission cap.
+    TOPOLOGY_POLICY_ENABLED = True
+    TOPOLOGY_TARGET_PEERS = 3
+    # Keep dedicated bootstrap seeds unbounded by default; opt in only after
+    # validating the network's bootstrap redundancy with an integration test.
+    TOPOLOGY_SEED_PRUNING_ENABLED = False
+    TOPOLOGY_MIN_SAFE_PEERS = 2
+    TOPOLOGY_REPORT_TTL_SECONDS = 180
+    TOPOLOGY_STABLE_SECONDS = 120
+    # Minimum retry delay when a targeted make-before-break topology probe fails.
+    TOPOLOGY_PROBE_INTERVAL_SECONDS = 60
+    TOPOLOGY_REBALANCE_INTERVAL = 60
+    # Try at most this many deterministic, locally initiated safe edges during
+    # one rebalance pass. Prevents a stuck preferred edge from starving every
+    # other edge while keeping the number of proposal waits bounded.
+    TOPOLOGY_PRUNE_CANDIDATES_PER_PASS = 3
+    # ``None`` means the designated seed has an unbounded discovery target and
+    # remains exempt from topology pruning to preserve bootstrap availability.
     SEED_MIN_PEERS      = None
     PEER_STORAGE        = 1000
     GOSSIP_TTL          = 8
@@ -1222,6 +1244,55 @@ class Config:
                         cls.MAX_PEERS = mp
                     else:
                         _cl.warning(f"config.json: max_peers {mp} out of range [5,500] — ignored")
+
+                if "topology_policy_enabled" in cfg:
+                    value = cfg.get("topology_policy_enabled")
+                    if isinstance(value, bool):
+                        cls.TOPOLOGY_POLICY_ENABLED = value
+                    else:
+                        _cl.warning("config.json: topology_policy_enabled must be boolean — ignored")
+                if "topology_seed_pruning_enabled" in cfg:
+                    value = cfg.get("topology_seed_pruning_enabled")
+                    if isinstance(value, bool):
+                        cls.TOPOLOGY_SEED_PRUNING_ENABLED = value
+                    else:
+                        _cl.warning("config.json: topology_seed_pruning_enabled must be boolean — ignored")
+                if "topology_target_peers" in cfg:
+                    try:
+                        value = int(cfg["topology_target_peers"])
+                        if 2 <= value <= 16:
+                            cls.TOPOLOGY_TARGET_PEERS = value
+                        else:
+                            _cl.warning("config.json: topology_target_peers must be in [2,16] — ignored")
+                    except (TypeError, ValueError, OverflowError):
+                        _cl.warning("config.json: topology_target_peers must be an integer — ignored")
+                if "topology_report_ttl_seconds" in cfg:
+                    try:
+                        value = int(cfg["topology_report_ttl_seconds"])
+                        if 60 <= value <= 600:
+                            cls.TOPOLOGY_REPORT_TTL_SECONDS = value
+                        else:
+                            _cl.warning("config.json: topology_report_ttl_seconds must be in [60,600] — ignored")
+                    except (TypeError, ValueError, OverflowError):
+                        _cl.warning("config.json: topology_report_ttl_seconds must be an integer — ignored")
+                if "topology_stable_seconds" in cfg:
+                    try:
+                        value = int(cfg["topology_stable_seconds"])
+                        if 30 <= value <= 900:
+                            cls.TOPOLOGY_STABLE_SECONDS = value
+                        else:
+                            _cl.warning("config.json: topology_stable_seconds must be in [30,900] — ignored")
+                    except (TypeError, ValueError, OverflowError):
+                        _cl.warning("config.json: topology_stable_seconds must be an integer — ignored")
+                if "topology_probe_interval_seconds" in cfg:
+                    try:
+                        value = int(cfg["topology_probe_interval_seconds"])
+                        if 30 <= value <= 900:
+                            cls.TOPOLOGY_PROBE_INTERVAL_SECONDS = value
+                        else:
+                            _cl.warning("config.json: topology_probe_interval_seconds must be in [30,900] — ignored")
+                    except (TypeError, ValueError, OverflowError):
+                        _cl.warning("config.json: topology_probe_interval_seconds must be an integer — ignored")
 
                 # A seed role must be explicit. A config-level value is used only
                 # when the operator did not set VISOLD_SEED_NODE in the environment.

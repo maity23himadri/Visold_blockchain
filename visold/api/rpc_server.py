@@ -55,6 +55,13 @@ from visold.vm.engine import VVMEngine
 from visold.vm.naming import derive_contract_address
 from visold.vm.static_analyzer import VVMStaticAnalyzer
 
+# Keep RPC connection handling bounded. The backlog absorbs short bursts, while
+# the worker cap prevents an unbounded number of per-connection threads. These
+# settings apply only to the loopback RPC listener.
+_RPC_REQUEST_QUEUE_SIZE = 128
+_RPC_MAX_WORKERS = 32
+_RPC_CLIENT_IO_TIMEOUT_SECONDS = 10.0
+
 if TYPE_CHECKING:  # annotation-only references (no runtime import, no cycle)
     from visold.node.visold_node import VisoldNode
 
@@ -133,7 +140,8 @@ class RPCServer:
             _admin_token = None
 
         # F-16 FIX: Token-bucket rate limiter — max 20 req/s standard,
-        # 2 req/s for expensive ops (analyzecontract, getmempool).
+        # 2 req/s sustained for expensive ops (analyzecontract, getmempool,
+        # checkinvariants).
         import threading as _rpc_threading
         _rate_lock      = _rpc_threading.Lock()
         _rate_tokens    = [20.0]
@@ -208,7 +216,7 @@ class RPCServer:
                     return False
 
             def _check_rate(self, method: str = "") -> bool:
-                """F-16: Enforce token-bucket rate limit."""
+                """F-16: Enforce token-bucket rate limit for this RPC method."""
                 if not _consume_token(method):
                     self._send_json(429, {"error": "Rate limit exceeded — try again shortly"})
                     return False
@@ -274,28 +282,54 @@ class RPCServer:
                                   "message": "Unauthorized — valid Bearer token required"}
                     })
                     return
-                # VSD-H07 FIX: apply token-bucket rate limit to POST as well
-                # (previously only GET /metrics was rate-limited)
-                try:
-                    _method_peek = ""
-                    # Peek method name for slow-method cost without consuming body
-                except Exception:
-                    pass
-                if not self._check_rate():
-                    return
+
+                # The body is bounded to 64 KiB, and authenticated connections
+                # and concurrent workers are bounded by the server. Read enough
+                # JSON to identify the method, then charge its full token cost in
+                # one atomic bucket operation before dispatch.
                 try:
                     length = int(self.headers.get("Content-Length", 0))
-                except ValueError:
+                except (TypeError, ValueError):
                     length = 0
+                if length < 0:
+                    if not self._check_rate():
+                        return
+                    self._send_json(400, {
+                        "jsonrpc": "2.0", "id": None,
+                        "error": {"code": -32600, "message": "Invalid Content-Length"}
+                    })
+                    return
                 if length > 64 * 1024:
+                    if not self._check_rate():
+                        return
                     self._send_json(413, {
                         "jsonrpc": "2.0", "id": None,
                         "error": {"code": -32700, "message": "Request body too large"}
                     })
                     return
+
                 body = self.rfile.read(length)
                 try:
-                    req    = json.loads(body)
+                    req = json.loads(body)
+                except Exception as e:
+                    if not self._check_rate():
+                        return
+                    self._send_json(200, {
+                        "jsonrpc": "2.0", "id": None,
+                        "error": {"code": -32603, "message": str(e)},
+                    })
+                    return
+
+                # The method is available only after bounded JSON parsing. Apply
+                # its cost atomically in the shared token bucket before dispatch.
+                # Treat non-string method values as ordinary requests here; the
+                # dispatcher will reject them without breaking the rate limiter.
+                method = req.get("method", "") if isinstance(req, dict) else ""
+                rate_method = method if isinstance(method, str) else ""
+                if not self._check_rate(rate_method):
+                    return
+
+                try:
                     result = self._dispatch(req)
                     self._send_json(200, {
                         "jsonrpc": "2.0",
@@ -1318,6 +1352,57 @@ class RPCServer:
             class _RPCServer(socketserver.ThreadingTCPServer):
                 allow_reuse_address = True
                 daemon_threads      = True
+                request_queue_size  = _RPC_REQUEST_QUEUE_SIZE
+
+                def __init__(self, server_address, request_handler_class):
+                    self._worker_slots = threading.BoundedSemaphore(_RPC_MAX_WORKERS)
+                    self._stopping = threading.Event()
+                    super().__init__(server_address, request_handler_class)
+
+                def get_request(self):
+                    request, client_address = super().get_request()
+                    # Bounded I/O timeouts stop incomplete local HTTP requests from
+                    # occupying a worker slot forever. RPC method execution itself
+                    # is not interrupted by this socket I/O timeout.
+                    try:
+                        request.settimeout(_RPC_CLIENT_IO_TIMEOUT_SECONDS)
+                    except OSError:
+                        self.shutdown_request(request)
+                        raise
+                    return request, client_address
+
+                def process_request(self, request, client_address):
+                    # Apply back-pressure in the accept loop instead of creating
+                    # unlimited threads or closing a socket before its request body
+                    # has been consumed (which can produce client-side TCP resets).
+                    # New connections wait in the OS listen backlog while all worker
+                    # slots are occupied. Poll the stop flag so shutdown cannot hang
+                    # if the server is waiting here for a worker slot.
+                    while not self._stopping.is_set():
+                        if self._worker_slots.acquire(timeout=0.1):
+                            break
+                    else:
+                        self.shutdown_request(request)
+                        return
+
+                    if self._stopping.is_set():
+                        self._worker_slots.release()
+                        self.shutdown_request(request)
+                        return
+                    try:
+                        super().process_request(request, client_address)
+                    except BaseException:
+                        self._worker_slots.release()
+                        raise
+
+                def process_request_thread(self, request, client_address):
+                    try:
+                        super().process_request_thread(request, client_address)
+                    finally:
+                        self._worker_slots.release()
+
+                def stop_accepting(self):
+                    self._stopping.set()
 
             self._server = _RPCServer(
                 ("127.0.0.1", self.rpc_port), Handler)
@@ -1338,6 +1423,9 @@ class RPCServer:
             return
         try:
             if thread is not None and thread.is_alive():
+                stop_accepting = getattr(server, "stop_accepting", None)
+                if callable(stop_accepting):
+                    stop_accepting()
                 server.shutdown()
         except Exception as exc:
             log.debug("RPC shutdown request: %s", exc)

@@ -49,6 +49,11 @@ MSG_GET_PEERS   = "GET_PEERS"
 
 MSG_PEERS       = "PEERS"
 
+# Adaptive topology pruning is a two-phase, connection-local proposal/ack.
+# It is advisory only; no consensus or transaction rules depend on these messages.
+MSG_TOPOLOGY_PRUNE_PROPOSE = "TOPOLOGY_PRUNE_PROPOSE"
+MSG_TOPOLOGY_PRUNE_ACK = "TOPOLOGY_PRUNE_ACK"
+
 
 MSG_TX          = "TX"
 
@@ -125,15 +130,12 @@ MSG_L2TX        = "L2TX"
 
 
 # ── HASHRATE OPTIMIZATION (v7.6.0) ────────────────────────────────────────────
-# Periodic broadcast of a miner's *actual* (unthrottled) hashrate.  Every
-# node maintains a registry { peer_id -> (actual_hashrate, last_seen_ts) }
-# which the local HashrateGovernor consults to compute its individual
-# optimized-hashrate cap.  This is metadata only — it does NOT affect block
-# validation, PoW target, difficulty, or consensus in any way.  The
-# message is point-to-point in spirit but gossiped network-wide so every
-# miner converges on a similar view of the global actual-hashrate
-# distribution.  Stale reports (older than HASHRATE_PEER_TTL seconds) are
-# evicted on read, so no central cleanup is needed.
+# Periodic wallet-signed broadcast of a miner's measured unthrottled CPU
+# hashrate. Nodes cache reports by authenticated origin ID and sequence, and
+# relay each fresh report through eager gossip links. This creates an observed
+# mesh-wide view where topology permits, not a guaranteed global census; rate
+# claims are self-reported and are never consensus inputs. Stale origin reports
+# decay/expire from the local governor registry.
 MSG_HASHRATE_REPORT = "HASHRATE_REPORT"
 
 

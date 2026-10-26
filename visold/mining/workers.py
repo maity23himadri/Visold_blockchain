@@ -121,7 +121,10 @@ def _cy_mine_worker(fmt_template: str,
                     result_lock,
                     stop_flag,
                     max_hps_per_thread: float = 0.0,
-                    throttle_batch:     int   = 0) -> None:
+                    throttle_batch:     int   = 0,
+                    work_metrics=None,
+                    metrics_index: int = 0,
+                    dynamic_cap_ref=None) -> None:
     """
     Cython-optimised inner mining loop.  Three concrete speedups over the old
     _cpu_mine_thread when compiled with Cython:
@@ -170,39 +173,43 @@ def _cy_mine_worker(fmt_template: str,
     tick     = 0
 
     # Throttle setup — only active when both knobs are positive.
-    #
-    # Algorithm (v7.6.1 — fixes two leaks present in v7.6.0):
-    #   1. The clock starts BEFORE the first hash, so the very first batch
-    #      cannot escape unthrottled (which previously let a lucky early
-    #      solve produce 2-second blocks even with a tight cap).
-    #   2. The sleep duration is NOT capped at 0.5 s.  We instead use
-    #      stop_flag.wait(timeout=...) which is fully responsive to
-    #      shutdown signals while honouring whatever sleep duration the
-    #      math demands.  Capping at 0.5 s leaked ~10-30% of throttle
-    #      enforcement when the requested rate was very low relative to
-    #      hardware speed.
-    _throttle_active = (max_hps_per_thread > 0.0 and throttle_batch > 0)
-    _batch_count     = 0
-    _batch_started   = _t.time() if _throttle_active else 0.0
+    _dynamic_cap_active = (dynamic_cap_ref is not None and throttle_batch > 0)
+    _throttle_active = ((max_hps_per_thread > 0.0 and throttle_batch > 0)
+                        or _dynamic_cap_active)
+    _batch_count = 0
+    _batch_started = _t.perf_counter() if _throttle_active else 0.0
     _batch_target_secs = (float(throttle_batch) / max_hps_per_thread
-                           if _throttle_active else 0.0)
+                           if (max_hps_per_thread > 0.0 and throttle_batch > 0)
+                           else 0.0)
+
+    # Work telemetry counts hashes and ACTIVE compute time. The metric clock is
+    # reset after governor sleeps, so the reported hardware estimate is not
+    # reduced merely because the governor intentionally throttles this worker.
+    _metric_count   = 0
+    _metric_started = _t.perf_counter()
+    # Publish calibration telemetry every 256 hashes even while the dynamic
+    # governor is active. Throttle batch size controls sleeps, not measurement
+    # latency; coupling them can leave low-rate devices reporting zero too long.
+    _metric_every   = 256
 
     while not stop_flag.is_set():
-
-        # ── VSA-28: the candidate timestamp is fixed ──────────────────────
-        # The state root was computed at initial_ts, so the header timestamp must
-        # not move during the search.  Stale candidates are rebuilt by the engine.
         if tick >= REFRESH:
             tick = 0
 
-        # ── Hash  (GIL is released inside hashlib's C implementation) ────
         raw        = (fmt_template % (nonce, local_ts)).encode('ascii')
-        digest_raw = _hl.sha256(raw).digest()     # 32 raw bytes — no hex step
+        digest_raw = _hl.sha256(raw).digest()
+        _metric_count += 1
 
-        # ── Target check: bytes comparison == big-endian bigint comparison ─
         if digest_raw <= target_bytes and nonce >= min_c:
+            # Flush before returning; the successful hash is included.
+            if work_metrics is not None and _metric_count:
+                _old = work_metrics[metrics_index]
+                _active = max(1e-9, _t.perf_counter() - _metric_started)
+                work_metrics[metrics_index] = (
+                    _old[0] + _metric_count, _old[1] + _active)
+                _metric_count = 0
             with result_lock:
-                if not result:                    # first thread to find wins
+                if not result:
                     result.append((int(nonce), digest_raw.hex(), int(local_ts)))
                     stop_flag.set()
             return
@@ -210,40 +217,65 @@ def _cy_mine_worker(fmt_template: str,
         nonce += step_c
         tick  += 1
 
-        # ── v7.6.0 Per-thread hashrate throttle ─────────────────────────
-        # Pace ourselves so that this thread averages no more than
-        # max_hps_per_thread hashes/second over each `throttle_batch`-sized
-        # window.  Inactive when either knob is 0.
-        #
-        # v7.6.1 fix — sleep is no longer capped at 0.5 s.  We use
-        # stop_flag.wait(timeout=_sleep_for) which is fully responsive to
-        # shutdown signals (returns immediately when the flag is set), so
-        # there is no need to cap the sleep duration.  The previous 0.5 s
-        # cap silently leaked enforcement when very low rates were
-        # requested relative to hardware speed.
-        #
-        # v7.6.2 — When stop_flag.wait() returns True (flag was set), it
-        # could mean EITHER (a) shutdown OR (b) another worker found a
-        # winning hash.  In case (b) we want to exit immediately too.
-        # Either way, returning is correct.
+        # Flush calibration telemetry independently of the throttle batch size.
+        # Otherwise a slow/low-power device might need to hash 1024 nonces
+        # before the governor learns any rate, reintroducing the startup-zero
+        # problem this metric is meant to remove.
+        if work_metrics is not None and _metric_count >= _metric_every:
+            _now = _t.perf_counter()
+            _old = work_metrics[metrics_index]
+            _active = max(1e-9, _now - _metric_started)
+            work_metrics[metrics_index] = (
+                _old[0] + _metric_count, _old[1] + _active)
+            _metric_count = 0
+            _metric_started = _now
+
         if _throttle_active:
             _batch_count += 1
             if _batch_count >= throttle_batch:
-                _now = _t.time()
-                _elapsed = _now - _batch_started
-                if _elapsed < _batch_target_secs:
-                    _sleep_for = _batch_target_secs - _elapsed
+                # This elapsed window ends BEFORE the intentional sleep.
+                _now = _t.perf_counter()
+                _elapsed = max(1e-9, _now - _batch_started)
+                # If throttle_batch is not an exact multiple of _metric_every,
+                # flush the partial active-work segment before sleeping.
+                if work_metrics is not None and _metric_count:
+                    _old = work_metrics[metrics_index]
+                    _active = max(1e-9, _now - _metric_started)
+                    work_metrics[metrics_index] = (
+                        _old[0] + _metric_count, _old[1] + _active)
+                    _metric_count = 0
+                _target_secs = _batch_target_secs
+                if _dynamic_cap_active:
+                    # The engine refreshes this shared per-thread cap while
+                    # the current block is still being mined. Infinity/zero
+                    # means unthrottled calibration or disabled optimization.
+                    try:
+                        _dynamic_hps = float(dynamic_cap_ref[0])
+                    except (TypeError, ValueError, IndexError, OverflowError):
+                        _dynamic_hps = 0.0
+                    if (_dynamic_hps > 0.0 and _dynamic_hps == _dynamic_hps
+                            and _dynamic_hps not in (float("inf"), float("-inf"))):
+                        _target_secs = float(throttle_batch) / _dynamic_hps
+                    else:
+                        _target_secs = 0.0
+                if _elapsed < _target_secs:
+                    _sleep_for = _target_secs - _elapsed
                     if _sleep_for > 0.0:
-                        # stop_flag.wait returns True if the flag was set
-                        # during the sleep — caller exits cleanly on the
-                        # next loop iteration.  Fully responsive shutdown.
                         if hasattr(stop_flag, "wait"):
                             if stop_flag.wait(timeout=_sleep_for):
                                 return
                         else:
                             _t.sleep(_sleep_for)
-                _batch_count   = 0
-                _batch_started = _t.time()
+                _batch_count = 0
+                _batch_started = _t.perf_counter()
+                _metric_started = _batch_started
+
+    # Flush a partial chunk on an external stop.
+    if work_metrics is not None and _metric_count:
+        _old = work_metrics[metrics_index]
+        _active = max(1e-9, _t.perf_counter() - _metric_started)
+        work_metrics[metrics_index] = (
+            _old[0] + _metric_count, _old[1] + _active)
 
 
 # ── Legacy single-thread worker (kept for fallback / testing) ─────────────────

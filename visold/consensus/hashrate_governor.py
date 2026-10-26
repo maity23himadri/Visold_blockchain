@@ -35,23 +35,20 @@ from visold.kernel.config import Config
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION 1H-EXT — HASHRATE GOVERNOR (Optimized vs Actual Hashrate)
 #
-# The HashrateGovernor maintains two pieces of state per node:
-#   1. Local actual hashrate — measured in real time from the mining loop.
-#      This is the "honest" rate the hardware can produce when unthrottled.
-#   2. A registry of recently-reported peer hashrates (peer_id → (rate, ts)).
-#      Built from MSG_HASHRATE_REPORT gossip messages.
+# The HashrateGovernor maintains:
+#   1. An estimate of local unthrottled hash throughput, measured from worker
+#      hashes / active compute time (intentional governor sleeps are excluded).
+#   2. Fresh authenticated miner-origin rate reports received directly or
+#      through mesh gossip, with sender sequence replay protection.
 #
-# From those it computes:
-#   • required_network_hashrate(D) — the inverse-difficulty answer to "how
-#     many H/s does the network need to mine each block in 60 s?"
-#   • allowed_local_hashrate()    — this node's individual cap.  The math is:
-#         total_actual = my_actual + Σ peer_actual
-#         my_share     = my_actual^α   (where α = HASHRATE_SHARE_EXPONENT)
-#         total_share  = my_share + Σ peer_actual^α
-#         my_cap       = required_total · my_share / total_share
-#     With α = 0.5 (sqrt) every miner gets "almost the same" opportunity:
-#     a 10× faster miner gets ~3.16× the cap, not 10×.  The LOCAL_FLOOR
-#     guarantees a minimum cap so a brand-new miner is never zeroed out.
+# required_network_hashrate(D) remains the aggregate rate implied by difficulty
+# and target block time. The local cap follows the requested policy:
+#   • unmeasured startup -> temporarily unthrottled calibration;
+#   • local actual < required -> cap at local actual (do not throttle a weak
+#     device that cannot reach the target itself);
+#   • otherwise C_i = H_actual_local × share_i / Σ share_j, with the result
+#     floored to H_required and never above this node's actual capacity.
+# Peer reports are direct-neighbour observations, NOT a network-wide census.
 #
 # IMPORTANT — CONSENSUS SAFETY:
 # This class is a LOCAL ADVISOR ONLY.  It influences the local miner's hash
@@ -67,9 +64,10 @@ from visold.kernel.config import Config
 
 class HashrateGovernor:
     """
-    Compute per-miner hashrate caps that keep the aggregate network rate
-    aligned with the inverse-difficulty target so blocks land near the
-    TARGET_BLOCK_TIME ± TARGET_BLOCK_TIME_TOLERANCE band.
+    Compute this miner's local hashrate cap from its own measured H_actual
+    and its weighted share among the currently observed miners. Each node
+    computes its local cap independently; the sum of local caps is not
+    guaranteed to equal the difficulty-derived network target.
 
     Thread safety: a single instance is owned by MiningEngine.  All public
     methods take an internal lock so reports from the network message loop
@@ -79,7 +77,10 @@ class HashrateGovernor:
     def __init__(self):
         self._lock                  = threading.Lock()
         self._peer_rates: Dict[str, Tuple[float, float]] = {}
-        # peer_id -> (actual_hashrate_hps, last_seen_unix_ts)
+        # peer_id -> (measured_unthrottled_hps, local_receive_time)
+        # Sender metadata is kept separately so the legacy rate tuple remains
+        # compatible with existing diagnostics/audit code.
+        self._peer_report_meta: Dict[str, Tuple[float, int]] = {}
 
         # Local measurement state
         self._local_actual_hashrate = 0.0
@@ -93,13 +94,17 @@ class HashrateGovernor:
     # Inputs from the local mining loop
     # ─────────────────────────────────────────────────────────────────────
     def update_local_actual_hashrate(self, hps: float) -> None:
-        """Called by MiningEngine.status / _mine_one to record the most
-        recent measured rate.  Negative or non-finite values are ignored."""
+        """Record the latest estimate of unthrottled local hash throughput.
+
+        This estimate is measured while the worker is actively hashing and
+        excludes governor sleep time.  Negative or non-finite values are
+        ignored; zero is reserved for the not-yet-calibrated state.
+        """
         try:
             v = float(hps)
         except (TypeError, ValueError):
             return
-        if v < 0.0 or v != v:   # NaN check
+        if v < 0.0 or v != v or v in (float("inf"), float("-inf")):
             return
         with self._lock:
             self._local_actual_hashrate = v
@@ -109,31 +114,102 @@ class HashrateGovernor:
         with self._lock:
             return self._local_actual_hashrate
 
+    def reset_local_measurement(self) -> None:
+        """Reset only local calibration when a new mining session starts.
+
+        Fresh peer reports stay cached until their own signed timestamps decay
+        or expire; a previous session's local capacity must not be reused.
+        """
+        with self._lock:
+            self._local_actual_hashrate = 0.0
+            self._local_last_update = 0.0
+            self._last_local_cap = float("inf")
+            self._last_required_total = 0.0
+
     # ─────────────────────────────────────────────────────────────────────
     # Inputs from the network (gossip)
     # ─────────────────────────────────────────────────────────────────────
-    def record_peer_hashrate(self, peer_id: str, hps: float) -> None:
-        """Called from the network message handler when a MSG_HASHRATE_REPORT
-        arrives.  Stores under the peer_id, replacing any previous report."""
+    def record_peer_hashrate(self, peer_id: str, hps: float,
+                             reported_ts=None, sequence=None) -> bool:
+        """Store a peer's measured-rate report with replay/staleness guards.
+
+        Signed miner-origin reports carry a timestamp verified by the network
+        layer; for sequenced reports the timestamp and sequence are preserved
+        so relaying cannot make an old measurement fresh again. Legacy direct
+        reports without a sequence remain supported and use local receive time
+        for freshness when no origin timestamp metadata is available.
+        """
         if not isinstance(peer_id, str) or not peer_id:
-            return
+            return False
         try:
             v = float(hps)
         except (TypeError, ValueError):
-            return
-        if v < 0.0 or v != v:
-            return
+            return False
+        if v < 0.0 or v != v or v == float("inf") or v == float("-inf"):
+            return False
         # Sanity cap — refuse absurd values (anti-spoofing).  2^48 H/s is
         # well above any plausible single-node hashrate but still finite.
         if v > (1 << 48):
-            return
+            return False
+
+        now = time.time()
+        parsed_ts = None
+        parsed_seq = None
+        if reported_ts is not None:
+            try:
+                parsed_ts = float(reported_ts)
+            except (TypeError, ValueError):
+                return False
+            if parsed_ts != parsed_ts or parsed_ts in (float("inf"), float("-inf")):
+                return False
+            # Allow modest mobile-device clock skew while rejecting reports
+            # that are clearly replayed/stale or far in the future. Signed
+            # reports are aged from this origin timestamp so relaying cannot
+            # refresh an old measurement; legacy reports without a timestamp
+            # fall back to local receive time.
+            max_skew = max(float(Config.HASHRATE_PEER_TTL), 300.0)
+            if abs(now - parsed_ts) > max_skew:
+                return False
+        if sequence is not None:
+            if isinstance(sequence, bool):
+                return False
+            try:
+                parsed_seq = int(sequence)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if parsed_seq < 0 or str(parsed_seq) != str(sequence).strip():
+                return False
+
         with self._lock:
-            self._peer_rates[peer_id] = (v, time.time())
+            previous = self._peer_report_meta.get(peer_id)
+            if parsed_seq is not None and previous is not None:
+                previous_ts, previous_seq = previous
+                if parsed_seq <= previous_seq:
+                    return False
+                # Signed rate reports are generated at the configured report
+                # cadence. A higher sequence with an unchanged/backward wall
+                # timestamp is not a fresh measurement and must not refresh it.
+                if parsed_ts is not None and parsed_ts <= previous_ts:
+                    return False
+            self._peer_rates[peer_id] = (v, now)
+            if parsed_seq is not None:
+                self._peer_report_meta[peer_id] = (
+                    parsed_ts if parsed_ts is not None else now, parsed_seq)
+            elif parsed_ts is not None:
+                # Legacy direct reports have no sequence number. Refresh their
+                # origin timestamp without erasing a newer-version anti-replay
+                # watermark. Never move that timestamp backwards.
+                if previous is None:
+                    self._peer_report_meta[peer_id] = (parsed_ts, -1)
+                elif parsed_ts > previous[0]:
+                    self._peer_report_meta[peer_id] = (parsed_ts, previous[1])
+        return True
 
     def forget_peer(self, peer_id: str) -> None:
-        """Drop a peer's cached hashrate (e.g. when it disconnects)."""
+        """Drop a peer's cached hashrate and anti-replay state on disconnect."""
         with self._lock:
             self._peer_rates.pop(peer_id, None)
+            self._peer_report_meta.pop(peer_id, None)
 
     # ─────────────────────────────────────────────────────────────────────
     # Internal helpers
@@ -164,34 +240,32 @@ class HashrateGovernor:
         now            = time.time()
         fresh_secs     = float(Config.HASHRATE_FRESH_SECS)
         decay_secs     = max(1e-3, float(Config.HASHRATE_DECAY_SECS))
-        ttl_cutoff     = now - float(Config.HASHRATE_PEER_TTL)
-        decay_cutoff   = now - (fresh_secs + decay_secs)
-        # Use the more aggressive of the two cut-offs for eviction.  Decay
-        # cutoff is normally tighter (90 s vs 300 s); TTL is the safety net.
-        evict_cutoff   = max(ttl_cutoff, decay_cutoff)
+        max_age_secs = min(float(Config.HASHRATE_PEER_TTL), fresh_secs + decay_secs)
 
         live: List[float] = []
         stale: List[str] = []
-        for pid, (rate, ts) in self._peer_rates.items():
-            if ts < evict_cutoff:
+        for pid, (rate, receive_ts) in self._peer_rates.items():
+            metadata = self._peer_report_meta.get(pid)
+            # A signed report may be relayed several hops after it was issued.
+            # Expiry is therefore based on the origin's signed timestamp, not
+            # on the most recent relay's receive time. Legacy reports without
+            # an origin timestamp still use local receive time.
+            origin_ts = metadata[0] if metadata is not None else receive_ts
+            age = max(0.0, now - origin_ts)  # tolerate bounded future clock skew
+            if age > max_age_secs:
                 stale.append(pid)
                 continue
-            age = now - ts
             if age <= fresh_secs:
                 effective = rate
             else:
-                # Linear decay over decay_secs; clamped to [0, rate].
                 decay_age = age - fresh_secs
-                if decay_age >= decay_secs:
-                    # Fully decayed but not yet evicted (within TTL safety
-                    # net but past decay window).  Treat as zero contribution.
-                    effective = 0.0
-                else:
-                    effective = rate * (1.0 - decay_age / decay_secs)
+                effective = (0.0 if decay_age >= decay_secs else
+                             rate * (1.0 - decay_age / decay_secs))
             if effective > 0.0:
                 live.append(effective)
         for pid in stale:
             self._peer_rates.pop(pid, None)
+            self._peer_report_meta.pop(pid, None)
         return live
 
     @staticmethod
@@ -211,206 +285,131 @@ class HashrateGovernor:
     # Public: compute the local cap
     # ─────────────────────────────────────────────────────────────────────
     def advise(self, current_difficulty: float) -> Tuple[float, float, dict]:
+        """Return (local_cap_hps, required_network_hps, diagnostics).
+
+        Policy requested for the adaptive governor:
+          * Until this node has a measured raw rate, run the first calibration
+            attempt unthrottled. Never derive a cap from a fake zero rate or
+            substitute another miner's rate for this node's hardware.
+          * If local measured capacity is below the difficulty-derived target,
+            cap at that local capacity (do not throttle a miner that cannot
+            reach the target by itself).
+          * Otherwise use THIS miner's local measured H_actual as the formula
+            multiplier, with square-root/proportional weighting configured by
+            HASHRATE_SHARE_EXPONENT. Peer reports supply the weighting terms,
+            not the formula numerator. If the calculated local cap is below the
+            required network rate, floor it at required_network_hps, per the
+            requested rule. Finally, never set a cap above this node's own
+            measured capacity.
+
+        Peer reports form an OBSERVED mesh view of other miners, not a guaranteed
+        network-wide census. It can be incomplete, and signatures authenticate
+        the claimant, not physical hashrate truth. This class is advisory and
+        does not alter consensus validation or the canonical difficulty calculation.
         """
-        Return (allowed_local_hashrate, required_network_hashrate, debug_info).
-
-        allowed_local_hashrate     — H/s; the cap to apply to the local miner.
-                                     float('inf') if optimization is disabled.
-        required_network_hashrate  — H/s; the inverse-difficulty target.
-        debug_info                 — dict for logging / status display.
-
-        Algorithm — water-filling with sqrt weighting:
-        ──────────────────────────────────────────────
-        We have a total "budget" of H_required hashes/second that the network
-        should produce per block to hit TARGET_BLOCK_TIME.  We need to allocate
-        this budget across all miners (self + peers).
-
-        Step 1 — Compute "ideal" shares from the sqrt-weighted formula:
-                 share_i = actual_i ^ HASHRATE_SHARE_EXPONENT
-                 ideal_i = H_required × share_i / Σ share_j
-
-        Step 2 — Water-filling redistribution:
-                 If ideal_i > actual_i, the miner cannot consume that many
-                 hashes — it would have to invent hardware power it does
-                 not have.  Cap it at actual_i and redistribute the surplus
-                 to the remaining miners (those with ideal_j ≤ actual_j),
-                 weighted by their remaining share.  Iterate until either
-                 every miner is at-or-below its actual rate OR the pool is
-                 fully distributed.
-
-        This guarantees:
-            Σ caps == min(H_required, Σ actual_rates)
-
-        i.e. the caps sum exactly to the required network hashrate when the
-        network has enough total capacity, and otherwise to the full network
-        capacity (with no waste).  This is the property the user specifically
-        asked for: "total hashrate ke calculated hashrate e rakhbe".
-
-        Behaviour when optimization is disabled (Config.HASHRATE_OPTIMIZATION_ENABLED
-        is False): allowed = +inf, so the throttle becomes a no-op.
-
-        Behaviour when no peers have reported yet (e.g. just-started network):
-        the local miner receives the FULL required network hashrate as its
-        cap.  This means a solo bootstrap miner will mine roughly on schedule
-        without waiting for peer-rate reports.
-
-        Behaviour when local actual rate has not been measured yet (first few
-        seconds of mining): the local miner is given an EQUAL share rather
-        than zero, so the very first block is not delayed indefinitely.
-        """
-        if not Config.HASHRATE_OPTIMIZATION_ENABLED:
-            req = DifficultyEngine.required_network_hashrate(current_difficulty)
-            return float("inf"), req, {
-                "enabled": False,
-                "required_total_hps": req,
-                "allowed_local_hps":  float("inf"),
-            }
-
         required_total = DifficultyEngine.required_network_hashrate(
             current_difficulty)
-        # Apply a small headroom so transient variance doesn't push solve
-        # time past the upper tolerance.  This is INSIDE the budget — caps
-        # still sum to (required × headroom), not above.
-        budget = required_total * float(Config.HASHRATE_HEADROOM_FACTOR)
+        if not Config.HASHRATE_OPTIMIZATION_ENABLED:
+            with self._lock:
+                self._last_required_total = required_total
+                self._last_local_cap = float("inf")
+            return float("inf"), required_total, {
+                "enabled": False,
+                "measurement_ready": self.get_local_actual_hashrate() > 0.0,
+                "required_total_hps": required_total,
+                "allowed_local_hps": float("inf"),
+            }
 
         with self._lock:
             local_actual = self._local_actual_hashrate
-            peer_rates   = self._live_peer_rates()
+            peer_rates = self._live_peer_rates()
 
-        # ── Edge case: no peer reports yet (solo bootstrap) ────────────────
-        # Give the local miner the full budget — but never exceed its own
-        # actual hardware rate (a cap above actual is meaningless and
-        # confuses operators who see "Optimized > Actual" in the panel).
-        # When solo the cap is effectively a floor of `min(budget, actual)`,
-        # which means: run as fast as you can, up to the network target.
-        if not peer_rates:
-            cap = budget
-            if local_actual > 0.0 and cap > local_actual:
-                cap = local_actual
+        # Startup safety: no valid local raw-rate sample yet. Use no throttle
+        # for calibration, report the UI as "measuring", and avoid making the
+        # local cap depend on a peer's hardware rate.
+        if local_actual <= 0.0:
             with self._lock:
                 self._last_required_total = required_total
-                self._last_local_cap      = cap
-            return cap, required_total, {
-                "enabled":            True,
+                self._last_local_cap = float("inf")
+            return float("inf"), required_total, {
+                "enabled": True,
+                "measurement_ready": False,
                 "required_total_hps": required_total,
-                "budget_hps":         budget,
-                "allowed_local_hps":  cap,
-                "local_actual_hps":   local_actual,
-                "peers_reporting":    0,
-                "share_exponent":     float(Config.HASHRATE_SHARE_EXPONENT),
-                "redistributed":      False,
+                "observed_actual_total_hps": sum(peer_rates),
+                "allowed_local_hps": float("inf"),
+                "local_actual_hps": 0.0,
+                "peers_reporting": len(peer_rates),
+                "mode": "startup_calibration",
+                "redistributed": False,
             }
 
         alpha = float(Config.HASHRATE_SHARE_EXPONENT)
+        actual_total = local_actual + sum(peer_rates)
 
-        # ── Build the participant list: index 0 is "self", 1..N are peers
-        # actuals[0]   = local_actual
-        # actuals[1..] = peer_rates
-        actuals = [local_actual] + list(peer_rates)
-
-        # If our local rate is unmeasured, give ourselves an equal share so
-        # the first-block-timing is not pathologically slow.  We use the
-        # MEDIAN of peer rates (robust to one outlier) as a placeholder so
-        # the share weights below are well-defined.
-        if local_actual <= 0.0 and peer_rates:
-            sorted_peers = sorted(peer_rates)
-            median_peer  = sorted_peers[len(sorted_peers) // 2]
-            actuals[0]   = max(median_peer, float(Config.HASHRATE_MIN_FLOOR))
-
-        # ── Step 1: ideal shares from sqrt weighting ───────────────────────
-        shares = [self._share_of(a, alpha) for a in actuals]
-        total_share = sum(shares)
-        if total_share <= 0.0:
-            # All actuals are zero — split equally
-            n_total = len(actuals)
-            ideal = [budget / n_total for _ in actuals]
+        # The user's low-cap guard is per local miner: a device whose own
+        # measured capacity is below the network target is never throttled.
+        if local_actual < required_total:
+            cap = local_actual
+            mode = "local_below_required"
+            calculated_cap = local_actual
+            local_share = 1.0
         else:
-            ideal = [budget * (s / total_share) for s in shares]
-
-        # ── Step 2: water-filling iterative redistribution ────────────────
-        # Cap any miner whose ideal share exceeds their actual rate; spread
-        # the surplus to the others.  Loop until either no more capping is
-        # needed, or every miner is capped (network is hashrate-starved).
-        caps = list(ideal)
-        # Track who is "saturated" (capped at their actual rate).
-        saturated = [False] * len(actuals)
-        redistributed = False
-
-        for _iter in range(len(actuals) + 1):   # at most N iterations
-            # Find miners exceeding their actual rate
-            surplus = 0.0
-            newly_saturated = False
-            for i, a in enumerate(actuals):
-                if saturated[i]:
-                    continue
-                if a > 0.0 and caps[i] > a:
-                    surplus += (caps[i] - a)
-                    caps[i] = a
-                    saturated[i] = True
-                    newly_saturated = True
-                    redistributed = True
-            if not newly_saturated or surplus <= 0.0:
-                break
-
-            # Redistribute surplus to non-saturated miners weighted by
-            # their original share.  If everyone is saturated, the surplus
-            # is wasted (correct: network has no more capacity to absorb).
-            unsaturated_share = sum(shares[i] for i in range(len(actuals))
-                                     if not saturated[i])
-            if unsaturated_share <= 0.0:
-                break
-            for i in range(len(actuals)):
-                if saturated[i]:
-                    continue
-                caps[i] += surplus * (shares[i] / unsaturated_share)
-
-        my_cap = caps[0]
-
-        # Hard floor so a brand-new low-rate miner is never starved out.
-        floor = float(Config.HASHRATE_MIN_FLOOR)
-        if my_cap < floor:
-            my_cap = floor
-
-        # Final clamp — never exceed our actual rate (we cannot use more
-        # than what the hardware produces; anything above is meaningless).
-        if local_actual > 0.0 and my_cap > local_actual:
-            my_cap = local_actual
+            actuals = [local_actual] + peer_rates
+            shares = [self._share_of(rate, alpha) for rate in actuals]
+            total_share = sum(shares)
+            local_share = (shares[0] / total_share) if total_share > 0.0 else 1.0
+            # Per the requested rule, replace H_required in C_i with THIS
+            # miner's measured H_actual. Peer rates define the share denominator;
+            # they do not become the numerator for this node's local cap.
+            calculated_cap = (local_actual * local_share
+                              * float(Config.HASHRATE_HEADROOM_FACTOR))
+            cap = max(required_total, calculated_cap)
+            # A cap cannot create hardware capacity. local_actual >= required
+            # in this branch, so this clamp does not violate the required floor.
+            cap = min(local_actual, cap)
+            mode = "weighted_local_actual"
 
         with self._lock:
             self._last_required_total = required_total
-            self._last_local_cap      = my_cap
+            self._last_local_cap = cap
 
         debug = {
-            "enabled":            True,
+            "enabled": True,
+            "measurement_ready": True,
             "required_total_hps": required_total,
-            "budget_hps":         budget,
-            "allowed_local_hps":  my_cap,
-            "local_actual_hps":   local_actual,
-            "peers_reporting":    len(peer_rates),
-            "share_exponent":     alpha,
-            "redistributed":      redistributed,
+            "observed_actual_total_hps": actual_total,
+            "allowed_local_hps": cap,
+            "calculated_cap_before_floor_hps": calculated_cap,
+            "local_actual_hps": local_actual,
+            "local_share": local_share,
+            "peers_reporting": len(peer_rates),
+            "share_exponent": alpha,
+            "mode": mode,
+            "redistributed": False,
         }
-        return my_cap, required_total, debug
+        return cap, required_total, debug
 
     def status_snapshot(self) -> dict:
         """Return a snapshot for CLI / RPC display.  Cheap; safe to call often.
 
-        v7.6.4 — peer count uses the decay window (FRESH + DECAY) instead
-        of the raw TTL, so the panel only reports peers whose claims are
-        still partially or fully effective in the cap calculation.  A
-        peer that has fallen silent for >90 s (default config) is no
-        longer counted, even though its entry may linger in the registry
-        until TTL eviction.
+        Peer count uses the original report timestamp and the effective decay
+        window, so relaying a report does not extend its useful lifetime. The
+        map can include authenticated miner origins learned through mesh gossip;
+        it is an observed view, not a guaranteed complete network census.
         """
         with self._lock:
-            decay_cutoff = time.time() - (
-                float(Config.HASHRATE_FRESH_SECS)
-                + float(Config.HASHRATE_DECAY_SECS))
+            now = time.time()
+            visible_age = min(float(Config.HASHRATE_PEER_TTL),
+                              float(Config.HASHRATE_FRESH_SECS)
+                              + float(Config.HASHRATE_DECAY_SECS))
             peer_count = sum(
-                1 for _, (_, ts) in self._peer_rates.items()
-                if ts >= decay_cutoff)
+                1 for pid, (_, receive_ts) in self._peer_rates.items()
+                if now - max(0.0, self._peer_report_meta.get(pid, (receive_ts, -1))[0])
+                < visible_age)
             return {
                 "local_actual_hps":   self._local_actual_hashrate,
+                "measurement_ready":  self._local_actual_hashrate > 0.0,
+                "optimization_enabled": bool(Config.HASHRATE_OPTIMIZATION_ENABLED),
                 "allowed_local_hps":  self._last_local_cap,
                 "required_total_hps": self._last_required_total,
                 "live_peer_reports":  peer_count,

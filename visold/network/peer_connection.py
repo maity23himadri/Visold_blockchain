@@ -23,10 +23,12 @@ Defines: PeerConnection
 Origin: visold_vsd_.py L31300-31628
 """
 
+import errno
 import hashlib
 import ipaddress
 import json
 import os
+import select
 import ssl
 import socket
 import sys
@@ -40,6 +42,181 @@ from visold.kernel.config import Config
 from visold.kernel.logging_setup import log
 from visold.network.compression import CompressionEngine
 from visold.network.message_logger import P2PMessageLogger
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Serialized TLS I/O  (fix for random session drops: EOF / BAD_RECORD_MAC)
+# ─────────────────────────────────────────────────────────────────────────────
+# One TLS connection is an OpenSSL SSL object.  OpenSSL does NOT support two
+# threads calling SSL_read() and SSL_write() on the same SSL object at the same
+# time (they share per-connection state such as the socket-BIO retry flags and
+# record-layer buffers).  This node's reader thread (_peer_message_loop) and its
+# writer paths (PeerConnection._raw_send / PeerConnection.send) do exactly that,
+# and the unsynchronized overlap shows up as spontaneous "EOF" or
+# "bad record MAC" drops of healthy sessions.
+#
+# Rule enforced here: for a TLS socket EVERY SSL read or write is one
+# NON-BLOCKING attempt made while holding a single per-socket lock.  Waiting for
+# readability/writability happens OUTSIDE that lock, so a reader that is idle
+# never blocks a writer (and vice versa).  The lock lives on the socket object
+# itself, so a temporary handshake PeerConnection and the final registered
+# PeerConnection that share one socket also share one lock.  Plain (non-TLS)
+# sockets keep their original behavior: concurrent recv()/send() on a plain TCP
+# socket is safe.
+_TLS_IO_LOCK_ATTR = "_visold_tls_io_lock"
+_TLS_WRITE_LOCK_ATTR = "_visold_tls_write_lock"
+_TLS_ATTR_GUARD = threading.Lock()
+_TLS_IO_WAIT_SLICE = 1.0       # max seconds one idle reader waits before re-checking the socket
+_TLS_WRITE_WAIT_SLICE = 0.25   # max seconds a blocked writer waits before retrying
+_TLS_SEND_TIMEOUT = 30.0       # seconds without write progress before a send fails
+
+
+def _is_tls_socket(sock) -> bool:
+    return isinstance(sock, ssl.SSLSocket)
+
+
+def _socket_lock(sock, attr: str):
+    lock = getattr(sock, attr, None)
+    if lock is None:
+        with _TLS_ATTR_GUARD:
+            lock = getattr(sock, attr, None)
+            if lock is None:
+                lock = threading.Lock()
+                setattr(sock, attr, lock)
+    return lock
+
+
+def _tls_io_lock(sock):
+    """Lock that serializes every SSL_read/SSL_write on this TLS socket."""
+    return _socket_lock(sock, _TLS_IO_LOCK_ATTR)
+
+
+def _tls_write_lock(sock):
+    """Keeps one complete frame write at a time per TLS socket, regardless of
+    how many PeerConnection wrappers share it (an interrupted SSL_write must be
+    retried with the same buffer before any other write)."""
+    return _socket_lock(sock, _TLS_WRITE_LOCK_ATTR)
+
+
+def _tls_set_nonblocking(sock) -> None:
+    # Called while holding the I/O lock.  Idempotent; every TLS read/write below
+    # uses non-blocking attempts and does its own deadline handling.
+    if sock.gettimeout() != 0.0:
+        sock.settimeout(0.0)
+
+
+def _wait_socket_ready(sock, want_read: bool, want_write: bool, timeout: float) -> None:
+    """Block (without holding any lock) until the fd is ready or timeout.
+
+    Uses poll() where available because select() cannot handle descriptors
+    >= 1024, which a seed node with many peers can reach.  A closed/invalid fd
+    raises OSError(EBADF), matching what recv() on a closed socket raised.
+    """
+    fd = sock.fileno()
+    if fd is None or fd < 0:
+        raise OSError(errno.EBADF, "Bad file descriptor")
+    if timeout <= 0:
+        return
+    if hasattr(select, "poll"):
+        poller = select.poll()
+        mask = 0
+        if want_read:
+            mask |= select.POLLIN
+        if want_write:
+            mask |= select.POLLOUT
+        poller.register(fd, mask)
+        # POLLHUP/POLLERR/POLLNVAL are always reported -> the following
+        # recv()/send() attempt surfaces the real condition.
+        poller.poll(int(timeout * 1000) + 1)
+        return
+    select.select([sock] if want_read else [], [sock] if want_write else [], [], timeout)
+
+
+def tls_recv(sock, size: int, timeout: float) -> bytes:
+    """recv() for a TLS socket that is safe next to concurrent writers.
+
+    Returns bytes (b"" means EOF, exactly like SSLSocket.recv).  Raises
+    socket.timeout after ``timeout`` seconds without data, so the caller's
+    existing idle/PING handling is unchanged.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    lock = _tls_io_lock(sock)
+    while True:
+        with lock:
+            fd = sock.fileno()
+            if fd is None or fd < 0:
+                raise OSError(errno.EBADF, "Bad file descriptor")
+            _tls_set_nonblocking(sock)
+            try:
+                return sock.recv(size)
+            except ssl.SSLWantReadError:
+                want_read, want_write = True, False
+            except ssl.SSLWantWriteError:
+                want_read, want_write = False, True
+            except BlockingIOError:
+                want_read, want_write = True, False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout("timed out waiting for readable TLS socket")
+        _wait_socket_ready(sock, want_read, want_write,
+                           min(remaining, _TLS_IO_WAIT_SLICE))
+
+
+def tls_sendall(sock, data, timeout: float = _TLS_SEND_TIMEOUT) -> None:
+    """sendall() for a TLS socket that is safe next to a concurrent reader.
+
+    ``timeout`` is the longest stretch without write progress.  Raises
+    socket.timeout when it expires; any other exception is a real send failure
+    (the caller must treat the stream as unusable, as before).
+    """
+    with memoryview(data) as raw_view, raw_view.cast("B") as view_b:
+        view = view_b
+        write_lock = _tls_write_lock(sock)
+        io_lock = _tls_io_lock(sock)
+        with write_lock:
+            deadline = time.monotonic() + max(0.0, float(timeout))
+            while len(view):
+                with io_lock:
+                    fd = sock.fileno()
+                    if fd is None or fd < 0:
+                        raise OSError(errno.EBADF, "Bad file descriptor")
+                    _tls_set_nonblocking(sock)
+                    try:
+                        sent = sock.send(view)
+                    except ssl.SSLWantWriteError:
+                        want_read, want_write = False, True
+                    except ssl.SSLWantReadError:
+                        want_read, want_write = True, False
+                    except BlockingIOError:
+                        want_read, want_write = False, True
+                    else:
+                        if sent:
+                            view = view[sent:]
+                            deadline = time.monotonic() + max(0.0, float(timeout))
+                        continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("timed out waiting for writable TLS socket")
+                _wait_socket_ready(sock, want_read, want_write,
+                                   min(remaining, _TLS_WRITE_WAIT_SLICE))
+
+
+def _sock_sendall(sock, data) -> None:
+    if _is_tls_socket(sock):
+        tls_sendall(sock, data)
+    else:
+        sock.sendall(data)
+
+
+def _tls_pending_safe(sock):
+    """SSL_pending() for diagnostics, taken under the I/O lock (never hangs)."""
+    lock = _tls_io_lock(sock)
+    if not lock.acquire(timeout=0.5):
+        return "unavailable_busy"
+    try:
+        return str(int(sock.pending()))
+    finally:
+        lock.release()
 
 
 def _tcp_session_diagnostics(sock):
@@ -125,13 +302,17 @@ def _tcp_transport_snapshot(sock):
     try:
         pending = getattr(sock, "pending", None)
         if callable(pending):
-            snapshot["ssl_pending"] = str(int(pending()))
+            if _is_tls_socket(sock):
+                snapshot["ssl_pending"] = _tls_pending_safe(sock)
+            else:
+                snapshot["ssl_pending"] = str(int(pending()))
     except Exception:
         pass
 
-    if not sys.platform.startswith("linux"):
-        snapshot["tcp_state"] = "unsupported_platform"
-        return snapshot
+    # Probe the socket capability instead of gating on sys.platform.
+    # Android reports sys.platform == "android" on a Linux kernel; TCP_INFO
+    # may still be available and useful there. Unsupported kernels/sockets are
+    # handled by the getsockopt exception below without affecting peer flow.
     tcp_info = getattr(socket, "TCP_INFO", None)
     if tcp_info is None:
         snapshot["tcp_state"] = "unsupported_option"
@@ -526,7 +707,7 @@ class PeerConnection:
                 if self._writer_stop.is_set() or not self.connected:
                     return False
                 try:
-                    self.sock.sendall(data)
+                    _sock_sendall(self.sock, data)
                 except Exception as exc:
                     # Publish failure BEFORE releasing the write lock. Otherwise
                     # a waiting synchronous sender could acquire the lock and
@@ -659,7 +840,7 @@ class PeerConnection:
                 if self._writer_stop.is_set() or not self.connected:
                     return False
                 try:
-                    self.sock.sendall(data)
+                    _sock_sendall(self.sock, data)
                 except Exception as exc:
                     self.connected = False
                     self._local_transport_failure_reason = "sync_sendall_failed"
@@ -702,9 +883,14 @@ class PeerConnection:
         # silently discarded everything after the first \n, causing the next
         # recv_line() call to block until timeout and then drop the connection.
         try:
-            self.sock.settimeout(timeout)
+            _tls_sock = _is_tls_socket(self.sock)
+            if not _tls_sock:
+                self.sock.settimeout(timeout)
             while b"\n" not in self._recv_buf:
-                chunk = self.sock.recv(4096)
+                if _tls_sock:
+                    chunk = tls_recv(self.sock, 4096, timeout)
+                else:
+                    chunk = self.sock.recv(4096)
                 if not chunk:
                     return None
                 self._recv_buf += chunk

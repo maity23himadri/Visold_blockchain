@@ -265,6 +265,9 @@ from visold.wallet.wallet import Wallet
 db, marker = sys.argv[1], sys.argv[2]
 st = Storage(db)
 bc = Blockchain(st)
+# Keep this crash/rollback regression deterministic and fast on low-power CI/Android.
+# Only the child test process is affected; production config and consensus code are untouched.
+Config.INITIAL_DIFFICULTY = 0.001
 sender = Wallet.generate()
 miner = Wallet.generate()
 st.credit_sat(sender.address, 20 * Config.SATOSHI_PER_VSD)

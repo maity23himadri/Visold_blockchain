@@ -140,7 +140,8 @@ class DNSSeeder:
                     "[SEED-ATTEMPT] %s %s via %s",
                     _family_label, _format_peer_addr(ip, port), hostname,
                 )
-                self._network._try_add_peer(ip, port)
+                self._network._try_add_peer(
+                    ip, port, auto_discovery=True, dial_source="dns-seeder")
 
             if ips_seen:
                 log.info(

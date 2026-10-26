@@ -14,9 +14,6 @@ This build combines the verified bootstrap scalability/backpressure fix with the
 - No bundled universal production ZK circuit.
 - No user database, `.vd3`, `visold.db`, WAL/SHM, wallet runtime state, or private node state.
 
-## Runtime database compatibility
-Runtime databases from older Visold builds are not compatible with this build. Start with a fresh database and retain older data separately as a backup. This source archive does not include runtime database or wallet files.
-
 ## Verification in this assembly
 - Python compilation of modified ZK modules: PASS.
 - `test_snark_backend_plumbing_20261024.py` + `test_bootstrap_rate_limit_backpressure.py`: 4/4 PASS.

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from visold.network.p2p import P2PNetwork
+from visold.network import peer_connection as peer_connection_module
 from visold.network.peer_connection import (
     PeerConnection,
     _enable_strict_tls_eof_diagnostic,
@@ -206,6 +207,17 @@ def test_tcp_transport_snapshot_decodes_tcp_info_and_ssl_pending():
     assert snapshot["ssl_pending"] == "3"
     assert snapshot["socket_fd"] == "42"
     assert snapshot["socket_closed"] == "False"
+
+
+def test_tcp_transport_snapshot_reads_tcp_info_on_android_platform(monkeypatch):
+    # Android's Python identifies as "android", despite running on Linux.
+    # The decision should be based on TCP_INFO socket capability, not the label.
+    monkeypatch.setattr(peer_connection_module.sys, "platform", "android")
+    snapshot = peer_connection_module._tcp_transport_snapshot(
+        _FakeSock(tcp_state=1, tls_pending=0))
+
+    assert snapshot["tcp_state"] == "ESTABLISHED"
+    assert snapshot["tcp_state_code"] == "1"
 
 
 def test_last_successfully_received_message_is_in_peer_loop_exit_log(caplog):

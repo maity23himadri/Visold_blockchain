@@ -36,6 +36,7 @@ def _pex_net(monkeypatch, *, seed=False, target=4, active_ids=("a", "b")):
     net._pex_seed_dials_per_minute = 1
     net._is_seed_node_mode = lambda: seed
     net.minimum_peer_target = lambda: target
+    net._desired_peer_target = lambda: target
     net.active_peer_count = lambda: [p for p in net.peers.values() if p.connected]
     return net
 
@@ -45,7 +46,7 @@ def test_pex_budget_counts_only_workers_that_really_start(monkeypatch):
     net = _pex_net(monkeypatch, target=4, active_ids=("a", "b"))
     attempts = []
 
-    def try_add(ip, port, peer_id=""):
+    def try_add(ip, port, peer_id="", **kwargs):
         attempts.append(peer_id)
         return peer_id in {"c", "d"}
 
@@ -63,7 +64,9 @@ def test_pex_budget_counts_only_workers_that_really_start(monkeypatch):
     started = net._dial_pex_candidates(SimpleNamespace(peer_id="source"), candidates)
 
     assert started == 2
-    assert attempts == ["a", "b", "c", "d"]
+    # Round-robin may rotate the unknown peers before the first dial; it still
+    # skips duplicate/source candidates and reaches two successful starts.
+    assert attempts == ["b", "c", "d"]
 
 
 def test_seed_pex_rate_slot_is_released_when_candidate_is_skipped(monkeypatch):
@@ -71,7 +74,7 @@ def test_seed_pex_rate_slot_is_released_when_candidate_is_skipped(monkeypatch):
     net = _pex_net(monkeypatch, seed=True, target=None, active_ids=("a",))
     attempts = []
 
-    def try_add(ip, port, peer_id=""):
+    def try_add(ip, port, peer_id="", **kwargs):
         attempts.append(peer_id)
         return peer_id == "b"
 
@@ -200,3 +203,151 @@ def test_old_duplicate_session_disconnect_cannot_evict_current_session():
     assert stale.connected is False
     assert net.peers["peer-a"] is current
     assert "peer-a" in net._eager_peers
+
+
+def _install_safe_replacement_topology(net, *, include_candidate_report=True):
+    """Install a fresh K5 reciprocal graph where d-e is the preferred safe edge."""
+    import time
+
+    nodes = {"a", "b", "c", "d", "e"}
+    net.node_id = "d"
+    now = time.time()
+    net._topology_reports = {
+        node_id: {
+            "node_id": node_id,
+            "neighbors": sorted(nodes - {node_id}),
+            "degree": len(nodes) - 1,
+            "complete": True,
+            "seed": False,
+            "issued_at": now,
+            "seq": 1,
+        }
+        for node_id in nodes
+    }
+    if include_candidate_report:
+        # The candidate is outside the current component; its report only helps
+        # the candidate ranker. It does not change the existing graph digest.
+        net._topology_reports["candidate"] = {
+            "node_id": "candidate", "neighbors": ["x", "y"], "degree": 2,
+            "complete": True, "seed": False, "issued_at": now, "seq": 1,
+        }
+
+
+def test_over_target_mesh_allows_one_replacement_probe_only_with_safe_local_edge(monkeypatch):
+    """A stable over-target graph may probe only if its preferred safe edge is local."""
+    import time
+
+    net = _pex_net(monkeypatch, target=3, active_ids=("a", "b", "c", "e"))
+    monkeypatch.setattr(Config, "TOPOLOGY_POLICY_ENABLED", True, raising=False)
+    monkeypatch.setattr(Config, "TOPOLOGY_TARGET_PEERS", 3, raising=False)
+    monkeypatch.setattr(Config, "TOPOLOGY_STABLE_SECONDS", 120, raising=False)
+    monkeypatch.setattr(Config, "TOPOLOGY_REPORT_TTL_SECONDS", 180, raising=False)
+    monkeypatch.setattr(Config, "MAX_PEERS", 30, raising=False)
+    net._peer_capacity_limit = lambda: 30
+    for peer in net.peers.values():
+        peer._topology_connected_since = time.monotonic() - 300
+    _install_safe_replacement_topology(net)
+
+    attempts = []
+    net._try_add_peer = lambda ip, port, peer_id="", **kwargs: attempts.append(peer_id) or True
+    candidate = {"ip": "192.0.2.60", "port": 8338, "peer_id": "candidate"}
+
+    started = net._dial_pex_candidates(SimpleNamespace(peer_id="seed"), [candidate])
+
+    assert started == 1
+    assert attempts == ["candidate"]
+
+
+def test_over_target_mesh_without_pruneable_reciprocal_edge_does_not_probe(monkeypatch):
+    """Do not add another peer when the current reciprocal graph cannot prune."""
+    import time
+
+    net = _pex_net(monkeypatch, target=3, active_ids=("a", "b", "c", "d"))
+    net.node_id = "self"
+    monkeypatch.setattr(Config, "TOPOLOGY_POLICY_ENABLED", True, raising=False)
+    monkeypatch.setattr(Config, "TOPOLOGY_TARGET_PEERS", 3, raising=False)
+    monkeypatch.setattr(Config, "TOPOLOGY_STABLE_SECONDS", 120, raising=False)
+    monkeypatch.setattr(Config, "TOPOLOGY_REPORT_TTL_SECONDS", 180, raising=False)
+    monkeypatch.setattr(Config, "MAX_PEERS", 30, raising=False)
+    net._peer_capacity_limit = lambda: 30
+    now = time.time()
+    for peer in net.peers.values():
+        peer._topology_connected_since = time.monotonic() - 300
+    # Local node claims four links, but the reciprocal connected component is a
+    # K4 (all degree 3). The extra d edge is asymmetric and cannot prove pruning.
+    graph = {
+        "self": ["a", "b", "c", "d"],
+        "a": ["b", "c", "self"],
+        "b": ["a", "c", "self"],
+        "c": ["a", "b", "self"],
+        "d": [],
+    }
+    net._topology_reports = {
+        node_id: {"node_id": node_id, "neighbors": sorted(neighbors),
+                 "degree": len(neighbors), "complete": True, "seed": False,
+                 "issued_at": now, "seq": 1}
+        for node_id, neighbors in graph.items()
+    }
+    net._topology_reports["candidate"] = {
+        "node_id": "candidate", "neighbors": [], "degree": 0,
+        "complete": True, "seed": False, "issued_at": now, "seq": 1,
+    }
+    attempts = []
+    net._try_add_peer = lambda ip, port, peer_id="", **kwargs: attempts.append(peer_id) or True
+
+    started = net._dial_pex_candidates(
+        SimpleNamespace(peer_id="seed"),
+        [{"ip": "192.0.2.61", "port": 8338, "peer_id": "candidate"}],
+    )
+
+    assert started == 0
+    assert attempts == []
+
+def test_over_target_replacement_probe_waits_for_pending_or_fresh_links(monkeypatch):
+    """One outstanding replacement is allowed; no repeated extra dials race it."""
+    import time
+
+    net = _pex_net(monkeypatch, target=3, active_ids=("a", "b", "c", "d", "e"))
+    monkeypatch.setattr(Config, "TOPOLOGY_POLICY_ENABLED", True, raising=False)
+    monkeypatch.setattr(Config, "TOPOLOGY_TARGET_PEERS", 3, raising=False)
+    monkeypatch.setattr(Config, "TOPOLOGY_STABLE_SECONDS", 120, raising=False)
+    monkeypatch.setattr(Config, "TOPOLOGY_REPORT_TTL_SECONDS", 180, raising=False)
+    monkeypatch.setattr(Config, "MAX_PEERS", 30, raising=False)
+    net._peer_capacity_limit = lambda: 30
+    for peer in net.peers.values():
+        peer._topology_connected_since = time.monotonic() - 300
+    _install_safe_replacement_topology(net)
+    net._pending_connections.add(("192.0.2.61", 8338))
+    attempts = []
+    net._try_add_peer = lambda ip, port, peer_id="", **kwargs: attempts.append(peer_id) or True
+    candidate = {"ip": "192.0.2.62", "port": 8338, "peer_id": "candidate"}
+
+    started = net._dial_pex_candidates(SimpleNamespace(peer_id="seed"), [candidate])
+
+    assert started == 0
+    assert attempts == []
+
+
+def test_over_target_mesh_can_probe_candidate_with_no_topology_report(monkeypatch):
+    """An unreported PEX peer is a single discovery probe, not an automatic reject."""
+    import time
+
+    net = _pex_net(monkeypatch, target=3, active_ids=("a", "b", "c", "d", "e"))
+    monkeypatch.setattr(Config, "TOPOLOGY_POLICY_ENABLED", True, raising=False)
+    monkeypatch.setattr(Config, "TOPOLOGY_TARGET_PEERS", 3, raising=False)
+    monkeypatch.setattr(Config, "TOPOLOGY_STABLE_SECONDS", 120, raising=False)
+    monkeypatch.setattr(Config, "TOPOLOGY_REPORT_TTL_SECONDS", 180, raising=False)
+    monkeypatch.setattr(Config, "MAX_PEERS", 30, raising=False)
+    net._peer_capacity_limit = lambda: 30
+    for peer in net.peers.values():
+        peer._topology_connected_since = time.monotonic() - 300
+    _install_safe_replacement_topology(net, include_candidate_report=False)
+    # Deliberately no report for the candidate yet.
+    attempts = []
+    net._try_add_peer = lambda ip, port, peer_id="", **kwargs: attempts.append(peer_id) or True
+    candidate = {"ip": "192.0.2.63", "port": 8338, "peer_id": "unreported-candidate"}
+
+    started = net._dial_pex_candidates(SimpleNamespace(peer_id="seed"), [candidate])
+
+    assert started == 1
+    assert attempts == ["unreported-candidate"]

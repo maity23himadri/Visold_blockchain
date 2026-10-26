@@ -1437,6 +1437,47 @@ class Blockchain:
         touched.add(L2_BRIDGE_ADDRESS)
         touched.add(L2_WITHDRAW_ADDRESS)
 
+        # snapshot_accounts()/restore_accounts() preserve the balance-row
+        # existence flag, but on SQLite restore_accounts() recreates an
+        # account_nonces row (value 0) for any address whose balance row existed
+        # even when that nonce row was absent before the dry run. That default
+        # is semantically equivalent for get_nonce(), but bootstrap snapshot
+        # serialization commits the nonce table, so this node-local row can make
+        # another validator compute a different snapshot digest. Preserve exact
+        # nonce-row presence/value around this non-mutating simulation.
+        # PostgreSQL stores nonce on the accounts row and has no separate-row
+        # shape to repair here.
+        _nonce_row_presence_before: dict[str, Optional[int]] = {}
+
+        def _remember_nonce_row_presence(address: str) -> None:
+            if not address or self.storage._pgx_enabled:
+                return
+            if address in _nonce_row_presence_before:
+                return
+            row = self.storage._conn().execute(
+                "SELECT nonce FROM account_nonces WHERE address=?", (address,)
+            ).fetchone()
+            _nonce_row_presence_before[address] = (
+                int(row["nonce"]) if row is not None else None
+            )
+
+        if not self.storage._pgx_enabled:
+            # Batch the initial lookup: at most 500 bind parameters per query
+            # keeps this safe on Android SQLite builds with conservative limits.
+            _nonce_addresses = sorted(a for a in touched if a)
+            _nonce_conn = self.storage._conn()
+            for _offset in range(0, len(_nonce_addresses), 500):
+                _nonce_batch = _nonce_addresses[_offset:_offset + 500]
+                for _address in _nonce_batch:
+                    _nonce_row_presence_before[_address] = None
+                _placeholders = ",".join("?" for _ in _nonce_batch)
+                _existing_nonce_rows = _nonce_conn.execute(
+                    "SELECT address, nonce FROM account_nonces WHERE address IN ("
+                    + _placeholders + ")", tuple(_nonce_batch)
+                ).fetchall()
+                for _row in _existing_nonce_rows:
+                    _nonce_row_presence_before[str(_row["address"])] = int(_row["nonce"])
+
         snap = self.storage.snapshot_accounts(touched)
 
         # AUDIT-FIX (Batch D): _distribute_rewards() below permanently
@@ -1496,6 +1537,7 @@ class Blockchain:
             if (not address or address in snap
                     or address in _dry_run_dynamic_accounts):
                 return
+            _remember_nonce_row_presence(address)
             _dry_run_dynamic_accounts[address] = \
                 self.storage.snapshot_accounts([address])[address]
 
@@ -2076,6 +2118,33 @@ class Blockchain:
                 log.error(
                     "CRITICAL: dry_run_state_root restore failed: %s — "
                     "state may be corrupted; node should be restarted.", _re)
+
+            # Restore the exact SQLite nonce row shape after restore_accounts().
+            # Missing rows mean nonce 0 via get_nonce(); preserving absence keeps
+            # candidate simulation from changing consensus-authenticated snapshot
+            # digests. Restore existing rows to their captured values too, which
+            # also covers an address whose balance row did not previously exist.
+            if not self.storage._pgx_enabled and _nonce_row_presence_before:
+                try:
+                    _nonce_conn = self.storage._conn()
+                    for _nonce_address, _old_nonce in _nonce_row_presence_before.items():
+                        if _old_nonce is None:
+                            _nonce_conn.execute(
+                                "DELETE FROM account_nonces WHERE address=?",
+                                (_nonce_address,),
+                            )
+                        else:
+                            _nonce_conn.execute(
+                                "INSERT OR REPLACE INTO account_nonces (address, nonce) VALUES (?,?)",
+                                (_nonce_address, int(_old_nonce)),
+                            )
+                    _nonce_conn.commit()
+                except Exception as _nonce_restore_exc:
+                    log.error(
+                        "CRITICAL: dry_run_state_root nonce-row restore failed: %s — "
+                        "bootstrap snapshot state may be non-deterministic; node should be restarted.",
+                        _nonce_restore_exc,
+                    )
 
             # AUDIT-FIX (Batch D): restore the cumulative issuance counter
             # snapshotted above, undoing _distribute_rewards()'s

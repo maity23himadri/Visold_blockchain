@@ -32,6 +32,7 @@ from visold.chain.blockchain import Blockchain
 from visold.chain.consensus_engine import ConsensusEngine
 from visold.consensus.difficulty import DifficultyEngine
 from visold.consensus.hashrate_governor import HashrateGovernor
+from visold.consensus.hashrate_reports import sign_hashrate_report
 from visold.consensus.mining_safety import MiningSafetyGuard
 from visold.crypto.vrf import vrf_prove
 from visold.kernel.config import Config
@@ -133,6 +134,7 @@ class MiningEngine:
         # mining-watchdog clock used by MiningSafetyGuard.
         self._hr_report_stop   = threading.Event()
         self._hr_report_thread: Optional[threading.Thread] = None
+        self._hr_report_seq    = 0
 
         # AUDIT-FIX-20 (Batch F, Finding 3): serializes start()/stop() so
         # the two can never interleave — see the comments on those methods.
@@ -240,6 +242,18 @@ class MiningEngine:
             # until every previous thread has actually exited.
             if self._live_mining_threads():
                 return False, "Previous mining loop is still stopping; try again shortly"
+            # A previous session's rate is not a valid startup measurement for
+            # this session. Calibrate before engaging the governor again.
+            try:
+                reset_rate = getattr(self._parallel, "reset_raw_hashrate", None)
+                if callable(reset_rate):
+                    reset_rate()
+            except Exception as _reset_exc:
+                log.debug(f"Hashrate telemetry reset failed: {_reset_exc}")
+            governor = getattr(self, "_hashrate_governor", None)
+            if governor is not None:
+                governor.reset_local_measurement()
+            self.start_time = time.time()
             self._running = True
             self._paused  = False
             self._stop_evt.clear()
@@ -257,7 +271,6 @@ class MiningEngine:
                 target=self._hashrate_report_loop, daemon=True,
                 name="mine-hr-report")
             self._hr_report_thread.start()
-            self.start_time = time.time()
             log.info("Auto mining started (with parallel candidate builder + "
                      "hashrate governor)")
             return True, "Mining started"
@@ -290,52 +303,57 @@ class MiningEngine:
 
     # ── v7.6.0 Hashrate-report broadcast loop ────────────────────────────
     def _hashrate_report_loop(self):
-        """Periodically broadcast our actual (unthrottled) hashrate to peers
-        so every node's HashrateGovernor has a fresh view of the network's
-        actual-hashrate distribution.
+        """Poll raw mining telemetry frequently and broadcast it periodically.
 
-        v7.6.1 — this loop NO LONGER overwrites the governor's measurement.
-        The per-block EMA in _mine_one() is the canonical value; this loop
-        only READS it for broadcasting.  The previous implementation
-        recomputed (total_hashes / total_elapsed) on every cycle and
-        clobbered the EMA, defeating the smoothing.
-
-        The broadcast is metadata only — it never affects block validation
-        or consensus.  If the network reference is None (test mode) the
-        loop is a no-op.
+        Raw H/s comes from the CPU workers' attempted-hash / active-compute-time
+        counters, excluding deliberate governor sleeps. It is therefore not
+        derived from successful-block nonce numbers, which can stay at zero or
+        be delayed for a long time at higher difficulty.
         """
         interval = max(5.0, float(Config.HASHRATE_REPORT_INTERVAL))
+        next_broadcast = time.monotonic()
         while not self._hr_report_stop.is_set() and self._running:
             try:
-                # Read the EMA-smoothed rate (already maintained by _mine_one).
-                hr = self._hashrate_governor.get_local_actual_hashrate()
-
-                # Broadcast to peers if we have any AND we have a measurement.
-                if (self.network is not None
-                        and getattr(self.network, "peers", None)
-                        and not self._paused
-                        and hr > 0.0):
-                    msg = {
-                        "type":     MSG_HASHRATE_REPORT,
-                        "node_id":  getattr(self.network, "node_id", ""),
-                        "hashrate": float(hr),
-                        "ts":       int(time.time()),
-                    }
-                    # Send to all currently-connected peers (point-to-point).
-                    # We do NOT use the gossip flooder because hashrate
-                    # reports are small, fresh, and self-evicting — there is
-                    # no benefit to amplification, and gossip would let a
-                    # single misbehaving peer rebroadcast a stale value.
-                    for p in list(self.network.peers.values()):
+                if not self._paused:
+                    raw_hr = 0.0
+                    get_raw = getattr(self._parallel, "get_raw_hashrate", None)
+                    if callable(get_raw):
                         try:
-                            if getattr(p, "connected", False):
-                                p.send(msg)
-                        except Exception:
-                            continue
-            except Exception as _e:
-                log.debug(f"[HR-Report] loop error: {_e}")
-            # Wait, but wake immediately on stop.
-            self._hr_report_stop.wait(timeout=interval)
+                            raw_hr = float(get_raw())
+                        except (TypeError, ValueError, OverflowError):
+                            raw_hr = 0.0
+                    if raw_hr > 0.0:
+                        # The worker-side sampler already smooths scheduling
+                        # noise; do not feed throttled block elapsed time back
+                        # into this raw-capability value.
+                        self._hashrate_governor.update_local_actual_hashrate(raw_hr)
+
+                    now_mono = time.monotonic()
+                    if (raw_hr > 0.0 and self.network is not None
+                            and getattr(self.network, "peers", None)
+                            and now_mono >= next_broadcast):
+                        # Nanosecond time makes sequence monotonic across normal
+                        # process restarts; origin wall timestamp remains signed
+                        # separately for bounded report freshness.
+                        self._hr_report_seq = max(
+                            int(getattr(self, "_hr_report_seq", 0)) + 1,
+                            time.time_ns())
+                        msg = sign_hashrate_report(
+                            self.network.wallet,
+                            str(getattr(self.network, "node_id", "")),
+                            float(raw_hr), sequence=self._hr_report_seq)
+                        for peer in list(self.network.peers.values()):
+                            try:
+                                if getattr(peer, "connected", False):
+                                    peer.send(msg)
+                            except Exception:
+                                continue
+                        next_broadcast = now_mono + interval
+            except Exception as exc:
+                log.debug(f"[HR-Report] loop error: {exc}")
+            # Poll frequently enough for startup calibration / live UI, but
+            # keep the network report interval at its configured value.
+            self._hr_report_stop.wait(timeout=0.25)
 
     def pause(self):
         self._paused = True
@@ -350,16 +368,27 @@ class MiningEngine:
         session_mean_hr = self.hashes_done / elapsed if elapsed > 0 else 0
         self.network.hashrate = session_mean_hr
         binfo = self._parallel.backend_info()
+        # Bring worker telemetry into the governor before creating this status
+        # snapshot, so the UI does not wait for a solved block or the next peer
+        # broadcast to display the initial H/s estimate.
+        try:
+            get_raw = getattr(self._parallel, "get_raw_hashrate", None)
+            raw_now = float(get_raw()) if callable(get_raw) else 0.0
+            if raw_now > 0.0 and self._running and not self._paused:
+                self._hashrate_governor.update_local_actual_hashrate(raw_now)
+        except Exception:
+            pass
         gov_snapshot = self._hashrate_governor.status_snapshot()
-        # ── v7.6.2 The dashboard "Hashrate" field now reports the EMA so it
-        # is consistent with the Hashrate Optimization panel below it.  The
-        # session mean (hashes_done / total_elapsed) is preserved as a
-        # separate field for operators who want to see total work done.
-        ema_hr = gov_snapshot['local_actual_hps']
+        measurement_ready = bool(gov_snapshot.get('measurement_ready', False))
+        calibrating = self._running and not self._paused and not measurement_ready
+        actual_hps = float(gov_snapshot['local_actual_hps'])
+        actual_display = f"{actual_hps:.1f} H/s" if measurement_ready else (
+            "measuring…" if calibrating else "not measured")
+        # The session mean is still useful but is not a hardware-speed metric.
         return {
             "running":       self._running,
             "paused":        self._paused,
-            "hashrate":      f"{ema_hr:.1f} H/s",
+            "hashrate":      actual_display,
             "session_mean_hashrate": f"{session_mean_hr:.1f} H/s",
             "blocks_found":  self.blocks_found,
             "difficulty":    self.blockchain.get_difficulty(),
@@ -373,12 +402,18 @@ class MiningEngine:
             "cuda_avail":    binfo["cuda_avail"],
             "opencl_avail":  binfo["opencl_avail"],
             # ── v7.6.0 Hashrate optimization governor ───────────────────────────
-            "actual_hashrate":     f"{gov_snapshot['local_actual_hps']:.1f} H/s",
-            "optimized_hashrate":  (f"{gov_snapshot['allowed_local_hps']:.1f} H/s"
-                                    if gov_snapshot['allowed_local_hps'] != float('inf')
-                                    else "unlimited"),
+            "actual_hashrate":     actual_display,
+            "optimized_hashrate":  (
+                f"{gov_snapshot['allowed_local_hps']:.1f} H/s"
+                if gov_snapshot['allowed_local_hps'] != float('inf')
+                else ("calibrating (unthrottled)" if calibrating else
+                      ("unlimited (optimization disabled)"
+                       if not Config.HASHRATE_OPTIMIZATION_ENABLED else
+                       "unthrottled (live cap pending)"))),
             "required_network_hashrate": f"{gov_snapshot['required_total_hps']:.1f} H/s",
             "live_peer_hr_reports":      gov_snapshot['live_peer_reports'],
+            "hashrate_measurement_ready": measurement_ready,
+            "hashrate_optimization_enabled": bool(Config.HASHRATE_OPTIMIZATION_ENABLED),
         }
 
     def _mine_loop(self):
@@ -657,9 +692,26 @@ class MiningEngine:
         wd_thread.start()
 
         # ── Parallel mine (CPU threads or GPU) — now possibly throttled ──
+        def _live_hashrate_cap():
+            """Refresh the governor cap while the same block is still mining."""
+            try:
+                get_raw = getattr(self._parallel, "get_raw_hashrate", None)
+                raw_live = float(get_raw()) if callable(get_raw) else 0.0
+                if raw_live > 0.0:
+                    self._hashrate_governor.update_local_actual_hashrate(raw_live)
+                cap_live, _req_live, _debug_live = self._hashrate_governor.advise(
+                    block.difficulty)
+                return cap_live
+            except Exception as _cap_exc:
+                log.debug(f"[HashrateGovernor] dynamic cap refresh failed: {_cap_exc}")
+                # Fail open on a local telemetry/governor failure; the cap is
+                # advisory and must never prevent consensus mining entirely.
+                return float("inf")
+
         try:
             success = self._parallel.mine(
-                block, stop_event=self._stop_evt, max_hps=mine_max_hps)
+                block, stop_event=self._stop_evt, max_hps=mine_max_hps,
+                max_hps_provider=_live_hashrate_cap)
         finally:
             watchdog_local_stop.set()
             wd_thread.join(timeout=2.0)
@@ -683,32 +735,10 @@ class MiningEngine:
         if success:
             self.hashes_done += block.nonce + 1
 
-        # ── v7.6.1 Refresh local actual hashrate using a sliding window ──
-        # Previously we used (total_hashes / total_elapsed) which produces
-        # a session-mean that includes early bootstrap blocks where the
-        # throttle was inactive.  That mean stays elevated for many blocks
-        # and confuses the operator (panel shows Actual >> Optimized even
-        # though the recent rate equals Optimized).
-        #
-        # The sliding window measures only the most recent block, which
-        # is closer to the live rate the throttle is actually enforcing.
-        # Combined with a 5-block exponential smoothing, it converges to
-        # the true throttled rate within a few blocks while still being
-        # noise-tolerant.
-        try:
-            block_hashes  = float(block.nonce + 1) if success else 0.0
-            block_elapsed = max(elapsed, 1e-3)
-            block_hr      = block_hashes / block_elapsed if success else 0.0
-            if block_hr > 0.0:
-                # 5-block EMA: weight = 1/5 for new, 4/5 for old
-                prev_hr = self._hashrate_governor.get_local_actual_hashrate()
-                if prev_hr > 0.0:
-                    smoothed = 0.2 * block_hr + 0.8 * prev_hr
-                else:
-                    smoothed = block_hr
-                self._hashrate_governor.update_local_actual_hashrate(smoothed)
-        except Exception:
-            pass
+        # Raw hardware-rate telemetry is sampled continuously by ParallelMiner
+        # while workers hash. Do not update it from block.nonce / elapsed here:
+        # elapsed includes deliberate governor sleeps and would create a
+        # throttle-feedback loop; failed block attempts also provide no result.
 
         if not success:
             return

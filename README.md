@@ -11,15 +11,13 @@ Keep `visold_vsd_.py` and the `visold/` folder side by side.
 | Path | What it is |
 |---|---|
 | `visold_vsd_.py` | entry point + backward-compatible flat namespace (no implementation, no legacy loader) |
-| `visold/` | the code: 22 bounded contexts, 123 modules, layered so import cycles cannot occur |
+| `visold/` | the code: 22 bounded contexts, 117 modules, layered so import cycles cannot occur |
 | `docs/ARCHITECTURE.md` | context map, layering rule, "where does X live", module index with original line ranges |
 | `docs/MIGRATION_LOG.md` | what changed (3 declared edits), proof it is equivalent, strangler-fig waves, limits |
 | `tools/` | `check_architecture.py` (run after every edit), `gen_docs.py`, and the verification / migration tooling |
 
 Before replacing your old file read **MIGRATION_LOG.md section 5** (the logic hash changes, so mixed old/new networks
 treat each other as TRUST_LOW) and run your usual multi-node test.
-
-> **Database compatibility:** This substantially updated build is not compatible with runtime databases from older Visold builds. Start with a fresh database and keep any older database as a separate backup; runtime database and wallet state are not included in this source archive.
 
 ## Android / Termux terminal experience
 
@@ -72,3 +70,7 @@ See `BOOTSTRAP_RATE_LIMIT_SCALABILITY_FIX_2026-10-24.md` and `docs/CURRENT_SYNC_
 
 ### 2026-10-24 mixed-version pruned-bootstrap handoff fix
 When authenticated snapshot bootstrap lands on a checkpoint whose following block bodies are already pruned on an older peer, the snapshot-response routing slot is now handed off atomically to pruned-history recovery. Legacy delayed cleanup can no longer erase a newer recovery queue. This preserves mixed-version recovery without changing consensus, wire formats, or database formats. See `MIXED_VERSION_PRUNED_BOOTSTRAP_QUEUE_FIX_2026-10-24.md`.
+
+## Adaptive topology probe eligibility fix (2026-10-26)
+
+See `TOPOLOGY_PROBE_PRUNING_ELIGIBILITY_FIX_2026-10-26.md`. Over-target replacement probes now require a safe reciprocal edge that this node is designated to prune; otherwise the extra outbound probe is suppressed. Incoming peer admission remains governed by the existing hard cap and handshake checks.

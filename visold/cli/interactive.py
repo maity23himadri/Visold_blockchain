@@ -3330,46 +3330,39 @@ class CLI:
         print(f"  Difficulty : {s['difficulty']}")
         print(f"  Height     : {s['chain_height']}")
 
-        # ── v7.6.0 Hashrate Optimization (governor) ───────────────────────────
-        # Show the four governor fields so the operator can see what the
-        # local cap is, what the network "should" be running at, and how
-        # many peers are reporting their actual hashrate.
-        actual_hr   = s.get('actual_hashrate',            '—')
-        opt_hr      = s.get('optimized_hashrate',         '—')
-        req_hr      = s.get('required_network_hashrate',  '—')
-        peer_n      = s.get('live_peer_hr_reports',       0)
+        # ── Hashrate Optimization (governor) ─────────────────────────────────
+        actual_hr   = s.get('actual_hashrate', '—')
+        opt_hr      = s.get('optimized_hashrate', '—')
+        req_hr      = s.get('required_network_hashrate', '—')
+        peer_n      = s.get('live_peer_hr_reports', 0)
+        measuring   = not bool(s.get('hashrate_measurement_ready', True))
+        optimization_enabled = bool(s.get('hashrate_optimization_enabled', True))
         print()
         print(clr("  ── Hashrate Optimization ──", CYAN))
         print(f"  Actual H/s    : {bold(actual_hr)}      "
-              f"(raw hardware speed)")
+              f"(measured active-compute rate; governor sleep excluded)")
         print(f"  Optimized H/s : {bold(opt_hr)}      "
-              f"(governor cap; 'unlimited' if solo / disabled)")
+              f"(local miner cap; startup is temporarily unthrottled)")
         print(f"  Required H/s  : {bold(req_hr)}      "
-              f"(network target at current difficulty)")
-        if peer_n == 0:
-            # When solo and our hardware can't keep up with the required
-            # rate, the cap is clamped to actual — show that explicitly so
-            # the operator understands why "Optimized == Actual" instead of
-            # "Optimized == Required".
-            try:
-                actual_v = float(actual_hr.split()[0])
-                req_v    = float(req_hr.split()[0])
-                if actual_v > 0 and actual_v < req_v:
-                    print(clr(
-                        f"  Peer reports  : 0  — solo mining; hardware below "
-                        f"network target, cap clamped to actual",
-                        DIM))
-                else:
-                    print(clr(
-                        f"  Peer reports  : 0  — solo mining, governor "
-                        f"inactive (cap = required H/s)", DIM))
-            except (ValueError, IndexError, AttributeError):
+              f"(aggregate network target at current difficulty)")
+        if measuring:
+            print(clr(
+                f"  Peer reports  : {peer_n} fresh miner-rate report(s) observed; "
+                f"calibrating local hashrate",
+                DIM))
+        elif peer_n == 0:
+            if optimization_enabled:
                 print(clr(
-                    f"  Peer reports  : 0  — solo mining, governor inactive "
-                    f"(cap = required H/s)", DIM))
+                    "  Peer reports  : 0 fresh miner-rate reports observed; "
+                    "using local-only hashrate view",
+                    DIM))
+            else:
+                print(clr(
+                    "  Peer reports  : 0 fresh miner-rate reports; governor disabled",
+                    DIM))
         else:
-            print(f"  Peer reports  : {bold(str(peer_n))} miner(s) reporting "
-                  f"actual H/s")
+            print(f"  Peer reports  : {bold(str(peer_n))} fresh miner-origin report(s) "
+                  f"observed via mesh; rates are self-reported, view may be incomplete")
 
         # ── Parallel mining backend ───────────────────────────────────────────
         print()

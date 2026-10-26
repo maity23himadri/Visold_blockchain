@@ -1,8 +1,16 @@
-"""Deterministic integration regression for prune/reconnect safety.
+"""Deterministic integration regressions for pruning and reconnect safety.
 
-PoW search is replaced with an always-valid test target so the real block
-application, SQLite storage, pruner, serialization and accept_chain paths can
-be exercised quickly. This is not a consensus/PoW correctness test.
+These tests deliberately model the current recoverability contract:
+
+* without a committed bootstrap snapshot, the pruner must fail closed and keep
+  full block bodies even when the rolling-window threshold has passed;
+* with real consensus-created bootstrap commitments, old bodies may be pruned,
+  but stale/fresh full-body synchronization must reject header-only history
+  without partially applying the supplied chain.
+
+Difficulty is set to zero only to make actual PoW mining deterministic and fast;
+this is not a consensus/PoW correctness test.  Production pruning and chain
+application code remain unpatched.
 """
 from __future__ import annotations
 
@@ -10,6 +18,7 @@ import time
 from unittest.mock import patch
 
 from visold.chain.blockchain import Blockchain
+from visold.chain.consensus_engine import ConsensusEngine
 from visold.kernel.config import Config
 from visold.ledger.block import Block
 from visold.ledger.transaction import Transaction
@@ -25,7 +34,8 @@ def _new_chain(tmp_path, filename):
     return storage, chain
 
 
-def _mine_one(chain, miner, timestamp):
+def _mine_one_without_bootstrap_commitment(chain, miner, timestamp):
+    """Build a simple block for the explicit no-servable-snapshot scenario."""
     height = chain.height() + 1
     parent = chain.latest_block()
     coinbase = Transaction.coinbase(
@@ -47,21 +57,79 @@ def _mine_one(chain, miner, timestamp):
     return block
 
 
-def test_pruned_history_is_marked_and_missing_body_fails_closed_without_partial_apply(
+def _mine_to(chain, miner, target_height):
+    """Mine using the real consensus candidate builder, including commitments."""
+    chain._rolling_pruner.prune_async = lambda _height: None
+    consensus = ConsensusEngine(chain, miner)
+    while chain.height() < target_height:
+        block = consensus.build_candidate_block(miner.address)
+        assert block.mine(), f"consensus candidate {block.index} mining failed"
+        ok, reason = chain.apply_block(block)
+        assert ok, f"consensus block {block.index} application failed: {reason}"
+
+
+def _chain_payload(chain, start_height, end_height_inclusive):
+    payload = []
+    for height in range(start_height, end_height_inclusive + 1):
+        block = chain.get_block(height)
+        assert block is not None, f"source block {height} unexpectedly missing"
+        payload.append(Block.from_dict(block.to_dict()))
+    return payload
+
+
+def test_pruner_keeps_full_bodies_when_no_committed_snapshot_is_available(
     tmp_path, monkeypatch
 ):
+    """A rolling-window cutoff alone must never authorize body deletion."""
     monkeypatch.setattr(Config, "ROLLING_PRUNE_ENABLED", True)
     monkeypatch.setattr(Config, "ROLLING_PRUNE_WINDOW", 3)
     monkeypatch.setattr(Config, "ROLLING_PRUNE_INTERVAL", 1)
     monkeypatch.setattr(Config, "ROLLING_PRUNE_BATCH", 200)
     monkeypatch.setattr(Config, "SNAPSHOT_FAST_SYNC_ENABLED", False)
-    if hasattr(Config, "SNAPSHOT_ENABLED"):
-        monkeypatch.setattr(Config, "SNAPSHOT_ENABLED", False)
+    monkeypatch.setattr(Config, "SNAPSHOT_ENABLED", False)
+    # Keep the consensus snapshot interval at its normal/default scale for this
+    # case: the test chain never reaches an anchor/commitment boundary.
 
-    # Fast deterministic integration: all actual storage, block application,
-    # chain validation and pruning logic remain in use. Returning difficulty
-    # zero makes the real PoW target maximal, so the real miner and PoW verifier
-    # can run without patching the process-global DifficultyEngine or its cache.
+    with patch.object(Blockchain, "get_difficulty", return_value=0.0):
+        storage, chain = _new_chain(tmp_path, "no_anchor.db")
+        try:
+            miner = Wallet.generate()
+            # Finish near local time to avoid manufacturing large clock offsets.
+            t0 = int(time.time()) - 11 * 60
+            for height in range(1, 12):
+                _mine_one_without_bootstrap_commitment(
+                    chain, miner, t0 + height * 60
+                )
+                chain._rolling_pruner.maybe_prune(chain.height())
+
+            assert chain.height() == 11
+            assert chain._snapshot_engine.get_servable_manifest() == []
+            assert chain._rolling_pruner._recoverability_aligned_cutoff(11) == 0
+            old_block = chain.get_block(1)
+            assert old_block is not None
+            assert old_block.is_pruned is False
+        finally:
+            storage.close()
+
+
+def test_pruned_history_fails_closed_without_partial_apply_when_commitments_exist(
+    tmp_path, monkeypatch
+):
+    """Real committed anchors allow pruning; old-body sync still fails closed."""
+    monkeypatch.setattr(Config, "ROLLING_PRUNE_WINDOW", 3)
+    monkeypatch.setattr(Config, "ROLLING_PRUNE_INTERVAL", 1)
+    monkeypatch.setattr(Config, "ROLLING_PRUNE_BATCH", 200)
+    monkeypatch.setattr(Config, "SNAPSHOT_FAST_SYNC_ENABLED", False)
+    monkeypatch.setattr(Config, "SNAPSHOT_ENABLED", False)
+    monkeypatch.setattr(Config, "BOOTSTRAP_SNAPSHOT_INTERVAL", 4)
+    monkeypatch.setattr(Config, "BOOTSTRAP_COMMITMENT_ACTIVATION_HEIGHT", 5)
+    monkeypatch.setattr(Config, "SNAPSHOT_KEEP", 3)
+
+    # Keep pruning off while the receiver fixtures acquire complete history.
+    # ConsensusEngine still creates/commits the required bootstrap snapshots at
+    # the test-only 4-block interval. No production implementation is mocked.
+    monkeypatch.setattr(Config, "ROLLING_PRUNE_ENABLED", False)
+
     with patch.object(Blockchain, "get_difficulty", return_value=0.0):
         source_storage, source = _new_chain(tmp_path, "source.db")
         short_storage, short = _new_chain(tmp_path, "short.db")
@@ -69,28 +137,41 @@ def test_pruned_history_is_marked_and_missing_body_fails_closed_without_partial_
         fresh_storage, fresh = _new_chain(tmp_path, "fresh.db")
         try:
             miner = Wallet.generate()
-            t0 = int(time.time()) + 3600
+            _mine_to(source, miner, 14)
 
-            # Mine first, while the entire chain body remains available.
-            for height in range(1, 9):
-                _mine_one(source, miner, t0 + height * 60)
+            # Candidate dry-runs must not leave node-local zero nonce rows that
+            # a receiving validator cannot reproduce in the same bootstrap
+            # snapshot digest. This assertion makes the discovered regression
+            # explicit instead of relying only on the next block's validation.
+            zero_nonce_rows = source_storage._conn().execute(
+                "SELECT address FROM account_nonces WHERE nonce=0"
+            ).fetchall()
+            assert zero_nonce_rows == [], [row["address"] for row in zero_nonce_rows]
 
-            # Node 2a syncs through 8; node 2b syncs only through height 5.
-            short_payload = [source.get_block(i).to_dict() for i in range(0, 9)]
-            ok, reason = short.accept_chain([Block.from_dict(d) for d in short_payload])
+            # Verify snapshots are actually servable only after their H+1
+            # commitment has committed to the source chain.
+            anchors = {
+                int(entry["height"])
+                for entry in source._snapshot_engine.get_servable_manifest()
+            }
+            assert {4, 8, 12}.issubset(anchors), anchors
+
+            # A recent node has all history through 14; another node only through 5.
+            ok, reason = short.accept_chain(_chain_payload(source, 0, 14))
             assert ok, reason
-            assert short.height() == 8
+            assert short.height() == 14
 
-            stale_payload = [source.get_block(i).to_dict() for i in range(0, 6)]
-            ok, reason = stale.accept_chain([Block.from_dict(d) for d in stale_payload])
+            ok, reason = stale.accept_chain(_chain_payload(source, 0, 5))
             assert ok, reason
             assert stale.height() == 5
 
-            # Node 1 advances and prunes the bodies needed by stale/fresh nodes.
-            for height in range(9, 12):
-                _mine_one(source, miner, t0 + height * 60)
+            # Enable pruning only after those complete histories have been acquired.
+            monkeypatch.setattr(Config, "ROLLING_PRUNE_ENABLED", True)
+            for height in range(15, 20):
+                _mine_to(source, miner, height)
                 source._rolling_pruner.maybe_prune(source.height())
-            assert source.height() == 11
+
+            assert source.height() == 19
             old_block = source.get_block(1)
             assert old_block is not None and old_block.is_pruned
             assert old_block.transactions == ()
@@ -98,26 +179,26 @@ def test_pruned_history_is_marked_and_missing_body_fails_closed_without_partial_
             valid, reason = source.validate_block(old_block)
             assert not valid and "pruned" in reason.lower()
 
-            # A recently synced node asks only for 9..11, whose bodies still exist.
-            recent_missing = [source.get_block(i).to_dict() for i in range(9, 12)]
-            ok, reason = short.accept_chain([Block.from_dict(d) for d in recent_missing])
+            # The latest recoverable suffix remains full and synchronizes normally.
+            recent_missing = _chain_payload(source, 15, 19)
+            ok, reason = short.accept_chain(recent_missing)
             assert ok, reason
-            assert short.height() == 11
+            assert short.height() == 19
 
-            # Stale node needs pruned block 6. It must fail without applying 7..11.
-            stale_missing = [source.get_block(i).to_dict() for i in range(6, 12)]
-            ok, reason = stale.accept_chain([Block.from_dict(d) for d in stale_missing])
+            # The stale node needs old block 6, whose body has been pruned.
+            stale_missing = _chain_payload(source, 6, 19)
+            ok, reason = stale.accept_chain(stale_missing)
             assert not ok
             assert "pruned/header-only" in reason
             assert stale.height() == 5, "failed batch partially changed local chain"
 
-            # Fresh node asks for full history. It must fail closed before applying
-            # any of that page; never treat a pruned header as a full block.
-            full_payload = [source.get_block(i).to_dict() for i in range(0, 12)]
-            ok, reason = fresh.accept_chain([Block.from_dict(d) for d in full_payload])
+            # A fresh node cannot consume a full-history page that contains a
+            # header-only block and must remain at genesis on rejection.
+            full_payload = _chain_payload(source, 0, 19)
+            ok, reason = fresh.accept_chain(full_payload)
             assert not ok
             assert "pruned/header-only" in reason
-            assert fresh.height() == 0, "fresh sync partially applied a pruned-history page"
+            assert fresh.height() == 0, "fresh sync partially applied pruned history"
         finally:
             source_storage.close()
             short_storage.close()

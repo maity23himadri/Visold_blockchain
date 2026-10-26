@@ -55,6 +55,11 @@ def _recv_with_blockingio_retry(sock, size: int, timeout: float):
     Wait for readability using one monotonic deadline; turn a real wait expiry
     into socket.timeout so the existing PING/liveness path remains authoritative.
     """
+    if isinstance(sock, ssl.SSLSocket):
+        # TLS sockets are shared with writer threads. OpenSSL forbids
+        # overlapping SSL_read/SSL_write on one connection, so the read goes
+        # through the per-socket serialized path (see peer_connection.tls_recv).
+        return tls_recv(sock, size, timeout)
     deadline = time.monotonic() + max(0.0, float(timeout))
     pending_retry_count = 0
     while True:
@@ -84,6 +89,7 @@ def _recv_with_blockingio_retry(sock, size: int, timeout: float):
 
 from visold.chain.blockchain import Blockchain
 from visold.consensus.slashing import SlashingEvidenceProtocol
+from visold.consensus.hashrate_reports import verify_hashrate_report
 from visold.crypto.ecc import ecdsa_sign, ecdsa_verify, pub_from_hex, sig_from_hex, sig_to_hex
 from visold.crypto.hashing import hash_obj, sha256
 from visold.kernel.config import Config
@@ -122,10 +128,21 @@ from visold.kernel.messages import (
     MSG_RESOLVE,
     MSG_RESOLVE_RESP,
     MSG_TX,
+    MSG_TOPOLOGY_PRUNE_ACK,
+    MSG_TOPOLOGY_PRUNE_PROPOSE,
     MSG_VALIDATOR_SIG,
     MSG_VERIFY,
 )
 from visold.kernel.metrics import metrics
+from visold.network.topology_policy import (
+    list_redundant_edges,
+    rank_topology_candidates,
+    topology_component_digest,
+    topology_component_view_diagnostic,
+    topology_prune_initiator,
+    topology_signing_bytes,
+    verify_topology_report,
+)
 from visold.kernel.netutil import (
     _create_connection_dual_stack,
     _create_dual_stack_server_socket,
@@ -163,7 +180,7 @@ from visold.network.kademlia import KademliaRouter
 from visold.network.message_logger import P2PMessageLogger
 from visold.network.nat.ice import ICEManager, _pow_check, _pow_solve
 from visold.network.nat.upnp import UPnPManager
-from visold.network.peer_connection import PeerConnection, _tcp_transport_snapshot
+from visold.network.peer_connection import PeerConnection, _tcp_transport_snapshot, tls_recv
 from visold.network.receipt_relay import ReceiptRelayManager
 from visold.network.tls import TLSManager
 from visold.network.udp.latency import LatencyTracker
@@ -205,6 +222,8 @@ class P2PNetwork:
     _PEX_PAGE_SIZE = 100
     _PEX_DIAL_BATCH = 4
     _PEX_DIRECTORY_MAX = 5000
+    _TOPOLOGY_PAGE_SIZE = 128
+    _TOPOLOGY_REPORTS_MAX = 5000
 
     # ── v7.1.0: Per-peer message-rate limits (DoS protection) ────────────────
     # The existing byte-rate cap (MAX_PEER_BANDWIDTH) catches bulk floods, and
@@ -220,6 +239,8 @@ class P2PNetwork:
         # Expensive queries — strictly limited
         "GET_CHAIN":          5,   # 0.5 req/s sustained
         "GET_PEERS":          3,
+        "TOPOLOGY_PRUNE_PROPOSE": 2,
+        "TOPOLOGY_PRUNE_ACK": 2,
         "GET_BLOCK":         30,
         "RESOLVE":           10,
         "CAPABILITY_QUERY":   5,
@@ -244,11 +265,11 @@ class P2PNetwork:
         "GET_BLOCK_CHUNK":   200,   # Accommodates 512KB chunking of large blocks
         # ── v7.6.0 Hashrate optimization gossip ──────────────────────────────
         # Each node sends one report per HASHRATE_REPORT_INTERVAL (default 5s).
-        # 30/window (10 s) sustained = 3 reports per honest cycle with 10×
-        # headroom for transient bursts and accidental retries.  An attacker
-        # spamming reports is harmless (governor's per-peer key dedupes them)
-        # but still consumes bandwidth, so we cap.
-        "HASHRATE_REPORT":   30,
+        # Signed reports are relayed, so a neighbour can legitimately forward
+        # many distinct miner reports per interval in a larger mesh. Signature,
+        # per-origin sequence/timestamp dedup, global rate limiting and payload
+        # bounds jointly constrain abuse.
+        "HASHRATE_REPORT":  300,
         # VARR temporary mailbox. PUT/ACK are bounded because each canonical
         # transfer is replicated to a small fixed number of deterministic slots.
         "RECEIPT_PUT":       240,
@@ -289,6 +310,19 @@ class P2PNetwork:
         self._node_directory_ttl_secs = 30 * 24 * 60 * 60
         self._node_directory_claim_cache = {}
         self._node_directory_storage_refresh_at = 0.0
+        # Signed, gossip-propagated adjacency reports. These are topology hints,
+        # never consensus inputs or permission to bypass peer admission checks.
+        self._topology_lock = threading.RLock()
+        self._topology_reports: Dict[str, dict] = {}
+        self._topology_seq = 0
+        self._topology_rr_cursor = 0
+        self._topology_last_rebalance_at = 0.0
+        # Authenticated hashrate report anti-replay state. Reports are keyed by
+        # their signing origin and sequence, not by whichever relay forwarded
+        # them. The cache is bounded to protect long-lived nodes.
+        self._hr_reports_lock = threading.Lock()
+        self._hr_reports_seen: Dict[str, Tuple[int, int, float]] = {}
+        self._hr_reports_seen_max = 10000
         self._pex_dial_lock = threading.Lock()
         self._pex_dial_times = deque()
         self._pex_seed_dials_per_minute = 12
@@ -341,6 +375,11 @@ class P2PNetwork:
         # same endpoint (Bug #3 / #4 fix).
         self._pending_connections: set = set()
         self._pending_lock = threading.Lock()
+        # Serialize automatic discovery admission so concurrent PEX/DNS/DHT
+        # callbacks cannot all observe the same free soft-target slot. The
+        # lock is held only until the new endpoint is inserted into the pending
+        # set (or the attempt is rejected), never for the network handshake.
+        self._auto_dial_lock = threading.RLock()
         # Per-endpoint outbound fail tracking: (ip, port) ->
         # [fail_count, cooldown_until_ts]. Mobile/CGNAT users can run several
         # independent nodes on one IP, so one dead port must not cool down every
@@ -2247,10 +2286,9 @@ class P2PNetwork:
     def minimum_peer_target(self) -> Optional[int]:
         """Return the finite desired peer target, or ``None`` for an unbounded seed.
 
-        Ordinary nodes keep the configured finite target (3 by default). The
-        explicitly designated seed has no finite minimum target: its discovery
-        loop keeps exploring known and PEX-discovered peers, while admission is
-        independently governed by the seed-only unlimited capacity policy.
+        Adaptive topology uses a separate soft degree goal. Dedicated seeds retain
+        unbounded discovery unless topology_seed_pruning_enabled is explicitly
+        enabled; seed admission capacity remains unlimited in either mode.
 
         ``None`` must never be compared to an integer directly; callers should
         use ``_below_minimum_peer_target`` / ``_minimum_peer_target_met``.
@@ -2268,20 +2306,490 @@ class P2PNetwork:
         except (TypeError, ValueError, OverflowError):
             return 3
 
-    def _below_minimum_peer_target(self, peer_count: int) -> bool:
-        """Whether peer discovery should continue for the current count.
+    def _desired_peer_target(self) -> Optional[int]:
+        """Return the active discovery goal without rewriting MIN/MAX config.
 
-        For an unbounded seed this deliberately remains true for every finite
-        peer count; retry cadence, peer deduplication, failure cooldowns and
-        bounded candidate batches keep discovery from becoming a tight loop.
+        Ordinary nodes in adaptive-topology mode use a soft degree target (3 by
+        default); MIN_PEERS remains numerically unchanged as the legacy/fallback
+        setting. MAX_PEERS remains the hard admission cap. Dedicated seed nodes
+        retain their existing unbounded discovery role.
         """
-        target = self.minimum_peer_target()
+        topology_enabled = bool(getattr(Config, "TOPOLOGY_POLICY_ENABLED", True))
+        seed_pruning = bool(getattr(Config, "TOPOLOGY_SEED_PRUNING_ENABLED", False))
+        # Preserve a dedicated seed's existing unbounded behavior unless the
+        # operator explicitly opts it into topology pruning after testing.
+        if self._is_seed_node_mode() and not (topology_enabled and seed_pruning):
+            return self.minimum_peer_target()
+        if topology_enabled:
+            try:
+                target = max(2, int(getattr(Config, "TOPOLOGY_TARGET_PEERS", 3)))
+                if self._is_seed_node_mode():
+                    return target
+                cap = max(1, int(getattr(Config, "MAX_PEERS", 30)))
+                return min(target, cap)
+            except (TypeError, ValueError, OverflowError):
+                return 3
+        return self.minimum_peer_target()
+
+    def _below_minimum_peer_target(self, peer_count: int) -> bool:
+        """Whether discovery should continue toward the active policy's target."""
+        target = self._desired_peer_target()
         return target is None or int(peer_count) < target
 
     def _minimum_peer_target_met(self, peer_count: int) -> bool:
-        """Return whether a finite target has been met (never true for seed)."""
-        target = self.minimum_peer_target()
+        """Return whether the active finite discovery target has been met."""
+        target = self._desired_peer_target()
         return target is not None and int(peer_count) >= target
+
+    def _ensure_topology_state(self):
+        """Lazily initialize topology fields for lightweight test/harness objects."""
+        if getattr(self, "_topology_lock", None) is None:
+            self._topology_lock = threading.RLock()
+        if not isinstance(getattr(self, "_topology_reports", None), dict):
+            self._topology_reports = {}
+        if not hasattr(self, "_topology_seq"):
+            self._topology_seq = 0
+        if not hasattr(self, "_topology_rr_cursor"):
+            self._topology_rr_cursor = 0
+        if not hasattr(self, "_topology_last_rebalance_at"):
+            self._topology_last_rebalance_at = 0.0
+        if not isinstance(getattr(self, "_topology_pending_prunes", None), dict):
+            self._topology_pending_prunes = {}
+        return self._topology_lock
+
+    def _local_topology_report(self) -> dict:
+        """Create a signed report of our current direct-neighbor set."""
+        self._ensure_topology_state()
+        with self._lock:
+            neighbors_all = sorted({str(pid) for pid, peer in self.peers.items()
+                                    if pid and pid != self.node_id
+                                    and getattr(peer, "connected", False)})
+        try:
+            cap = self._peer_capacity_limit()
+            neighbor_limit = max(1, min(500, int(cap if cap is not None else 500)))
+        except Exception:
+            neighbor_limit = 30
+        neighbors = neighbors_all[:neighbor_limit]
+        now_wall = int(time.time())
+        with self._topology_lock:
+            self._topology_seq += 1
+            seq = self._topology_seq
+            previous = self._topology_reports.get(self.node_id, {})
+            if previous.get("neighbors") == neighbors and previous.get("degree") == len(neighbors_all):
+                stable_since = float(previous.get("_observed_stable_since", time.monotonic()))
+            else:
+                stable_since = time.monotonic()
+        report = {
+            "version": 1,
+            "node_id": str(self.node_id),
+            "pub_hex": str(getattr(self.wallet, "pub_hex", "") or ""),
+            "neighbors": neighbors,
+            "degree": len(neighbors_all),
+            "complete": len(neighbors) == len(neighbors_all),
+            "seed": bool(self._is_seed_node_mode()),
+            "issued_at": now_wall,
+            "seq": seq,
+        }
+        report["sig"] = sig_to_hex(ecdsa_sign(
+            self.wallet.priv, hashlib.sha256(topology_signing_bytes(report)).digest()))
+        stored = dict(report)
+        stored["_observed_stable_since"] = stable_since
+        with self._topology_lock:
+            self._topology_reports[self.node_id] = stored
+        return report
+
+    def _remember_topology_report(self, report: Any) -> bool:
+        """Keep a fresh, identity-signed topology hint; reject stale replays."""
+        self._ensure_topology_state()
+        if not isinstance(report, dict):
+            return False
+        ttl = max(30, int(getattr(Config, "TOPOLOGY_REPORT_TTL_SECONDS", 180)))
+        node_id = str(report.get("node_id", ""))
+        # PEX repeatedly retransmits identical reports. Skip ECDSA verification
+        # only for an exact signed-field + signature match already verified here.
+        signed_fields = ("version", "node_id", "pub_hex", "neighbors", "degree",
+                         "complete", "issued_at", "seq", "sig")
+        with self._topology_lock:
+            previous_cached = self._topology_reports.get(node_id)
+            exact_cached = bool(previous_cached) and all(
+                previous_cached.get(key) == report.get(key) for key in signed_fields)
+        try:
+            issued_at = float(report.get("issued_at", 0) or 0)
+            exact_cached = (exact_cached and issued_at <= time.time() + 30
+                            and time.time() - issued_at <= ttl)
+        except (TypeError, ValueError, OverflowError):
+            exact_cached = False
+        if not exact_cached and not verify_topology_report(
+                report, ttl_seconds=ttl, max_neighbors=500):
+            return False
+        now_mono = time.monotonic()
+        incoming = dict(report)
+        with self._topology_lock:
+            previous = self._topology_reports.get(node_id)
+            if previous:
+                if (str(previous.get("sig", "")) == str(incoming.get("sig", ""))
+                        and previous.get("neighbors") == incoming.get("neighbors")
+                        and previous.get("issued_at") == incoming.get("issued_at")):
+                    return True
+                try:
+                    old_order = (int(previous.get("issued_at", 0)), int(previous.get("seq", 0)))
+                    new_order = (int(incoming.get("issued_at", 0)), int(incoming.get("seq", 0)))
+                    if new_order <= old_order:
+                        return False
+                except (TypeError, ValueError, OverflowError):
+                    return False
+                if previous.get("neighbors") == incoming.get("neighbors") and previous.get("degree") == incoming.get("degree"):
+                    incoming["_observed_stable_since"] = float(
+                        previous.get("_observed_stable_since", now_mono))
+                else:
+                    incoming["_observed_stable_since"] = now_mono
+            else:
+                incoming["_observed_stable_since"] = now_mono
+            self._topology_reports[node_id] = incoming
+            maximum = max(100, int(getattr(self, "_TOPOLOGY_REPORTS_MAX", 5000)))
+            if len(self._topology_reports) > maximum:
+                ttl_cutoff = time.time() - ttl
+                stale = sorted((nid, rec) for nid, rec in self._topology_reports.items()
+                               if float(rec.get("issued_at", 0) or 0) < ttl_cutoff
+                               and nid != self.node_id)
+                for old_id, _ in stale[:max(0, len(self._topology_reports) - maximum)]:
+                    self._topology_reports.pop(old_id, None)
+        return True
+
+    def _topology_report_page(self, cursor: int = 0, limit: int = 128) -> tuple:
+        """Return a bounded, stable-ID page of signed adjacency reports."""
+        self._ensure_topology_state()
+        self._local_topology_report()
+        try:
+            cursor = max(0, int(cursor))
+        except (TypeError, ValueError, OverflowError):
+            cursor = 0
+        try:
+            limit = max(1, min(int(limit), self._TOPOLOGY_PAGE_SIZE))
+        except (TypeError, ValueError, OverflowError):
+            limit = self._TOPOLOGY_PAGE_SIZE
+        ttl = max(30, int(getattr(Config, "TOPOLOGY_REPORT_TTL_SECONDS", 180)))
+        cutoff = time.time() - ttl
+        with self._topology_lock:
+            for node_id, report in list(self._topology_reports.items()):
+                if node_id != self.node_id and float(report.get("issued_at", 0) or 0) < cutoff:
+                    self._topology_reports.pop(node_id, None)
+            rows = [dict(report) for _nid, report in sorted(self._topology_reports.items())]
+        # Never expose local bookkeeping fields on the wire.
+        wire_rows = []
+        for row in rows:
+            row.pop("_observed_stable_since", None)
+            wire_rows.append(row)
+        page = wire_rows[cursor:cursor + limit]
+        next_cursor = cursor + len(page) if cursor + len(page) < len(wire_rows) else None
+        return page, len(wire_rows), next_cursor
+
+    def _topology_prune_preconditions_detail(self, peer_id: str, target: int,
+                                            expected_view_hash: str = ""):
+        """Return ``(preconditions, reason)`` for a proposed direct edge.
+
+        The reason string is diagnostic only; all rejection paths remain
+        fail-closed. ``edge_not_redundant`` is distinct from stale/incomplete
+        topology so logs show whether the graph or a per-session gate blocks it.
+        """
+        self._ensure_topology_state()
+        peer_id = str(peer_id or "")
+        if not peer_id or peer_id == self.node_id:
+            return None, "invalid_peer"
+        self._local_topology_report()
+        with self._topology_lock:
+            reports = {nid: dict(rec) for nid, rec in self._topology_reports.items()}
+        ttl = max(30, int(getattr(Config, "TOPOLOGY_REPORT_TTL_SECONDS", 180)))
+        view, view_reason = topology_component_view_diagnostic(
+            reports, local_node_id=self.node_id, ttl_seconds=ttl)
+        if view is None:
+            return None, f"topology_view_{view_reason}"
+        fresh_reports, adjacency, component = view
+        edges = list_redundant_edges(
+            reports, local_node_id=self.node_id, ttl_seconds=ttl,
+            target_degree=int(target))
+        expected_edge = tuple(sorted((str(self.node_id), peer_id)))
+        if expected_edge not in edges:
+            return None, "edge_not_redundant_or_not_over_target"
+        view_hash = topology_component_digest(
+            reports, local_node_id=self.node_id, ttl_seconds=ttl)
+        if not view_hash:
+            return None, "topology_digest_unavailable"
+        if expected_view_hash and view_hash != expected_view_hash:
+            return None, "topology_view_changed"
+        with self._lock:
+            active = {str(pid): p for pid, p in self.peers.items()
+                      if pid and getattr(p, "connected", False)}
+        peer = active.get(peer_id)
+        if peer is None:
+            return None, "edge_peer_not_connected_locally"
+        if len(active) <= int(target):
+            return None, "local_peer_count_at_or_below_target"
+        report_a, report_b = reports.get(expected_edge[0], {}), reports.get(expected_edge[1], {})
+        # Pruning decisions use reciprocal, mutually reported adjacency only.
+        # Raw reported degree may count asymmetric edges deliberately quarantined
+        # by topology_component_view_diagnostic().
+        degree_a = len(adjacency.get(expected_edge[0], set()) & component)
+        degree_b = len(adjacency.get(expected_edge[1], set()) & component)
+        if degree_a <= int(target) or degree_b <= int(target):
+            return None, f"endpoint_degree_not_over_target:{degree_a}/{degree_b}"
+        safe_min = max(2, int(getattr(Config, "TOPOLOGY_MIN_SAFE_PEERS", 2)))
+        if degree_a - 1 < safe_min or degree_b - 1 < safe_min:
+            return None, f"endpoint_below_safety_floor:{degree_a}/{degree_b}"
+        stable_secs = max(30, int(getattr(Config, "TOPOLOGY_STABLE_SECONDS", 120)))
+        now_mono = time.monotonic()
+        connection_since = float(getattr(peer, "_topology_connected_since", now_mono))
+        if now_mono - connection_since < stable_secs:
+            return None, "connection_not_stable"
+        for endpoint_id, report in ((expected_edge[0], report_a), (expected_edge[1], report_b)):
+            observed_since = float(report.get("_observed_stable_since", now_mono))
+            if now_mono - observed_since < stable_secs:
+                return None, f"report_not_stable:{endpoint_id[:12]}"
+        return {"edge": expected_edge, "view_hash": view_hash, "peer": peer,
+                "reports": reports, "degree_a": degree_a, "degree_b": degree_b}, "ok"
+
+    def _topology_prune_preconditions(self, peer_id: str, target: int,
+                                      expected_view_hash: str = "") -> Optional[dict]:
+        """Compatibility wrapper: validate a topology edge fail-closed."""
+        result, _reason = self._topology_prune_preconditions_detail(
+            peer_id, target, expected_view_hash=expected_view_hash)
+        return result
+
+    def _handle_topology_prune_proposal(self, peer, msg: dict) -> None:
+        """Acknowledge only if both endpoints independently see the same safe edge."""
+        nonce = str(msg.get("nonce", "") or "")
+        edge = msg.get("edge", [])
+        view_hash = str(msg.get("view_hash", "") or "")
+        allow = False
+        try:
+            target = self._desired_peer_target()
+            # A dedicated seed remains exempt from initiating prunes by default,
+            # but it can ACK a safe client-initiated removal of the seed edge.
+            # The seed's inbound admission capacity remains unlimited.
+            if target is None and self._is_seed_node_mode():
+                target = max(2, int(getattr(Config, "TOPOLOGY_TARGET_PEERS", 3)))
+            issued_at = int(msg.get("issued_at", 0))
+            requested_target = int(msg.get("target_degree", -1))
+            valid_nonce = (len(nonce) == 32
+                           and all(ch in "0123456789abcdef" for ch in nonce.lower()))
+            expected_edge = sorted((str(peer.peer_id), str(self.node_id)))
+            valid_edge = (isinstance(edge, list) and len(edge) == 2
+                          and edge == expected_edge
+                          and str(peer.peer_id) != str(self.node_id))
+            fresh = abs(time.time() - issued_at) <= 15
+            if (valid_nonce and valid_edge and len(view_hash) == 64
+                    and fresh and target is not None
+                    and requested_target == int(target)
+                    and getattr(peer, "connected", False)):
+                preconditions, reason = self._topology_prune_preconditions_detail(
+                    str(peer.peer_id), int(target), expected_view_hash=view_hash)
+                allow = preconditions is not None
+                if not allow:
+                    log.info("[TopologyPolicy] prune proposal denied: edge=%s<->%s reason=%s",
+                             min(str(peer.peer_id), str(self.node_id))[:12],
+                             max(str(peer.peer_id), str(self.node_id))[:12], reason)
+            else:
+                log.info("[TopologyPolicy] prune proposal denied: peer=%s reason=invalid_or_stale_proposal",
+                         str(getattr(peer, "peer_id", "") or "")[:12])
+        except (TypeError, ValueError, OverflowError) as exc:
+            allow = False
+            log.info("[TopologyPolicy] prune proposal denied: peer=%s reason=invalid_fields error=%s",
+                     str(getattr(peer, "peer_id", "") or "")[:12], type(exc).__name__)
+        try:
+            peer.send({"type": MSG_TOPOLOGY_PRUNE_ACK, "nonce": nonce,
+                       "view_hash": view_hash, "allow": bool(allow)})
+        except Exception:
+            pass
+
+    def _handle_topology_prune_ack(self, peer, msg: dict) -> None:
+        """Wake only the matching proposal waiter from the authenticated peer."""
+        self._ensure_topology_state()
+        nonce = str(msg.get("nonce", "") or "")
+        with self._topology_lock:
+            pending = self._topology_pending_prunes.get(nonce)
+            if (not pending
+                    or str(pending.get("peer_id", "")) != str(getattr(peer, "peer_id", ""))
+                    or str(pending.get("view_hash", "")) != str(msg.get("view_hash", ""))):
+                return
+            pending["allow"] = (msg.get("allow") is True)
+            pending["event"].set()
+
+    def _maybe_prune_topology_edge(self) -> bool:
+        """Prune one safe edge; the preferred edge may fall back safely.
+
+        Only the designated initiator of the globally preferred edge may drive
+        fallback for this rebalance pass. This keeps every node from launching
+        independent competing prune proposals. Fallback candidates must also be
+        incident to that initiator and deterministic in the shared graph order.
+        """
+        self._ensure_topology_state()
+        seed_pruning = bool(getattr(Config, "TOPOLOGY_SEED_PRUNING_ENABLED", False))
+        if not bool(getattr(Config, "TOPOLOGY_POLICY_ENABLED", True)):
+            log.debug("[TopologyPolicy] prune skipped: policy_disabled")
+            return False
+        if self._is_seed_node_mode() and not seed_pruning:
+            log.debug("[TopologyPolicy] prune skipped: seed_pruning_disabled")
+            return False
+        interval = max(30, int(getattr(Config, "TOPOLOGY_REBALANCE_INTERVAL", 60)))
+        now_mono = time.monotonic()
+        with self._topology_lock:
+            if now_mono - self._topology_last_rebalance_at < interval:
+                return False
+            self._topology_last_rebalance_at = now_mono
+        target = self._desired_peer_target()
+        if target is None:
+            log.debug("[TopologyPolicy] prune skipped: no_finite_target")
+            return False
+        with self._lock:
+            active = {str(pid): peer for pid, peer in self.peers.items()
+                      if pid and getattr(peer, "connected", False)}
+        if len(active) <= target:
+            log.debug("[TopologyPolicy] prune skipped: active=%s target=%s reason=at_or_below_target",
+                      len(active), target)
+            return False
+        self._local_topology_report()
+        with self._topology_lock:
+            reports = {nid: dict(rec) for nid, rec in self._topology_reports.items()}
+        ttl = max(30, int(getattr(Config, "TOPOLOGY_REPORT_TTL_SECONDS", 180)))
+        view, view_reason = topology_component_view_diagnostic(
+            reports, local_node_id=self.node_id, ttl_seconds=ttl)
+        if view is None:
+            log.info("[TopologyPolicy] prune deferred: reason=topology_view_%s active=%s target=%s reports=%s",
+                     view_reason, len(active), target, len(reports))
+            return False
+        fresh_reports, adjacency, component = view
+        if view_reason != "ok":
+            log.info("[TopologyPolicy] using reciprocal topology edges only: %s", view_reason)
+        edges = list_redundant_edges(
+            reports, local_node_id=self.node_id, ttl_seconds=ttl,
+            target_degree=int(target))
+        if not edges:
+            degree_eligible_edges = 0
+            safe_min = max(2, int(getattr(Config, "TOPOLOGY_MIN_SAFE_PEERS", 2)))
+            for node_a in component:
+                degree_a = len(adjacency.get(node_a, set()) & component)
+                for node_b in adjacency.get(node_a, set()) & component:
+                    if node_a >= node_b:
+                        continue
+                    degree_b = len(adjacency.get(node_b, set()) & component)
+                    if (degree_a > int(target) and degree_b > int(target)
+                            and degree_a - 1 >= safe_min and degree_b - 1 >= safe_min):
+                        degree_eligible_edges += 1
+            reason = ("all_degree_eligible_edges_are_bridges"
+                      if degree_eligible_edges else "no_edge_has_both_endpoints_over_target")
+            local_reported_degree = int(fresh_reports.get(self.node_id, {}).get("degree", -1))
+            local_reciprocal_degree = len(adjacency.get(self.node_id, set()) & component)
+            degree_summary = ",".join(
+                f"{node_id[:8]}:{len(adjacency.get(node_id, set()) & component)}"
+                for node_id in sorted(component)
+            )
+            log.info("[TopologyPolicy] prune deferred: reason=%s active=%s target=%s "
+                     "component=%s degree_eligible_edges=%s local_reported_degree=%s "
+                     "local_reciprocal_degree=%s reciprocal_degrees={%s}",
+                     reason, len(active), target, len(component), degree_eligible_edges,
+                     local_reported_degree, local_reciprocal_degree, degree_summary)
+            return False
+        preferred = edges[0]
+        preferred_initiator = topology_prune_initiator(preferred, reports)
+        if preferred_initiator != self.node_id:
+            log.debug("[TopologyPolicy] prune deferred: reason=not_designated_initiator preferred=%s<->%s initiator=%s",
+                      preferred[0][:12], preferred[1][:12],
+                      (preferred_initiator or "none")[:12])
+            return False
+
+        max_candidates = max(1, int(getattr(Config, "TOPOLOGY_PRUNE_CANDIDATES_PER_PASS", 3)))
+        candidates = [edge for edge in edges
+                      if self.node_id in edge
+                      and topology_prune_initiator(edge, reports) == self.node_id][:max_candidates]
+        if not candidates:
+            log.info("[TopologyPolicy] prune deferred: reason=no_fallback_edge_for_initiator preferred=%s<->%s",
+                     preferred[0][:12], preferred[1][:12])
+            return False
+
+        for edge in candidates:
+            peer_id = edge[1] if edge[0] == self.node_id else edge[0]
+            preconditions, reason = self._topology_prune_preconditions_detail(
+                peer_id, int(target))
+            if not preconditions:
+                log.info("[TopologyPolicy] candidate skipped: edge=%s<->%s reason=%s",
+                         edge[0][:12], edge[1][:12], reason)
+                # A changed/missing graph means later candidates are not based on
+                # the same shared view. Retry on the next rebalance cycle instead.
+                if reason.startswith("topology_view_") or reason in {
+                        "topology_digest_unavailable", "topology_view_changed",
+                        "edge_peer_not_connected_locally", "local_peer_count_at_or_below_target"}:
+                    return False
+                continue
+            peer = preconditions["peer"]
+            view_hash = preconditions["view_hash"]
+            nonce = secrets.token_hex(16)
+            waiter = threading.Event()
+            with self._topology_lock:
+                # Never permit overlapping proposals from this node.
+                if any(not isinstance(item, dict) or not item.get("done", False)
+                       for item in self._topology_pending_prunes.values()):
+                    log.info("[TopologyPolicy] candidate skipped: edge=%s<->%s reason=proposal_already_pending",
+                             edge[0][:12], edge[1][:12])
+                    return False
+                self._topology_pending_prunes[nonce] = {
+                    "peer_id": peer_id, "view_hash": view_hash,
+                    "event": waiter, "allow": False, "done": False,
+                }
+            try:
+                try:
+                    sent = bool(peer.send({
+                        "type": MSG_TOPOLOGY_PRUNE_PROPOSE,
+                        "nonce": nonce,
+                        "edge": [edge[0], edge[1]],
+                        "view_hash": view_hash,
+                        "target_degree": int(target),
+                        "issued_at": int(time.time()),
+                    }))
+                except Exception as exc:
+                    log.info("[TopologyPolicy] candidate skipped: edge=%s<->%s reason=proposal_send_error error=%s",
+                             edge[0][:12], edge[1][:12], type(exc).__name__)
+                    continue
+                if not sent:
+                    log.info("[TopologyPolicy] candidate skipped: edge=%s<->%s reason=proposal_send_failed",
+                             edge[0][:12], edge[1][:12])
+                    continue
+                if not waiter.wait(timeout=3.0):
+                    log.info("[TopologyPolicy] candidate skipped: edge=%s<->%s reason=ack_timeout",
+                             edge[0][:12], edge[1][:12])
+                    continue
+                with self._topology_lock:
+                    proposal = self._topology_pending_prunes.get(nonce, {})
+                    allowed = proposal.get("allow") is True
+                if not allowed:
+                    log.info("[TopologyPolicy] candidate skipped: edge=%s<->%s reason=peer_rejected_or_view_changed",
+                             edge[0][:12], edge[1][:12])
+                    continue
+            finally:
+                with self._topology_lock:
+                    self._topology_pending_prunes.pop(nonce, None)
+
+            final_check, final_reason = self._topology_prune_preconditions_detail(
+                peer_id, int(target), expected_view_hash=view_hash)
+            if not final_check or not getattr(peer, "connected", False):
+                log.info("[TopologyPolicy] candidate skipped: edge=%s<->%s reason=final_recheck_%s",
+                         edge[0][:12], edge[1][:12], final_reason)
+                return False
+            log.info("[TopologyPolicy] pruning redundant stable edge %s <-> %s "
+                     "(degree %s/%s, target %s; both endpoints agreed on graph view)",
+                     edge[0][:12], edge[1][:12],
+                     final_check.get("degree_a"), final_check.get("degree_b"), target)
+            try:
+                peer.close()
+            except Exception as exc:
+                log.warning("[TopologyPolicy] close failed for %s: %s", peer_id[:12], exc)
+                return False
+            with self._lock:
+                self.peers.pop(peer_id, None)
+                self._eager_peers.discard(peer_id)
+            return True
+        log.info("[TopologyPolicy] prune deferred: reason=all_candidates_failed attempted=%s",
+                 len(candidates))
+        return False
 
     def _peer_capacity_limit(self) -> Optional[int]:
         """Return the effective active-peer cap; None means seed-only unlimited.
@@ -2953,11 +3461,120 @@ class P2PNetwork:
         not consume either the per-message dial budget or a seed's per-minute
         dial slot, otherwise stable candidate ordering starves later peers.
         """
-        active_count = len(self.active_peer_count())
+        active_peers = self.active_peer_count()
+        active_count = len(active_peers)
         with self._pending_lock:
             pending_count = len(self._pending_connections)
-        target = self.minimum_peer_target()
-        if target is None:
+        target = self._desired_peer_target()
+        ranked_candidates = list(candidates or [])
+        replacement_probe = False
+        replacement_peer_ids = set()
+        if bool(getattr(Config, "TOPOLOGY_POLICY_ENABLED", True)) and target is not None:
+            self._ensure_topology_state()
+            ttl = max(30, int(getattr(Config, "TOPOLOGY_REPORT_TTL_SECONDS", 180)))
+            with self._topology_lock:
+                report_snapshot = {nid: dict(rec) for nid, rec in self._topology_reports.items()}
+                self._topology_rr_cursor += 1
+                rr_cursor = self._topology_rr_cursor
+            ranked_candidates = rank_topology_candidates(
+                ranked_candidates, report_snapshot, cursor=rr_cursor, ttl_seconds=ttl)
+            # Make-before-break is allowed only when this node can actually act
+            # on the globally preferred safe prune edge. Previously a low-degree
+            # candidate could trigger an extra dial even when the reciprocal graph
+            # had no edge eligible for pruning, causing peer counts to grow while
+            # the prune path correctly reported no_edge_has_both_endpoints_over_target.
+            active_ids = {str(getattr(peer, "peer_id", "") or "") for peer in active_peers}
+            source_id = str(getattr(source_peer, "peer_id", "") or "")
+            now_wall = time.time()
+            safe_edges = list_redundant_edges(
+                report_snapshot, local_node_id=str(self.node_id), now=now_wall,
+                ttl_seconds=ttl, target_degree=int(target))
+            preferred_edge = safe_edges[0] if safe_edges else None
+            owns_preferred_edge = bool(
+                preferred_edge is not None
+                and str(self.node_id) in preferred_edge
+                and topology_prune_initiator(preferred_edge, report_snapshot) == str(self.node_id)
+            )
+            if active_count >= int(target) and not owns_preferred_edge:
+                log.debug(
+                    "[TopologyPolicy] replacement probe suppressed: "
+                    "reason=no_local_pruneable_preferred_edge active=%s target=%s reports=%s",
+                    active_count, target, len(report_snapshot))
+            incumbent_degrees = []
+            if owns_preferred_edge:
+                for pid in active_ids:
+                    rec = report_snapshot.get(pid, {})
+                    try:
+                        issued_at = float(rec.get("issued_at", 0) or 0)
+                        is_fresh = (issued_at <= now_wall + 30
+                                    and now_wall - issued_at <= ttl)
+                        degree = int(rec.get("degree", -1))
+                        if is_fresh and degree > int(target):
+                            incumbent_degrees.append(degree)
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+            if owns_preferred_edge and incumbent_degrees and active_count >= int(target):
+                highest = max(incumbent_degrees)
+                for item in ranked_candidates:
+                    if not isinstance(item, dict):
+                        continue
+                    pid = str(item.get("peer_id", "") or "")
+                    if not pid or pid in active_ids or pid == source_id:
+                        continue
+                    rec = report_snapshot.get(pid, {})
+                    try:
+                        issued_at = float(rec.get("issued_at", 0) or 0)
+                        is_fresh = (issued_at <= now_wall + 30
+                                    and now_wall - issued_at <= ttl)
+                        candidate_degree = int(rec.get("degree", -1)) if is_fresh else -1
+                    except (TypeError, ValueError, OverflowError):
+                        candidate_degree = -1
+                    # Unknown/stale degree is eligible as a single topology probe:
+                    # connecting is required to obtain a fresh signed report.
+                    if candidate_degree < 0 or candidate_degree < highest:
+                        replacement_peer_ids.add(pid)
+                if replacement_peer_ids and pending_count == 0:
+                    stable_secs = max(30, int(getattr(Config, "TOPOLOGY_STABLE_SECONDS", 120)))
+                    now_mono = time.monotonic()
+                    all_links_stable = all(
+                        now_mono - float(getattr(peer, "_topology_connected_since", now_mono))
+                        >= stable_secs
+                        for peer in active_peers
+                    )
+                    capacity = self._peer_capacity_limit()
+                    capacity_available = (capacity is None or
+                                          active_count + pending_count < int(capacity))
+                    replacement_probe = all_links_stable and capacity_available
+            # Under target, use the normal target budget. At/over target, a
+            # replacement probe gets one slot, never an unbounded extra-peer ramp.
+            now_mono = time.monotonic()
+            if active_count + pending_count < int(target):
+                dial_budget = min(
+                    self._PEX_DIAL_BATCH,
+                    max(0, int(target) - active_count - pending_count),
+                )
+            elif replacement_probe:
+                dial_budget = 1
+                ranked_candidates = [
+                    item for item in ranked_candidates
+                    if isinstance(item, dict)
+                    and str(item.get("peer_id", "") or "") in replacement_peer_ids
+                ]
+                log.info(
+                    "[TopologyPolicy] replacement probe available: active=%s target=%s candidates=%s",
+                    active_count, target, len(ranked_candidates))
+            else:
+                dial_budget = 0
+                if active_count >= int(target) and pending_count == 0:
+                    log.debug(
+                        "[TopologyPolicy] replacement probe skipped: active=%s target=%s "
+                        "over_target_incumbents=%s candidate_ids=%s stable=%s",
+                        active_count, target, len(incumbent_degrees),
+                        len(replacement_peer_ids),
+                        all(now_mono - float(getattr(peer, "_topology_connected_since", now_mono))
+                            >= max(30, int(getattr(Config, "TOPOLOGY_STABLE_SECONDS", 120)))
+                            for peer in active_peers))
+        elif target is None:
             dial_budget = self._PEX_DIAL_BATCH
         else:
             dial_budget = min(
@@ -2968,7 +3585,7 @@ class P2PNetwork:
             return 0
 
         dialed = 0
-        for pinfo in candidates:
+        for pinfo in ranked_candidates:
             if dialed >= dial_budget:
                 break
             if not isinstance(pinfo, dict):
@@ -2988,7 +3605,9 @@ class P2PNetwork:
             if rate_token is None:
                 break
             try:
-                started = bool(self._try_add_peer(ip, port, pid))
+                started = bool(self._try_add_peer(
+                    ip, port, pid, auto_discovery=True,
+                    topology_probe=bool(replacement_probe), dial_source="pex"))
             except Exception as exc:
                 log.debug("PEX dial scheduling failed for %s:%s: %s", ip, port, exc)
                 started = False
@@ -3055,6 +3674,11 @@ class P2PNetwork:
         # Every transport must carry a reservation acquired before ACCEPT. The
         # fallback keeps internal callers safe, while TCP/UDP pass the preflight
         # token so capacity and subnet checks cannot race with ACCEPT.
+        try:
+            peer._topology_connected_since = time.monotonic()
+        except Exception:
+            pass
+
         if peer_id == self.node_id:
             log.warning(
                 f"Refusing self-connection from "
@@ -3186,7 +3810,9 @@ class P2PNetwork:
         try:
             if peer.connected:
                 peer.send({"type": MSG_GET_PEERS, "cursor": 0,
-                           "limit": self._PEX_PAGE_SIZE})
+                           "limit": self._PEX_PAGE_SIZE,
+                           "topology_cursor": 0,
+                           "topology_limit": self._TOPOLOGY_PAGE_SIZE})
         except Exception as _pex_err:
             log.debug("Immediate peer exchange request failed: %s", _pex_err)
 
@@ -3724,7 +4350,9 @@ class P2PNetwork:
 
         while self._running and peer.connected:
             try:
-                peer.sock.settimeout(30)
+                if not isinstance(peer.sock, ssl.SSLSocket):
+                    # TLS sockets are driven non-blocking by tls_recv/tls_sendall.
+                    peer.sock.settimeout(30)
                 while True:
                     chunk = _recv_with_blockingio_retry(peer.sock, 65536, timeout=30.0)
                     if not chunk:
@@ -4768,6 +5396,8 @@ class P2PNetwork:
             MSG_CAPABILITY_RESPONSE,
             MSG_GET_CHAIN,
             MSG_GET_PEERS,
+            MSG_TOPOLOGY_PRUNE_PROPOSE,
+            MSG_TOPOLOGY_PRUNE_ACK,
             MSG_GET_BLOCK,
             MSG_RESOLVE,
             MSG_CAPABILITY_QUERY,
@@ -4789,9 +5419,8 @@ class P2PNetwork:
             MSG_BLOCK_MANIFEST,
             MSG_GET_BLOCK_CHUNK,
             MSG_BLOCK_CHUNK_DATA,
-            # ── v7.6.0 Hashrate optimization: point-to-point, never gossiped.
-            # Dedup is unnecessary because each peer's payload changes every
-            # HASHRATE_REPORT_INTERVAL, and stale reports are evicted by TTL.
+            # Hashrate reports use origin-signature + sequence dedup in their
+            # handler because the mutable hop TTL must not affect identity.
             MSG_HASHRATE_REPORT,
             # ── v7.7.0 Rate defection evidence — gossiped, but dedup is
             # done inside RateDefectionAuditor by content hash, not here.
@@ -5071,6 +5700,12 @@ class P2PNetwork:
         elif mtype == MSG_PONG:
             pass
 
+        elif mtype == MSG_TOPOLOGY_PRUNE_PROPOSE:
+            self._handle_topology_prune_proposal(peer, msg)
+
+        elif mtype == MSG_TOPOLOGY_PRUNE_ACK:
+            self._handle_topology_prune_ack(peer, msg)
+
         elif mtype == MSG_GET_PEERS:
             # PEX is a paginated gossip directory, not merely the current direct
             # neighbours. It provides eventual discovery; it is not a central
@@ -5086,9 +5721,24 @@ class P2PNetwork:
                 page_limit = self._PEX_PAGE_SIZE
             pex_page, pex_total, pex_next = self._network_directory_page(
                 page_cursor, page_limit, exclude_peer_id=peer.peer_id)
+            try:
+                topology_cursor = max(0, int(msg.get("topology_cursor", 0)))
+            except (TypeError, ValueError, OverflowError):
+                topology_cursor = 0
+            try:
+                topology_limit = max(1, min(int(msg.get("topology_limit", self._TOPOLOGY_PAGE_SIZE)),
+                                            self._TOPOLOGY_PAGE_SIZE))
+            except (TypeError, ValueError, OverflowError):
+                topology_limit = self._TOPOLOGY_PAGE_SIZE
+            topology_page, topology_total, topology_next = self._topology_report_page(
+                topology_cursor, topology_limit)
             peer.send({"type": MSG_PEERS, "peers": pex_page,
                        "cursor": page_cursor, "next_cursor": pex_next,
-                       "total": pex_total})
+                       "total": pex_total,
+                       "topology_reports": topology_page,
+                       "topology_cursor": topology_cursor,
+                       "topology_next_cursor": topology_next,
+                       "topology_total": topology_total})
 
         elif mtype == MSG_PEERS:
             # Save every discovered endpoint for the searchable local directory,
@@ -5100,11 +5750,20 @@ class P2PNetwork:
             for pinfo in pex_peers:
                 if isinstance(pinfo, dict):
                     self._remember_node_info(pinfo, verified=False, source="pex")
+            topology_reports = msg.get("topology_reports", [])
+            if isinstance(topology_reports, list):
+                for report in topology_reports[:self._TOPOLOGY_PAGE_SIZE]:
+                    self._remember_topology_report(report)
             try:
                 next_cursor = msg.get("next_cursor")
                 peer._pex_cursor = max(0, int(next_cursor)) if next_cursor is not None else 0
             except (TypeError, ValueError):
                 peer._pex_cursor = 0
+            try:
+                topology_next = msg.get("topology_next_cursor")
+                peer._topology_cursor = max(0, int(topology_next)) if topology_next is not None else 0
+            except (TypeError, ValueError, OverflowError):
+                peer._topology_cursor = 0
 
             pex_ipv6 = [p for p in pex_peers
                         if isinstance(p, dict) and _is_ipv6_address(str(p.get("ip", "")))]
@@ -5183,46 +5842,90 @@ class P2PNetwork:
                 log.debug(f"L2TX handler error: {e}")
 
         elif mtype == MSG_HASHRATE_REPORT:
-            # ── v7.6.0 HASHRATE OPTIMIZATION (peer-actual-rate gossip) ──────
-            # A peer reports its actual (unthrottled) hashrate.  We forward
-            # this to the local HashrateGovernor (if mining is active) so
-            # the per-miner cap can be recomputed against the latest network
-            # picture.  This is metadata only — it does NOT affect any
-            # consensus rule, block validation, or PoW path.
-            #
-            # Validation:
-            #   • node_id and hashrate must both be present and well-formed.
-            #   • hashrate is clamped via record_peer_hashrate (>= 0, <= 2^48).
-            #   • Stale reports are dropped automatically on read by the
-            #     governor's TTL eviction; no cleanup is needed here.
+            # Network-wide, identity-signed rate telemetry. The signature binds
+            # origin node ID, public key, rate, origin timestamp and sequence;
+            # the mutable hop TTL is intentionally outside the signature.
+            # This authenticates who made the claim, not whether the claimed
+            # hashrate is physically truthful. It remains advisory only.
             try:
-                reporter_id = msg.get("node_id", "")
-                hr_value    = msg.get("hashrate", -1.0)
-                if not isinstance(reporter_id, str) or not reporter_id:
+                reporter_id = str(msg.get("node_id", ""))
+                if not reporter_id or reporter_id == self.node_id:
                     return
-                # Use the peer's connection peer_id as the canonical key —
-                # not the node_id from the payload — to prevent a malicious
-                # peer from spoofing reports for OTHER peers.  The peer_id
-                # used here is the cryptographically-verified ID established
-                # during the HELLO handshake.
-                key = peer.peer_id
-                if key == self.node_id:
-                    return   # ignore reports about ourselves (shouldn't happen)
-                # Push into our local mining engine's governor.  When no
-                # mining engine is attached (e.g. an investor-only node) the
-                # report is silently ignored — that's the correct behavior.
+
+                signed_report = bool(msg.get("sig"))
+                if signed_report:
+                    report_max_age = min(
+                        int(Config.HASHRATE_PEER_TTL),
+                        int(Config.HASHRATE_FRESH_SECS + Config.HASHRATE_DECAY_SECS))
+                    if not verify_hashrate_report(
+                            msg, max_age_seconds=report_max_age,
+                            max_future_skew_seconds=30):
+                        log.debug("[HR-Report] rejected invalid signature/freshness")
+                        return
+                    try:
+                        report_seq = int(msg.get("seq"))
+                        report_ts = int(msg.get("ts"))
+                        report_hps = float(msg.get("hashrate"))
+                    except (TypeError, ValueError, OverflowError):
+                        return
+                    now = time.time()
+                    with self._hr_reports_lock:
+                        # Expire replay watermarks independently of the mining
+                        # engine. A relayed old report cannot become fresh again.
+                        expired = [nid for nid, (_seq, _ts, seen_at)
+                                   in self._hr_reports_seen.items()
+                                   if now - seen_at > max(60.0, float(Config.HASHRATE_PEER_TTL))]
+                        for nid in expired:
+                            self._hr_reports_seen.pop(nid, None)
+                        previous = self._hr_reports_seen.get(reporter_id)
+                        if previous is not None:
+                            old_seq, old_ts, _seen_at = previous
+                            if report_seq <= old_seq or report_ts <= old_ts:
+                                return
+                        # A normal source reports every 5 seconds. Reject rapid
+                        # same-origin timestamp churn even if sequence advances.
+                        # report_ts strictly increases above; this bounds simple
+                        # self-signed report floods to at most one per second.
+                        self._hr_reports_seen[reporter_id] = (report_seq, report_ts, now)
+                        if len(self._hr_reports_seen) > self._hr_reports_seen_max:
+                            oldest = sorted(self._hr_reports_seen.items(),
+                                            key=lambda item: item[1][2])
+                            for nid, _meta in oldest[:len(self._hr_reports_seen) - self._hr_reports_seen_max]:
+                                self._hr_reports_seen.pop(nid, None)
+                else:
+                    # Backward compatibility for old builds: unsigned reports
+                    # are accepted ONLY when directly received from the claimed
+                    # authenticated peer and are never relayed network-wide.
+                    if reporter_id != str(getattr(peer, "peer_id", "")):
+                        return
+                    report_hps = float(msg.get("hashrate", -1.0))
+                    report_ts = msg.get("ts")
+                    report_seq = msg.get("seq")
+
                 me_attr = getattr(self, "_mining_engine_ref", None)
                 if me_attr is not None:
+                    gov = me_attr.get_hashrate_governor()
+                    if gov is not None:
+                        accepted = gov.record_peer_hashrate(
+                            reporter_id, report_hps,
+                            reported_ts=report_ts, sequence=report_seq)
+                        if not accepted:
+                            if signed_report:
+                                with self._hr_reports_lock:
+                                    current = self._hr_reports_seen.get(reporter_id)
+                                    if current and current[0] == report_seq:
+                                        self._hr_reports_seen.pop(reporter_id, None)
+                            log.debug(f"[HR-Report] rejected invalid/stale/replayed report from {reporter_id[:12]}")
+                            return
+
+                if signed_report:
+                    # Relay only authenticated reports that are new to this
+                    # node. Generic message dedup skips this type because the
+                    # origin sequence (not wire TTL) is its stable identity.
                     try:
-                        gov = me_attr.get_hashrate_governor()
-                        if gov is not None:
-                            gov.record_peer_hashrate(key, float(hr_value))
-                    except Exception as _hge:
-                        log.debug(f"[HR-Report] governor update failed: {_hge}")
-                # Hashrate reports are point-to-point, NOT gossiped.  Each
-                # node's report reaches every peer it is directly connected
-                # to in O(degree) sends per HASHRATE_REPORT_INTERVAL, which
-                # is plenty for governance accuracy and avoids amplification.
+                        self._gossip(msg, exclude=peer.peer_id)
+                    except Exception as relay_exc:
+                        log.debug(f"[HR-Report] relay failed: {relay_exc}")
             except Exception as _hre:
                 log.debug(f"[HR-Report] handler error: {_hre}")
 
@@ -6395,7 +7098,8 @@ class P2PNetwork:
                             (discovered_peer_id,)).fetchone()
                         if row and row["ip"] and row["port"]:
                             self._try_add_peer(
-                                row["ip"], row["port"], discovered_peer_id)
+                                row["ip"], row["port"], discovered_peer_id,
+                                auto_discovery=True, dial_source="capability")
                         else:
                             log.debug(
                                 f"DiscV5: no stored address for peer "
@@ -6608,23 +7312,73 @@ class P2PNetwork:
             for _k in _dead_keys:
                 self._compact_stash.pop(_k, None)
                 log.debug(f"[CMPCT] Stash entry {_k[:16]} dropped on peer disconnect")
-        # ── v7.6.0: Drop the peer's last-known hashrate from the governor ────
-        # Stale hashrate reports from a now-disconnected peer would incorrectly
-        # inflate the governor's view of the network's actual-hashrate sum.
-        # Forget_peer is idempotent and safe to call when no entry exists.
-        try:
-            me_attr = getattr(self, "_mining_engine_ref", None)
-            if me_attr is not None:
-                gov = me_attr.get_hashrate_governor()
-                if gov is not None:
-                    gov.forget_peer(peer.peer_id)
-        except Exception:
-            pass
+        # Hasrate reports are keyed by authenticated origin and may have arrived
+        # through another relay. Do not erase global telemetry just because one
+        # transport path to that origin closed; it expires from its signed ts.
         log.info(f"Peer disconnected: {peer.ip}:{peer.port} ({peer.peer_id[:12]})")
         # ── LIVE-UI: push instant peer-disconnect notification ────────────────
         _push_peer_notif("disconnected", peer.ip, peer.port)
 
-    def _try_add_peer(self, ip: str, port: int, peer_id: str = "") -> bool:
+    def _try_add_peer(self, ip: str, port: int, peer_id: str = "", *,
+                      auto_discovery: bool = False, topology_probe: bool = False,
+                      dial_source: str = "manual") -> bool:
+        """Start an outbound connection with an optional soft-target guard.
+
+        User-requested/manual dials retain legacy behavior. Every automatic
+        discovery path opts in to the guard, which atomically reserves one
+        active-or-pending slot below the target. At/above target, only the PEX
+        topology policy may start one make-before-break probe; ordinary DNS, DHT,
+        bootstrap, reconnect, and PEX discovery dials are rejected.
+        """
+        if not auto_discovery:
+            return self._try_add_peer_impl(ip, port, peer_id)
+
+        guard = getattr(self, "_auto_dial_lock", None)
+        if guard is None:
+            guard = threading.RLock()
+            self._auto_dial_lock = guard
+        with guard:
+            try:
+                target = self._desired_peer_target()
+            except Exception:
+                target = None
+            count = self._discovery_peer_count()
+            with getattr(self, "_pending_lock", threading.Lock()):
+                pending_count = len(getattr(self, "_pending_connections", ()))
+
+            probe_at_target = target is not None and count >= int(target)
+            if probe_at_target:
+                # A topology probe is the sole allowed over-target automatic
+                # dial. It must be explicitly selected by _dial_pex_candidates,
+                # and there must not already be another pending connection.
+                if not topology_probe or pending_count > 0:
+                    log.debug(
+                        "[TopologyPolicy] auto dial suppressed: source=%s active_pending=%s "
+                        "target=%s topology_probe=%s pending=%s",
+                        dial_source, count, target, topology_probe, pending_count)
+                    return False
+                interval = max(30, int(getattr(
+                    Config, "TOPOLOGY_PROBE_INTERVAL_SECONDS", 60)))
+                last_probe = float(getattr(self, "_topology_probe_last_attempt_mono", 0.0) or 0.0)
+                now_mono = time.monotonic()
+                if now_mono - last_probe < interval:
+                    log.debug(
+                        "[TopologyPolicy] replacement probe suppressed by cooldown: "
+                        "source=%s retry_in=%.1fs interval=%ss",
+                        dial_source, interval - (now_mono - last_probe), interval)
+                    return False
+            elif topology_probe:
+                # Do not label an ordinary under-target dial as a replacement.
+                topology_probe = False
+
+            started = self._try_add_peer_impl(ip, port, peer_id)
+            if started and probe_at_target and topology_probe:
+                # Stamp under the global auto-dial lock so simultaneous PEX pages
+                # cannot schedule a burst after a fast failed connection.
+                self._topology_probe_last_attempt_mono = time.monotonic()
+            return started
+
+    def _try_add_peer_impl(self, ip: str, port: int, peer_id: str = "") -> bool:
         if not ip or not port:
             return False
         # Normalize first (strips IPv4-mapped prefix from IPv6 dual-stack addr)
@@ -7450,12 +8204,9 @@ class P2PNetwork:
         except queue.Empty:
             return None
 
-    def _bootstrap(self):
-        time.sleep(1)
-        known = self.storage.get_peers(limit=20)
-        for p in known:
-            if self._below_minimum_peer_target(self._discovery_peer_count()):
-                self._try_add_peer(p["ip"], p["port"], p["peer_id"])
+    def _try_seed_peers(self) -> int:
+        """Try configured seeds first so they can refresh mobile peer endpoints."""
+        started = 0
         for seed in Config.SEED_PEERS:
             if not self._below_minimum_peer_target(self._discovery_peer_count()):
                 break
@@ -7464,16 +8215,35 @@ class P2PNetwork:
             except ValueError:
                 log.debug(f"Bootstrap: invalid seed address '{seed}' — skipping")
                 continue
-            # Skip self-connections for both IPv4 and IPv6 loopbacks
-            # (do NOT include Config.BIND_ADDRESS "::" — it is a wildcard, not a peer addr)
-            _boot_loopback = {"127.0.0.1", "::1", "0.0.0.0"}  # nosec B104 – comparison set, never passed to bind()
+            # Avoid self-connections, but never treat the bind wildcard as a peer.
+            boot_loopback = {"127.0.0.1", "::1", "0.0.0.0"}  # nosec B104
             if Config.LOOPBACK_ADDRESS:
-                _boot_loopback.add(Config.LOOPBACK_ADDRESS)
-            if port == self.port and ip in _boot_loopback:
+                boot_loopback.add(Config.LOOPBACK_ADDRESS)
+            if port == self.port and ip in boot_loopback:
                 continue
-            self._try_add_peer(ip, port)
-        # DNS seeds are queried in the DNSSeeder background thread; no extra
-        # call needed here — DNSSeeder.start() fires an immediate query.
+            try:
+                if self._try_add_peer(
+                        ip, port, auto_discovery=True, dial_source="bootstrap-seed"):
+                    started += 1
+            except Exception as exc:
+                log.debug("Bootstrap: seed dial scheduling failed for %s:%s: %s",
+                          ip, port, exc)
+        return started
+
+    def _bootstrap(self):
+        time.sleep(1)
+        # A seed is the endpoint-refresh/discovery entry point on every fresh
+        # start. Only after asking seeds do we try the locally cached peers.
+        self._try_seed_peers()
+        known = self.storage.get_peers(limit=20)
+        random.shuffle(known)
+        for p in known:
+            if not self._below_minimum_peer_target(self._discovery_peer_count()):
+                break
+            self._try_add_peer(
+                p["ip"], p["port"], p["peer_id"],
+                auto_discovery=True, dial_source="bootstrap-cache")
+        # DNS seeds are queried by DNSSeeder's background thread.
 
     def active_peer_count(self):
         with self._lock:
@@ -7502,8 +8272,11 @@ class P2PNetwork:
             for peer in targets:
                 if peer.connected:
                     cursor = max(0, int(getattr(peer, "_pex_cursor", 0) or 0))
+                    topology_cursor = max(0, int(getattr(peer, "_topology_cursor", 0) or 0))
                     peer.send({"type": MSG_GET_PEERS,
-                               "cursor": cursor, "limit": self._PEX_PAGE_SIZE})
+                               "cursor": cursor, "limit": self._PEX_PAGE_SIZE,
+                               "topology_cursor": topology_cursor,
+                               "topology_limit": self._TOPOLOGY_PAGE_SIZE})
 
     def _reconnect_loop(self):
         while self._running:
@@ -7511,17 +8284,19 @@ class P2PNetwork:
             time.sleep(Config.RECONNECT_INTERVAL * _rnd.uniform(0.75, 1.25))
             count = self._discovery_peer_count()
             if self._below_minimum_peer_target(count):
-                target = self.minimum_peer_target()
+                target = self._desired_peer_target()
                 if target is None:
-                    log.debug(
-                        "Seed peer target is unbounded; exploring known peers...")
+                    log.debug("Seed peer target is unbounded; exploring known peers...")
                 else:
-                    log.debug(f"Only {count}/{target} peers, reconnecting...")
+                    log.debug("Only %s/%s peers, reconnecting toward topology target...",
+                              count, target)
+                # Seed first on each recovery pass: it can publish new endpoints
+                # for peers whose mobile IP has changed since our last session.
+                self._try_seed_peers()
                 known = self.storage.get_peers(limit=20)
                 random.shuffle(known)
                 for p in known:
-                    if not self._below_minimum_peer_target(
-                            self._discovery_peer_count()):
+                    if not self._below_minimum_peer_target(self._discovery_peer_count()):
                         break
                     with self._lock:
                         already = any(
@@ -7535,9 +8310,16 @@ class P2PNetwork:
                             for pid, peer in self.peers.items()
                         )
                     if not already:
-                        self._try_add_peer(p["ip"], p["port"], p["peer_id"])
-                if self._below_minimum_peer_target(self._discovery_peer_count()):
-                    self._bootstrap()
+                        self._try_add_peer(
+                            p["ip"], p["port"], p["peer_id"],
+                            auto_discovery=True, dial_source="reconnect-cache")
+
+            # Adaptive topology may drop one edge only after signed, fresh reports
+            # prove it is redundant and the peer session has remained stable.
+            try:
+                self._maybe_prune_topology_edge()
+            except Exception as _topology_err:
+                log.debug("[TopologyPolicy] rebalance skipped safely: %s", _topology_err)
 
             # Chain sync heartbeat — send to ONE selected peer, not every peer.
             # Pick the highest peer for missing blocks. Every tenth heartbeat

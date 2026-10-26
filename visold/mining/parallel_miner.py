@@ -79,6 +79,11 @@ class ParallelMiner:
         self._backend     = "cpu"
         self._initialized = False
         self._lock        = threading.Lock()
+        # Estimated unthrottled CPU hash throughput. Worker telemetry measures
+        # only active compute time and excludes intentional governor sleeps.
+        self._hashrate_lock = threading.Lock()
+        self._raw_hashrate_hps = 0.0
+        self._raw_hashrate_updated_at = 0.0
         # CUDA state
         self._cuda_ctx    = None
         self._cuda_mod    = None
@@ -198,7 +203,8 @@ class ParallelMiner:
 
     def mine(self, block: 'Block',
              stop_event: Optional[threading.Event] = None,
-             max_hps: float = 0.0) -> bool:
+             max_hps: float = 0.0,
+             max_hps_provider=None) -> bool:
         """
         Mine block in-place with the best available backend.
         Returns True  → block.nonce / block.block_hash / block.timestamp set.
@@ -215,15 +221,47 @@ class ParallelMiner:
         same valid block at exactly the same nonce as an unthrottled miner
         would, just later.
 
-        GPU backends currently ignore max_hps (the kernel batch size is the
-        natural pacing knob there); future work can plumb it through.
+        GPU backends currently ignore the cap provider and use their existing
+        batch pacing; those kernels remain disabled unless their known-answer
+        verification is explicitly enabled. The supported production path is CPU.
         """
         self.initialize()
         if self._backend == "cuda":
             return self._mine_cuda(block, stop_event, max_hps=max_hps)
         if self._backend == "opencl":
             return self._mine_opencl(block, stop_event, max_hps=max_hps)
-        return self._mine_cpu(block, stop_event, max_hps=max_hps)
+        return self._mine_cpu(block, stop_event, max_hps=max_hps,
+                              max_hps_provider=max_hps_provider)
+
+    def get_raw_hashrate(self) -> float:
+        """Return the latest estimate of unthrottled CPU hash throughput.
+
+        The estimate is based on hashes attempted / active compute seconds;
+        worker sleep time used by the governor is excluded. Zero means the
+        first usable sample has not yet been collected. GPU backends are not
+        currently verified and the node intentionally falls back to CPU.
+        """
+        with self._hashrate_lock:
+            return float(self._raw_hashrate_hps)
+
+    def reset_raw_hashrate(self) -> None:
+        """Discard telemetry from an older mining session before calibration."""
+        with self._hashrate_lock:
+            self._raw_hashrate_hps = 0.0
+            self._raw_hashrate_updated_at = 0.0
+
+    def _publish_raw_hashrate(self, hps: float) -> None:
+        try:
+            value = float(hps)
+        except (TypeError, ValueError):
+            return
+        if value <= 0.0 or value != value or value in (float("inf"), float("-inf")):
+            return
+        with self._hashrate_lock:
+            previous = self._raw_hashrate_hps
+            # Smooth small timer/scheduling noise without delaying startup.
+            self._raw_hashrate_hps = value if previous <= 0.0 else (0.35 * value + 0.65 * previous)
+            self._raw_hashrate_updated_at = time.monotonic()
 
     def backend_info(self) -> dict:
         """Return backend details for CLI / RPC status display."""
@@ -241,7 +279,8 @@ class ParallelMiner:
 
     def _mine_cpu(self, block: 'Block',
                   stop_event: Optional[threading.Event] = None,
-                  max_hps: float = 0.0) -> bool:
+                  max_hps: float = 0.0,
+                  max_hps_provider=None) -> bool:
         """
         Spawn N Cython-typed worker threads each covering a strided nonce range.
 
@@ -259,10 +298,10 @@ class ParallelMiner:
         Compiled speedup vs interpreted:  3–8× on the mining inner loop.
         Interpreted speedup vs old code:  1.5–2× (template + bytes cmp alone).
 
-        v7.6.0 — When max_hps > 0 the per-thread cap is max_hps / N and each
-        thread throttles itself with a small sleep every
-        Config.HASHRATE_THROTTLE_BATCH_SIZE nonces.  See _cy_mine_worker
-        for the throttle algorithm.
+        A dynamic cap provider can refresh the shared per-thread cap every
+        ~100 ms while a candidate is in flight. The worker applies updates at
+        batch boundaries, so startup calibration does not leave a difficult
+        block permanently unthrottled until it is solved.
         """
         target       = DifficultyEngine.difficulty_to_target(block.difficulty)
         target_bytes = target.to_bytes(32, 'big')   # pre-convert once for cmp
@@ -278,19 +317,54 @@ class ParallelMiner:
         result      = []
         result_lock = threading.Lock()
         thread_stop = threading.Event()
+        # Each worker owns one slot: cumulative hashes and active compute
+        # seconds (excluding throttle sleep). Tuple assignment is atomic under
+        # CPython's GIL and avoids readers seeing half-written counters.
+        work_metrics = [(0, 0.0) for _ in range(N)]
+        previous_metrics = [(0, 0.0) for _ in range(N)]
+        worker_rates = [0.0 for _ in range(N)]
+        last_sample = time.monotonic()
+        last_cap_refresh = last_sample
+
+        def _sample_work_metrics():
+            nonlocal previous_metrics, last_sample
+            current = [tuple(row) for row in work_metrics]
+            for idx, (count, active_secs) in enumerate(current):
+                old_count, old_active = previous_metrics[idx]
+                delta_count = count - old_count
+                delta_active = active_secs - old_active
+                if delta_count > 0 and delta_active > 1e-9:
+                    worker_rates[idx] = delta_count / delta_active
+            previous_metrics = current
+            last_sample = time.monotonic()
+            # Do not publish a partial sum while some workers have not yet
+            # produced their first sample; that would under-report startup H/s.
+            if worker_rates and all(rate > 0.0 for rate in worker_rates):
+                self._publish_raw_hashrate(sum(worker_rates))
 
         # ── v7.6.0 Per-thread throttle parameters ─────────────────────────
         # Distribute the aggregate cap evenly across the N workers.  When
         # max_hps == 0 (or HASHRATE_OPTIMIZATION_ENABLED is False) per_thread
         # is also 0, which makes _cy_mine_worker's throttle a no-op.
-        if max_hps and max_hps > 0.0 and N > 0:
+        dynamic_cap = max_hps_provider is not None and N > 0
+        if dynamic_cap:
+            per_thread = 0.0  # dynamic_cap_ref is authoritative in the worker
+            batch_sz = max(1, int(Config.HASHRATE_THROTTLE_BATCH_SIZE))
+            initial_per_thread_cap = (float(max_hps) / float(N)
+                                      if max_hps and max_hps > 0.0
+                                      and max_hps not in (float("inf"), float("-inf"))
+                                      else float("inf"))
+            dynamic_cap_ref = [initial_per_thread_cap]
+        elif max_hps and max_hps > 0.0:
             per_thread = float(max_hps) / float(N)
             batch_sz   = int(Config.HASHRATE_THROTTLE_BATCH_SIZE)
             if batch_sz < 1:
                 batch_sz = 1
+            dynamic_cap_ref = None
         else:
             per_thread = 0.0
             batch_sz   = 0
+            dynamic_cap_ref = None
 
         workers = [
             threading.Thread(
@@ -302,7 +376,8 @@ class ParallelMiner:
                           16,                # min_iters
                           result, result_lock, thread_stop,
                           per_thread,        # max_hps_per_thread (0 = unlimited)
-                          batch_sz),         # throttle_batch     (0 = no throttle)
+                          batch_sz,          # throttle_batch     (0 = no throttle)
+                          work_metrics, i, dynamic_cap_ref),  # telemetry + live cap
                 daemon = True,
                 name   = f"vsd-miner-{i}",
             )
@@ -317,9 +392,25 @@ class ParallelMiner:
                 thread_stop.set()
                 break
             thread_stop.wait(timeout=0.05)
+            now_mono = time.monotonic()
+            if now_mono - last_sample >= 0.10:
+                _sample_work_metrics()
+            if dynamic_cap and now_mono - last_cap_refresh >= 0.10:
+                try:
+                    live_cap = float(max_hps_provider())
+                except Exception as exc:
+                    log.debug(f"[HashrateGovernor] dynamic cap provider failed: {exc}")
+                    live_cap = float("inf")  # fail open: don't stall consensus mining
+                if (live_cap > 0.0 and live_cap == live_cap
+                        and live_cap not in (float("inf"), float("-inf"))):
+                    dynamic_cap_ref[0] = live_cap / float(N)
+                else:
+                    dynamic_cap_ref[0] = float("inf")
+                last_cap_refresh = now_mono
 
         for w in workers:
             w.join(timeout=2.0)
+        _sample_work_metrics()
 
         if result:
             nonce, hex_hash, ts = result[0]
@@ -395,7 +486,8 @@ class ParallelMiner:
             log.error("CUDA mining requires numpy (pip install numpy). "
                       "Falling back to CPU.")
             self._backend = "cpu"
-            return self._mine_cpu(block, stop_event, max_hps=max_hps)
+            return self._mine_cpu(block, stop_event, max_hps=max_hps,
+                              max_hps_provider=max_hps_provider)
         try:
             import numpy as np
             drv  = self._cuda_drv
@@ -441,7 +533,8 @@ class ParallelMiner:
         except Exception as exc:
             log.error(f"CUDA mining error ({exc}) — falling back to CPU.")
             self._backend = "cpu"
-            return self._mine_cpu(block, stop_event, max_hps=max_hps)
+            return self._mine_cpu(block, stop_event, max_hps=max_hps,
+                              max_hps_provider=max_hps_provider)
 
     # ── OpenCL mine ───────────────────────────────────────────────────────────
 
@@ -459,7 +552,8 @@ class ParallelMiner:
             log.error("OpenCL mining requires numpy (pip install numpy). "
                       "Falling back to CPU.")
             self._backend = "cpu"
-            return self._mine_cpu(block, stop_event, max_hps=max_hps)
+            return self._mine_cpu(block, stop_event, max_hps=max_hps,
+                              max_hps_provider=max_hps_provider)
         try:
             import numpy as np
             cl    = self._cl
@@ -518,4 +612,5 @@ class ParallelMiner:
         except Exception as exc:
             log.error(f"OpenCL mining error ({exc}) — falling back to CPU.")
             self._backend = "cpu"
-            return self._mine_cpu(block, stop_event, max_hps=max_hps)
+            return self._mine_cpu(block, stop_event, max_hps=max_hps,
+                              max_hps_provider=max_hps_provider)

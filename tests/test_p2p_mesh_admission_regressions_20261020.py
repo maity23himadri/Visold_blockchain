@@ -306,7 +306,7 @@ def test_seed_bootstrap_keeps_exploring_after_thirty_active_peers(monkeypatch):
 
     attempts = []
     monkeypatch.setattr(p2p.time, "sleep", lambda *_: None)
-    monkeypatch.setattr(net, "_try_add_peer", lambda ip, port, peer_id="": attempts.append((ip, port, peer_id)))
+    monkeypatch.setattr(net, "_try_add_peer", lambda ip, port, peer_id="", **kwargs: attempts.append((ip, port, peer_id)))
     net._bootstrap()
 
     assert len(net.active_peer_count()) == 30
