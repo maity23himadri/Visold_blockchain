@@ -806,10 +806,53 @@ class P2PNetwork:
         """
         addr = _udp_normalize_addr((ip, port))
 
-        # Bail out if already connected over UDP
+        # Reuse an endpoint mapping only when the registered peer AND its
+        # underlying UDP session are still live.  A stale mapping must never be
+        # reported as a successful reconnect: callers would skip TCP fallback
+        # and the node would remain below its peer target until process restart.
+        stale_peer = None
+        stale_session = None
         with self._udp_peers_lock:
-            if addr in self._udp_peers:
-                return True
+            existing = self._udp_peers.get(addr)
+            if existing is not None:
+                candidate_session = getattr(existing, "_session", None)
+                try:
+                    if candidate_session is None:
+                        session_live = False
+                    else:
+                        # Atomically mark a timed-out session expired. A late
+                        # heartbeat must not revive it after this path has
+                        # decided to replace its stale endpoint mapping.
+                        expire = getattr(candidate_session, "expire_if_silent", None)
+                        session_live = (not expire()) if callable(expire) else bool(
+                            candidate_session.is_alive())
+                except Exception:
+                    session_live = False
+                if bool(getattr(existing, "connected", False)) and session_live:
+                    return True
+                stale_peer = existing
+                stale_session = candidate_session
+                if self._udp_peers.get(addr) is existing:
+                    self._udp_peers.pop(addr, None)
+
+        if stale_peer is not None:
+            log.info("[UDP] Evicting stale peer mapping before reconnect: %s:%s",
+                     ip, port)
+            try:
+                stale_peer.connected = False
+            except Exception:
+                pass
+            # Run identity-safe peer bookkeeping now rather than waiting for a
+            # blocked/late receive loop to notice that its session has died.
+            try:
+                self._on_peer_disconnect(stale_peer)
+            except Exception as exc:
+                log.debug("[UDP] stale peer cleanup failed for %s:%s: %s",
+                          ip, port, type(exc).__name__)
+            try:
+                self._udp.remove_session(addr, expected_session=stale_session)
+            except Exception:
+                pass
 
         sess = self._udp.get_session(addr)
         peer = UDPPeerConnection("outbound", ip, port, sess)
@@ -1017,7 +1060,10 @@ class P2PNetwork:
 
             if msg is None:
                 # Timeout — check liveness via heartbeat
-                if not peer._session.is_alive():
+                expire = getattr(peer._session, "expire_if_silent", None)
+                session_expired = (bool(expire()) if callable(expire)
+                                   else not peer._session.is_alive())
+                if session_expired:
                     log.debug(f"[UDP] Peer {peer.peer_id[:12]} heartbeat timeout — disconnecting")
                     break
                 # Still alive — send a ping to keep the session warm
@@ -1060,10 +1106,13 @@ class P2PNetwork:
                 log.debug(f"[UDP] _handle_message error: {exc}")
 
         self._on_peer_disconnect(peer)  # type: ignore[arg-type]
-        # Clean up UDP session
+        # Clean up only this session.  A reconnect may already have installed a
+        # newer peer at the same endpoint while the old receive loop was
+        # unwinding; an unconditional pop here would erase the replacement.
         addr = _udp_normalize_addr((peer.ip, peer.port))
         with self._udp_peers_lock:
-            self._udp_peers.pop(addr, None)
+            if self._udp_peers.get(addr) is peer:
+                self._udp_peers.pop(addr, None)
         self._udp.remove_session(addr, expected_session=peer._session)
 
     def _udp_send_to_peer(self, peer: 'UDPPeerConnection', msg: dict,
@@ -1102,7 +1151,13 @@ class P2PNetwork:
                     sess = getattr(up, "_session", None)
                     if sess is None:
                         continue
-                    if not sess.is_alive():
+                    # Expiration is atomic with inbound heartbeat updates. This
+                    # avoids evicting a session that became live again after the
+                    # initial heartbeat scan but before map cleanup.
+                    expire = getattr(sess, "expire_if_silent", None)
+                    session_expired = (bool(expire()) if callable(expire)
+                                       else not sess.is_alive())
+                    if session_expired:
                         dead_peers.append((addr, up))
                         continue
                     # Pull the session's current smoothed RTT (may be None
@@ -1121,8 +1176,11 @@ class P2PNetwork:
                             self._udp_peers.pop(addr, None)
                             evict = True
                     if evict:
-                        dead_up.connected = False
-                        dead_up.close()
+                        try:
+                            self._on_peer_disconnect(dead_up)
+                        except Exception as exc:
+                            log.debug("[UDP] stale peer bookkeeping failed for %s: %s",
+                                      addr, type(exc).__name__)
                         self._udp.remove_session(
                             addr, expected_session=getattr(dead_up, "_session", None))
                         self.latency_tracker.drop_peer(addr)
@@ -1912,7 +1970,13 @@ class P2PNetwork:
             try:
                 raw_sock = _create_connection_dual_stack(
                     ip, port, Config.PEER_TIMEOUT)
-            except Exception:
+            except Exception as exc:
+                # Keep the network/OS failure visible at normal log level. The
+                # previous blanket return made timeout, refusal, no-route, and
+                # resolver failures indistinguishable in live IP-change tests.
+                log.info(
+                    "[P2PConnect] TCP dial to %s failed: %s: %s",
+                    _format_peer_addr(ip, port), type(exc).__name__, str(exc)[:180])
                 return False
 
         # ── From here: identical to original connect_to logic ─────────────────
@@ -7416,14 +7480,22 @@ class P2PNetwork:
                 # Do not label an ordinary under-target dial as a replacement.
                 topology_probe = False
 
-            started = self._try_add_peer_impl(ip, port, peer_id)
+            # During recovery, a known endpoint may be in the ordinary
+            # outbound-failure cooldown. Permit a bounded half-open probe while
+            # this node remains below its peer target; the endpoint itself
+            # enforces one such probe per reconnect interval. This avoids a
+            # restart being the only way to clear an in-memory cooldown.
+            recovery_probe = (target is None or count < int(target))
+            started = self._try_add_peer_impl(
+                ip, port, peer_id, recovery_probe=recovery_probe)
             if started and probe_at_target and topology_probe:
                 # Stamp under the global auto-dial lock so simultaneous PEX pages
                 # cannot schedule a burst after a fast failed connection.
                 self._topology_probe_last_attempt_mono = time.monotonic()
             return started
 
-    def _try_add_peer_impl(self, ip: str, port: int, peer_id: str = "") -> bool:
+    def _try_add_peer_impl(self, ip: str, port: int, peer_id: str = "", *,
+                           recovery_probe: bool = False) -> bool:
         if not ip or not port:
             return False
         # Normalize first (strips IPv4-mapped prefix from IPv6 dual-stack addr)
@@ -7524,14 +7596,32 @@ class P2PNetwork:
             _of = self._outbound_fail.get(endpoint)
             if _of is not None:
                 if _of[0] >= Config.OUTBOUND_FAIL_LIMIT and _now < _of[1]:
-                    _remain = max(1, int(_of[1] - _now))
-                    log.debug(
-                        f"[OutboundCooldown] Skipping "
-                        f"{_format_peer_addr(ip, port)} — failed "
-                        f"{_of[0]}x consecutively, cooling down "
-                        f"for {_remain}s more")
-                    _pa_push("OUT", ip, port, "COOLDOWN")
-                    return False
+                    # Healthy recovery must not require a process restart just
+                    # to clear this in-memory cooldown.  When the node is below
+                    # its peer target, allow one half-open attempt per ordinary
+                    # reconnect interval; normal/at-target dials still obey the
+                    # full cooldown.  Keep fail_count so failed probes do not
+                    # reset the backoff state.
+                    if len(_of) < 3:
+                        _of.append(0.0)
+                    probe_interval = max(30.0, float(getattr(
+                        Config, "RECONNECT_INTERVAL", 60)))
+                    last_probe = float(_of[2] or 0.0)
+                    if recovery_probe and (_now - last_probe) >= probe_interval:
+                        _of[2] = _now
+                        log.info(
+                            "[OutboundCooldown] Half-open recovery probe for %s "
+                            "while below peer target (next probe no sooner than %.0fs)",
+                            _format_peer_addr(ip, port), probe_interval)
+                    else:
+                        _remain = max(1, int(_of[1] - _now))
+                        log.debug(
+                            f"[OutboundCooldown] Skipping "
+                            f"{_format_peer_addr(ip, port)} — failed "
+                            f"{_of[0]}x consecutively, cooling down "
+                            f"for {_remain}s more")
+                        _pa_push("OUT", ip, port, "COOLDOWN")
+                        return False
                 elif _of[0] >= Config.OUTBOUND_FAIL_LIMIT and _now >= _of[1]:
                     del self._outbound_fail[endpoint]
         # ── Pending-connection dedup (Bug #3/#4 fix) ─────────────────────────
@@ -7630,7 +7720,9 @@ class P2PNetwork:
             # Increment consecutive fail counter for this endpoint only.
             endpoint = (ip, int(port))
             with self._outbound_fail_lock:
-                rec = self._outbound_fail.setdefault(endpoint, [0, 0.0])
+                rec = self._outbound_fail.setdefault(endpoint, [0, 0.0, 0.0])
+                if len(rec) < 3:
+                    rec.append(0.0)
                 rec[0] += 1
                 if rec[0] >= Config.OUTBOUND_FAIL_LIMIT:
                     rec[1] = time.time() + Config.OUTBOUND_FAIL_COOLDOWN_SECS
@@ -8249,6 +8341,24 @@ class P2PNetwork:
         except queue.Empty:
             return None
 
+    def _refresh_dns_seeds_for_recovery(self) -> int:
+        """Refresh dynamic seed endpoints during a below-target recovery pass."""
+        seeder = getattr(self, "_dns_seeder", None)
+        refresh = getattr(seeder, "refresh_now", None)
+        if not callable(refresh):
+            return 0
+        try:
+            scheduled = int(refresh(min_interval_seconds=15.0) or 0)
+            if scheduled:
+                log.info("[Reconnect] DNS refresh scheduled %s seed endpoint dial(s)",
+                         scheduled)
+            return scheduled
+        except Exception as dns_exc:
+            # DNS lookup failure must not kill the reconnect worker; cached and
+            # static peer candidates remain available as a fallback.
+            log.debug("DNSSeeder: recovery refresh failed safely: %s", dns_exc)
+            return 0
+
     def _try_seed_peers(self) -> int:
         """Try configured seeds first so they can refresh mobile peer endpoints."""
         started = 0
@@ -8335,8 +8445,14 @@ class P2PNetwork:
                 else:
                     log.debug("Only %s/%s peers, reconnecting toward topology target...",
                               count, target)
-                # Seed first on each recovery pass: it can publish new endpoints
-                # for peers whose mobile IP has changed since our last session.
+                # Resolve DNS seed hostnames during recovery, not only on the
+                # slow background timer. If the first dial happened while a seed
+                # was restarting, the old implementation kept retrying cached
+                # IPs and might wait up to DNS_SEED_INTERVAL (600s) to learn the
+                # now-live endpoint. Refresh is rate-limited inside DNSSeeder.
+                self._refresh_dns_seeds_for_recovery()
+                # Static seeds remain supported; DNS refresh above handles
+                # dynamic endpoints that are absent from SEED_PEERS by default.
                 self._try_seed_peers()
                 known = self.storage.get_peers(limit=20)
                 random.shuffle(known)

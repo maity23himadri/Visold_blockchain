@@ -396,6 +396,9 @@ class MiningEngine:
             # ── Parallel mining info ───────────────────────────────────────────
             "backend":       binfo["backend"],
             "cpu_threads":   binfo["cpu_threads"],
+            "configured_cpu_threads": binfo.get(
+                "configured_cpu_threads", binfo["cpu_threads"]),
+            "hash_input_bytes": binfo.get("hash_input_bytes", 0),
             "gpu_enabled":   binfo["gpu_enabled"],
             "gpu_device":    binfo["gpu_device"],
             "gpu_batch":     binfo["gpu_batch"],
@@ -692,6 +695,12 @@ class MiningEngine:
         wd_thread.start()
 
         # ── Parallel mine (CPU threads or GPU) — now possibly throttled ──
+        # Keep a bounded-by-attempt series of finite cap samples so the end
+        # diagnostic can describe a dynamically changing governor cap. The
+        # initial cap alone is not comparable with the block's wall-clock rate
+        # because the cap can be recomputed many times while mining.
+        cap_samples = []
+
         def _live_hashrate_cap():
             """Refresh the governor cap while the same block is still mining."""
             try:
@@ -701,6 +710,9 @@ class MiningEngine:
                     self._hashrate_governor.update_local_actual_hashrate(raw_live)
                 cap_live, _req_live, _debug_live = self._hashrate_governor.advise(
                     block.difficulty)
+                if (cap_live > 0.0 and cap_live == cap_live
+                        and cap_live not in (float("inf"), float("-inf"))):
+                    cap_samples.append(float(cap_live))
                 return cap_live
             except Exception as _cap_exc:
                 log.debug(f"[HashrateGovernor] dynamic cap refresh failed: {_cap_exc}")
@@ -771,29 +783,30 @@ class MiningEngine:
         if not block._sealed:
             block.seal()
 
-        # ── v7.6.2 Per-block throttle diagnostic ─────────────────────────
-        # Print the measured rate alongside the cap so a throttle leak is
-        # immediately visible in the log.  measured = nonce / elapsed; cap
-        # = mine_max_hps.  In a healthy throttle:
-        #   measured ≈ cap × (1 ± 0.15)    (15% jitter is normal)
-        # If measured >> cap consistently, the throttle is leaking.
+        # ── Per-block mining-rate diagnostic ─────────────────────────────────
+        # `measured` is wall-clock nonce throughput. The governor cap may
+        # change while a candidate is in flight, so comparing measured against
+        # only the initial cap produces false throttle-leak warnings. Report
+        # the initial cap and observed finite dynamic-cap range instead.
         try:
             block_measured_hr = (float(block.nonce + 1) / max(elapsed, 1e-3))
         except Exception:
             block_measured_hr = 0.0
         cap_str = ('unlimited' if mine_max_hps == 0.0 else f'{mine_max_hps:.0f}')
-        if mine_max_hps > 0.0 and block_measured_hr > 0.0:
-            ratio = block_measured_hr / mine_max_hps
-            ratio_str = f"  measured/cap={ratio:.2f}x"
+        if cap_samples:
+            cap_summary = (
+                f"  live_cap_avg={sum(cap_samples) / len(cap_samples):.0f}H/s"
+                f"  live_cap_range={min(cap_samples):.0f}-{max(cap_samples):.0f}H/s"
+                f"  cap_samples={len(cap_samples)}")
         else:
-            ratio_str = ""
+            cap_summary = ""
 
         log.info(
             f"Block #{block.index} mined!  hash={block.block_hash[:16]}…  "
             f"nonce={block.nonce}  backend={self._parallel._backend.upper()}  "
             f"time={elapsed:.1f}s  "
-            f"measured={block_measured_hr:.0f}H/s  cap={cap_str}H/s"
-            f"{ratio_str}"
+            f"measured={block_measured_hr:.0f}H/s  initial_cap={cap_str}H/s"
+            f"{cap_summary}"
         )
 
         # ── Post MINE_RESULT to StateEngine (single-writer principle) ──────────

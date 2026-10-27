@@ -1522,6 +1522,7 @@ class CLI:
         ("27", "MEV protection: OFF"),
         ("28", "Network & Ports"),
         ("29", "Network-wide Node Directory"),
+        ("30", "Incoming Transfers [0]"),
         ("H",  "Help & Keyboard Tips"),
         ("B",  "Detach UI (keep node running)"),
         ("99", "Diagnose Sync (live trace)"),
@@ -2085,6 +2086,7 @@ class CLI:
 
         _lookup: dict = {k: v for k, v in self.MENU}
         _lookup["27"] = self._mev_menu_label()
+        _lookup["30"] = self._incoming_transfers_menu_label()
 
         printed = 0
         def _emit(line: str = "") -> None:
@@ -2165,6 +2167,9 @@ class CLI:
         # and avoids hiding it behind the existing Network & Ports entry.
         _sec("NETWORK-WIDE NODE DIRECTORY", CYAN)
         _row1("29", CYAN)
+        _emit()
+        _sec("INCOMING TRANSFERS", CYAN)
+        _row1("30", CYAN)
         _emit()
         _sec("HELP & SESSION", CYAN)
         _row2("H", CYAN, "B", GREEN)
@@ -2264,6 +2269,7 @@ class CLI:
             "27": self._toggle_mev_protection,
             "28": self._network_ports,
             "29": self._network_directory,
+            "30": self._incoming_transfers,
             "H":  self._show_tui_help,
             "h":  self._show_tui_help,
             "B":  self._detach_tui,
@@ -2310,6 +2316,103 @@ class CLI:
         except Exception:
             return "MEV protection"
         return f"MEV protection: {'ON' if on else 'OFF'}"
+
+    def _incoming_transfers_menu_label(self) -> str:
+        """Current cumulative count shown beside the Incoming Transfers option."""
+        try:
+            count = max(0, int(self.node.get_incoming_transfer_total()))
+        except Exception:
+            count = 0
+        return f"Incoming Transfers [{count}]"
+
+    def _incoming_transfers(self) -> None:
+        """Show the latest locally observed transfers addressed to this wallet.
+
+        A mempool sighting is explicitly displayed as unconfirmed.  Only a
+        transaction found in canonical storage is shown as confirmed; an entry
+        missing from both storage and the live mempool is not called pending.
+        Sender-supplied memos are omitted to avoid terminal-control injection.
+        """
+        inbox = self.node.get_incoming_transfer_inbox()
+        entries = list(inbox.get("entries", []))
+        entries.sort(key=lambda item: (int(item.get("received_at", 0)),
+                                       int(item.get("timestamp", 0))), reverse=True)
+        total_count = max(0, int(inbox.get("total_count", len(entries))))
+        page_size = 20
+        page = 0
+        total_pages = max(1, (len(entries) + page_size - 1) // page_size)
+
+        print(clr("\n  ── Incoming Transfers ──", CYAN))
+        print(f"  Total recorded: {total_count}  |  Showing latest {len(entries)} saved entries")
+        print(clr(
+            "  Safety: mempool arrival is NOT confirmation. Funds count as received "
+            "only after the transaction is included in the canonical chain.", YELLOW))
+        if not entries:
+            print(clr("  No incoming transfers have been observed by this node yet.", DIM))
+            return
+
+        while True:
+            start = page * page_size
+            window = entries[start:start + page_size]
+            print(clr("  " + "─" * 76, DIM))
+            print(f"  Page {page + 1}/{total_pages}  |  newest first")
+            for index, item in enumerate(window, start=start + 1):
+                sender = str(item.get("sender", "Unknown sender"))
+                # Registered names are canonical-claim checked at record time;
+                # strip any control chars defensively before terminal output.
+                sender = re.sub(r"[\x00-\x1f\x7f-\x9f]", "?", sender)[:128]
+                sender_name = str(item.get("sender_name", ""))
+                sender_name = re.sub(r"[\x00-\x1f\x7f-\x9f]", "?", sender_name)[:64]
+                sender_display = (f"{sender_name} ({sender})" if sender_name else sender)
+                tx_id = str(item.get("tx_id", ""))[:16]
+                try:
+                    amount = from_satoshi(int(item.get("amount_sat", 0)))
+                except (TypeError, ValueError, OverflowError):
+                    amount = 0.0
+                try:
+                    timestamp = int(item.get("timestamp", 0))
+                    ts_display = (datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+                                  if timestamp > 0 else "unknown time")
+                except (ValueError, OverflowError, OSError, TypeError):
+                    ts_display = "unknown time"
+
+                confirmed = False
+                try:
+                    confirmed = bool(self.node.storage.tx_exists(str(item.get("tx_id", ""))))
+                except Exception:
+                    confirmed = False
+                if confirmed:
+                    status = clr("CONFIRMED · canonical body present", GREEN)
+                else:
+                    pending = False
+                    try:
+                        mempool = self.node.blockchain.mempool
+                        with mempool._lock:
+                            pending = str(item.get("tx_id", "")) in mempool._pending_tx_ids
+                    except Exception:
+                        pending = False
+                    status = (clr("PENDING · not confirmed", YELLOW) if pending else
+                              clr("UNVERIFIED · not in retained TX body/mempool", RED))
+
+                print(f"  {index:>3}. {amount:.8f} VSD  |  {status}")
+                print(f"       From: {sender_display}")
+                print(f"       Seen: {ts_display}  |  TX: {tx_id}...")
+
+            if total_pages <= 1:
+                break
+            controls = []
+            if page > 0:
+                controls.append("[P] Previous")
+            if page < total_pages - 1:
+                controls.append("[N] Next")
+            controls.append("[Q] Back")
+            choice = self._read_input("  " + "  ".join(controls) + ": ").strip().lower()
+            if choice == "n" and page < total_pages - 1:
+                page += 1
+            elif choice == "p" and page > 0:
+                page -= 1
+            else:
+                break
 
     def _toggle_mev_protection(self):
         """Switch MEV protection on or off for this node's own transfers.
@@ -3374,7 +3477,20 @@ class CLI:
             backend_str = clr(f"OpenCL  (GPU device {s['gpu_device']}, "
                                f"batch {s['gpu_batch']:,})", CYAN)
         else:
-            backend_str = clr(f"CPU  ({s['cpu_threads']} threads × all cores)", YELLOW)
+            effective_threads = int(s.get('cpu_threads', 1))
+            configured_threads = int(s.get('configured_cpu_threads', effective_threads))
+            if effective_threads < configured_threads:
+                input_bytes = int(s.get('hash_input_bytes', 0) or 0)
+                reason = (
+                    "; short-hash GIL limit"
+                    if 0 < input_bytes <= 2047 else "")
+                backend_text = (
+                    f"CPU  ({effective_threads} effective worker; "
+                    f"{configured_threads} configured{reason})")
+            else:
+                unit = "worker" if effective_threads == 1 else "workers"
+                backend_text = f"CPU  ({effective_threads} {unit})"
+            backend_str = clr(backend_text, YELLOW)
         print(f"  Backend    : {backend_str}")
 
         # GPU availability hint

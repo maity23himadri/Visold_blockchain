@@ -112,6 +112,11 @@ class SafetyInvariantChecker:
         # Liveness tracking: record height at which we last confirmed growth
         self._last_liveness_height: int = -1
         self._last_liveness_time:   float = time.time()
+        # Liveness is an operational warning, not a chain-safety failure.
+        # Track warning episodes so one stalled height is not logged and
+        # counted as a fresh event every timer tick.
+        self._liveness_episode_active: bool = False
+        self._liveness_last_log_time: float = 0.0
         # circuit_breaker — injected by VisoldNode after construction
         self._circuit_breaker: Optional[Any] = None
 
@@ -166,8 +171,16 @@ class SafetyInvariantChecker:
         self._check_liveness(violations)
         if violations:
             for v in violations:
-                log.warning(f"INVARIANT VIOLATION (rolling): {v}")
-            metrics.inc("invariant_rolling_violations", float(len(violations)))
+                # _check_liveness logs a rate-limited operational warning.
+                # Do not re-log it here on every one-second timer tick.
+                if not v.startswith("LIVENESS VIOLATION:"):
+                    log.warning(f"INVARIANT VIOLATION (rolling): {v}")
+            critical_count = sum(
+                1 for v in violations
+                if not v.startswith("LIVENESS VIOLATION:")
+            )
+            if critical_count:
+                metrics.inc("invariant_rolling_violations", float(critical_count))
         return {"violations": violations}
 
     # ── Invariant 1: Safety ───────────────────────────────────────────────────
@@ -244,19 +257,41 @@ class SafetyInvariantChecker:
                 # Chain grew — reset liveness timer
                 self._last_liveness_height = current_height
                 self._last_liveness_time   = now
+                self._liveness_episode_active = False
+                self._liveness_last_log_time = 0.0
                 return True
 
             stall_secs = now - self._last_liveness_time
+            if peer_count <= 0:
+                # No connected peer means this watchdog cannot infer that the
+                # wider network is progressing. A later reconnection begins a
+                # new warning episode, but does not reset the height timer.
+                self._liveness_episode_active = False
+                self._liveness_last_log_time = 0.0
+                return True
 
-        if stall_secs > self.LIVENESS_TIMEOUT_SECS and peer_count > 0:
+            if stall_secs <= self.LIVENESS_TIMEOUT_SECS:
+                return True
+
             msg = (
                 f"LIVENESS VIOLATION: Chain height has not advanced for "
                 f"{stall_secs:.0f}s (height={current_height}, "
                 f"peers={peer_count}, timeout={self.LIVENESS_TIMEOUT_SECS}s). "
                 f"Check mining status, validator participation, and peer connectivity.")
+            is_new_episode = not self._liveness_episode_active
+            should_log = (is_new_episode or
+                          now - self._liveness_last_log_time >= 60.0)
+            if is_new_episode:
+                self._liveness_episode_active = True
+            if should_log:
+                self._liveness_last_log_time = now
+
+        if stall_secs > self.LIVENESS_TIMEOUT_SECS and peer_count > 0:
             violations.append(msg)
-            log.warning(msg)
-            metrics.inc("invariant_liveness_violations")
+            if should_log:
+                log.warning(msg)
+            if is_new_episode:
+                metrics.inc("invariant_liveness_violations")
             return False
 
         return True

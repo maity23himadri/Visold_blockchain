@@ -29,7 +29,7 @@ def _net(active_ids=("peer-1", "peer-2", "peer-3")):
 
 
 def _install_impl_that_reserves_pending(net, starts):
-    def impl(ip, port, peer_id=""):
+    def impl(ip, port, peer_id="", **kwargs):
         starts.append((ip, port, peer_id))
         with net._pending_lock:
             net._pending_connections.add((ip, port))

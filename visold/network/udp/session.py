@@ -83,6 +83,8 @@ class UDPSession:
         # heartbeat
         self._last_hb_sent  = time.monotonic()
         self._last_hb_recv  = time.monotonic()   # updated on any inbound packet
+        self._liveness_lock = threading.Lock()
+        self._liveness_expired = False
         # retransmit background thread (one per session, daemon)
         self._rtx_stop      = threading.Event()
         self._rtx_thread    = threading.Thread(
@@ -107,7 +109,14 @@ class UDPSession:
     def _raw_sendto(self, pkt: bytes):
         """Send one raw UDP packet.  Silently swallows transient OS errors."""
         try:
-            self._transport._sock.sendto(pkt, self.addr)
+            # Route through UDPTransport when available so socket recovery cannot
+            # race sends. The fallback preserves compatibility with lightweight
+            # transport doubles used by integrations and tests.
+            sendto = getattr(self._transport, "sendto", None)
+            if callable(sendto):
+                sendto(pkt, self.addr)
+            else:
+                self._transport._sock.sendto(pkt, self.addr)
         except OSError:
             pass
 
@@ -175,7 +184,13 @@ class UDPSession:
         session.  Updates heartbeat timestamp unconditionally, then dispatches
         by flag.
         """
-        self._last_hb_recv = time.monotonic()
+        with self._liveness_lock:
+            # GC may have atomically expired this session immediately before a
+            # late packet arrived. Do not revive a session already detached from
+            # the transport; the next packet will create/find a fresh session.
+            if self._liveness_expired:
+                return
+            self._last_hb_recv = time.monotonic()
 
         # ── Control packets ───────────────────────────────────────────────
         if flags & _F_ACK:
@@ -273,6 +288,8 @@ class UDPSession:
 
     # ── Session teardown ──────────────────────────────────────────────────
     def close(self):
+        with self._liveness_lock:
+            self._liveness_expired = True
         self._rtx_stop.set()
         self._window.clear()
         # Unblock any waiting recv
@@ -281,6 +298,25 @@ class UDPSession:
         except Exception:
             pass
 
+    def expire_if_silent(self, now=None) -> bool:
+        """Atomically mark this session expired only if its heartbeat is stale.
+
+        Synchronizing this check with ``on_packet`` prevents the GC thread from
+        deciding a session is dead just before an inbound heartbeat refreshes it.
+        Once marked expired, a late packet cannot revive a detached session.
+        """
+        if now is None:
+            now = time.monotonic()
+        with self._liveness_lock:
+            if self._liveness_expired:
+                return True
+            if now - self._last_hb_recv >= _UDP_HB_TIMEOUT:
+                self._liveness_expired = True
+                return True
+            return False
+
     def is_alive(self) -> bool:
-        """False if the peer has been silent for longer than _UDP_HB_TIMEOUT."""
-        return (time.monotonic() - self._last_hb_recv) < _UDP_HB_TIMEOUT
+        """False if closed or silent for longer than _UDP_HB_TIMEOUT."""
+        with self._liveness_lock:
+            return (not self._liveness_expired and
+                    (time.monotonic() - self._last_hb_recv) < _UDP_HB_TIMEOUT)

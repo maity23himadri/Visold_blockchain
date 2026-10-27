@@ -23,7 +23,9 @@ Defines: UDPTransport, UDPPeerConnection
 Origin: visold_vsd_.py L2551-2674, L2690-2878
 """
 
+import errno
 import json
+import logging
 import socket
 from visold.kernel.netutil import wildcard_for_family
 import threading
@@ -38,6 +40,8 @@ from visold.network.udp.wire import (
     _udp_unpack,
 )
 
+
+_LOG = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 class UDPTransport:
@@ -55,9 +59,11 @@ class UDPTransport:
 
     def __init__(self, port: int, bind_addr: str = '',
                  max_pending_inbound: int = 64):
-        self._port       = port
+        self._port       = int(port)
         self._bind_addr  = bind_addr
         self._lock       = threading.Lock()
+        # Protect socket replacement against concurrent senders and shutdown.
+        self._socket_lock = threading.RLock()
         self._sessions: Dict[tuple, UDPSession] = {}
         # Addresses that passed the cheap pre-session admission gate but have
         # not completed the higher-level P2P handshake yet.  This prevents an
@@ -72,10 +78,17 @@ class UDPTransport:
         # handshake; it only decides whether a new source may allocate a
         # UDPSession.
         self._inbound_admission: Optional[Callable[[tuple], bool]] = None
-        self._sock       = self._create_socket()
+        self._sock = self._create_socket()
+        # Keep the actual bound port when callers request an ephemeral port
+        # (port=0), so a recovered socket rebinds to the same endpoint.
+        try:
+            self._port = int(self._sock.getsockname()[1])
+        except (AttributeError, IndexError, TypeError, ValueError, OSError):
+            pass
 
     def _create_socket(self) -> socket.socket:
         """Create a dual-stack UDP socket bound to self._port."""
+        s = None
         try:
             s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
             s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
@@ -84,13 +97,29 @@ class UDPTransport:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
             s.bind((wildcard_for_family(socket.AF_INET6, self._bind_addr), self._port))
         except OSError:
-            # Fallback: IPv4-only
+            # Close a partially-created IPv6 socket before trying IPv4. Leaking
+            # it here can prevent recovery from rebinding the same port.
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
-            s.bind((wildcard_for_family(socket.AF_INET, self._bind_addr), self._port))  # nosec B104 – intentional P2P bind-all
-        return s
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+                s.bind((wildcard_for_family(socket.AF_INET, self._bind_addr), self._port))  # nosec B104 – intentional P2P bind-all
+            except Exception:
+                s.close()
+                raise
+        try:
+            # Keep timeout on every socket instance, including self-healed ones.
+            s.settimeout(1.0)
+            return s
+        except Exception:
+            s.close()
+            raise
 
     def start(self, on_new_peer=None, inbound_admission=None):
         """Start background threads.
@@ -109,15 +138,80 @@ class UDPTransport:
 
     def stop(self):
         self._running = False
-        try:
-            self._sock.close()
-        except Exception:
-            pass
+        with self._socket_lock:
+            sock, self._sock = self._sock, None
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
         with self._lock:
-            for s in self._sessions.values():
-                s.close()
+            sessions = list(self._sessions.values())
             self._sessions.clear()
             self._pending_inbound.clear()
+        for sess in sessions:
+            try:
+                sess.close()
+            except Exception:
+                _LOG.exception("Error closing UDP session during transport shutdown")
+
+    def sendto(self, data: bytes, addr: tuple):
+        """Send using the current socket without racing socket recovery."""
+        with self._socket_lock:
+            sock = self._sock
+            if sock is None:
+                raise OSError("UDP socket is temporarily unavailable")
+            return sock.sendto(data, addr)
+
+    def _ensure_socket(self):
+        """Return the current socket, recreating it if recovery previously failed."""
+        with self._socket_lock:
+            if not self._running:
+                return None
+            if self._sock is None:
+                self._sock = self._create_socket()
+                _LOG.warning(
+                    "UDP receive socket was unavailable; rebound socket on port %s",
+                    self._port,
+                )
+            return self._sock
+
+    def _recover_socket(self, failed_sock, error: OSError) -> bool:
+        """Replace a failed receive socket while preserving peer session state.
+
+        A receive error must not silently terminate the sole UDP demultiplexer.
+        The same bound port is reused, and existing sessions stay registered so
+        normal heartbeat/retransmission can recover without restarting the node.
+        """
+        with self._socket_lock:
+            if not self._running:
+                return False
+            # Another recovery path may already have installed a replacement.
+            if self._sock is not failed_sock:
+                return self._sock is not None
+            try:
+                failed_sock.close()
+            except Exception:
+                pass
+            self._sock = None
+            try:
+                self._sock = self._create_socket()
+            except OSError:
+                _LOG.exception(
+                    "UDP receive socket recovery failed on port %s (errno=%s); "
+                    "receiver will retry",
+                    self._port,
+                    getattr(error, "errno", None),
+                )
+                return False
+            _LOG.warning(
+                "UDP receive socket recovered on port %s after receive error "
+                "(errno=%s: %s); peer sessions preserved",
+                self._port,
+                getattr(error, "errno", None),
+                error,
+            )
+            return True
 
     # ── Session access ────────────────────────────────────────────────────
     def _get_or_create_session(self, addr: tuple):
@@ -189,11 +283,15 @@ class UDPTransport:
         with self._lock:
             current = self._sessions.get(addr)
             if current is None:
-                self._pending_inbound.discard(addr)
+                # An identity-scoped cleanup may be running late while a new
+                # inbound handshake has reserved this address. Do not release
+                # that newer handshake's admission slot.
+                if expected_session is None:
+                    self._pending_inbound.discard(addr)
                 return False
             if expected_session is not None and current is not expected_session:
-                # A newer session owns this endpoint now.  Do not close it.
-                self._pending_inbound.discard(addr)
+                # A newer session owns this endpoint now. Do not close it or
+                # release its in-flight inbound admission reservation.
                 return False
             sess = self._sessions.pop(addr)
             # A pre-auth reservation belongs to this endpoint.  Releasing it
@@ -205,60 +303,126 @@ class UDPTransport:
 
     # ── Background threads ────────────────────────────────────────────────
     def _recv_loop(self):
+        """Receive and demultiplex datagrams; recover from socket failures.
+
+        A single OSError or malformed packet must not silently kill this only
+        receiver while leaving the transport marked as running.  Socket-level
+        failures trigger bounded-backoff socket recreation on the same port;
+        packet-level failures are logged and isolated to the offending packet.
         """
-        Single receive thread — demultiplexes every inbound UDP datagram to the
-        correct UDPSession.  New source addresses trigger _on_new_peer so that
-        the P2PNetwork can initiate a handshake for spontaneously connecting peers.
-        """
-        self._sock.settimeout(1.0)
+        retry_delay = 0.25
+        max_retry_delay = 5.0
+        consecutive_recv_errors = 0
+        fatal_socket_errnos = {
+            value for value in (
+                getattr(errno, "EBADF", None),
+                getattr(errno, "ENOTSOCK", None),
+                getattr(errno, "EINVAL", None),
+            ) if value is not None
+        }
         while self._running:
             try:
-                data, addr = self._sock.recvfrom(65535)
-            except socket.timeout:
+                sock = self._ensure_socket()
+            except OSError as exc:
+                if not self._running:
+                    break
+                _LOG.warning(
+                    "UDP receive socket unavailable on port %s: %s; retrying in %.2fs",
+                    self._port, exc, retry_delay,
+                )
+                time.sleep(retry_delay)
+                retry_delay = min(max_retry_delay, retry_delay * 2.0)
                 continue
-            except OSError:
+            if sock is None:
                 break
-            parsed = _udp_unpack(data)
-            if parsed is None:
-                continue   # bad magic / too short
-            flags, seq, frag_id, frag_off, payload = parsed
-            addr = _udp_normalize_addr(addr)
-
-            # Admission MUST happen before a new UDPSession is allocated.
-            # Existing sessions bypass the gate so authenticated peers are not
-            # affected by the pre-authentication resource budget.
-            if not self._admit_inbound(addr):
+            try:
+                data, addr = sock.recvfrom(65535)
+            except socket.timeout:
+                retry_delay = 0.25
+                consecutive_recv_errors = 0
+                continue
+            except OSError as exc:
+                if not self._running:
+                    break
+                consecutive_recv_errors += 1
+                fatal_socket_error = getattr(exc, "errno", None) in fatal_socket_errnos
+                if fatal_socket_error or consecutive_recv_errors >= 3:
+                    recovered = self._recover_socket(sock, exc)
+                    if recovered:
+                        retry_delay = 0.25
+                        consecutive_recv_errors = 0
+                    else:
+                        time.sleep(retry_delay)
+                        retry_delay = min(max_retry_delay, retry_delay * 2.0)
+                else:
+                    # Do not churn a healthy socket for an isolated transient
+                    # errno. Recreate it only for clearly fatal errors or after
+                    # repeated consecutive receive failures.
+                    _LOG.warning(
+                        "Transient UDP receive error on port %s "
+                        "(%d/3, errno=%s): %s; retrying same socket",
+                        self._port, consecutive_recv_errors,
+                        getattr(exc, "errno", None), exc,
+                    )
+                    time.sleep(retry_delay)
+                    retry_delay = min(max_retry_delay, retry_delay * 2.0)
                 continue
 
-            sess, created = self._get_or_create_session(addr)
-            if not created:
-                # Another local path (normally an outbound dial) won the race
-                # between admission and session creation.  Do not start a
-                # second inbound handshake for the same endpoint.
-                self.release_inbound(addr)
-            sess.on_packet(flags, seq, frag_id, frag_off, payload)
+            retry_delay = 0.25
+            consecutive_recv_errors = 0
+            # Isolate all parser, admission and session-dispatch exceptions so a
+            # bad datagram or callback cannot permanently stop the receive loop.
+            try:
+                parsed = _udp_unpack(data)
+                if parsed is None:
+                    continue   # bad magic / too short
+                flags, seq, frag_id, frag_off, payload = parsed
+                addr = _udp_normalize_addr(addr)
 
-            # Notify P2PNetwork of brand-new senders so it can do a handshake.
-            # The P2P handler releases the pre-auth reservation as soon as the
-            # handshake either fails or the peer is successfully registered.
-            if created and self._on_new_peer:
-                try:
-                    self._on_new_peer(addr)
-                except Exception:
-                    # No worker was successfully launched; do not strand the
-                    # admission slot.
+                # Admission MUST happen before a new UDPSession is allocated.
+                # Existing sessions bypass the gate so authenticated peers are
+                # not affected by the pre-authentication resource budget.
+                if not self._admit_inbound(addr):
+                    continue
+
+                sess, created = self._get_or_create_session(addr)
+                if not created:
+                    # Another local path (normally an outbound dial) won the
+                    # race between admission and session creation.
                     self.release_inbound(addr)
-            elif created and not self._on_new_peer:
-                self.release_inbound(addr)
+                sess.on_packet(flags, seq, frag_id, frag_off, payload)
+
+                if created and self._on_new_peer:
+                    try:
+                        self._on_new_peer(addr)
+                    except Exception:
+                        # No worker launched; do not strand admission capacity.
+                        self.release_inbound(addr)
+                        _LOG.exception("UDP new-peer callback failed for %s", addr)
+                elif created and not self._on_new_peer:
+                    self.release_inbound(addr)
+            except Exception:
+                _LOG.exception("Dropping UDP datagram after dispatch failure from %r", addr)
 
     def _gc_loop(self):
         """Reap UDPSessions that have gone silent beyond the heartbeat timeout."""
         while self._running:
             time.sleep(_UDP_HB_TIMEOUT / 4)
             with self._lock:
-                dead = [a for a, s in self._sessions.items() if not s.is_alive()]
-            for addr in dead:
-                self.remove_session(addr)
+                dead = [(addr, sess) for addr, sess in self._sessions.items()
+                        if not sess.is_alive()]
+            for addr, sess in dead:
+                # Recheck immediately before removal and use object identity so
+                # an old GC snapshot cannot delete a replacement session at the
+                # same address. Real UDPSessions atomically mark themselves
+                # expired to serialize this decision against inbound packets.
+                expire = getattr(sess, "expire_if_silent", None)
+                if expire is not None:
+                    if not expire():
+                        continue
+                elif sess.is_alive():
+                    continue
+                self.remove_session(addr, expected_session=sess)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

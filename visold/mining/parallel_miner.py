@@ -95,6 +95,14 @@ class ParallelMiner:
         self._cl_prog     = None
         # Config snapshot (read once at init)
         self._n_threads   = Config.MINING_THREADS
+        # Effective worker count is decided for each candidate based on the
+        # actual canonical hash input length. Short hashlib inputs hold the
+        # GIL, so the configured thread count is not necessarily usable.
+        # Until the first candidate header is measured, advertise the safe
+        # serial fallback rather than claiming unverified parallelism.
+        self._last_effective_threads = 1
+        self._last_hash_input_bytes = 0
+        self._thread_limit_notice_emitted = False
         self._gpu_device  = Config.MINING_GPU_DEVICE
         self._gpu_batch   = Config.MINING_GPU_BATCH
 
@@ -128,8 +136,9 @@ class ParallelMiner:
                     )
             if self._backend == "cpu":
                 log.info(
-                    f"Mining backend: CPU  {self._n_threads} threads  "
-                    f"(set VISOLD_MINING_GPU=1 to enable GPU acceleration)"
+                    f"Mining backend: CPU  {self._n_threads} configured worker(s); "
+                    f"effective worker count depends on canonical hash-input size "
+                    f"(set VISOLD_MINING_GPU=1 to request GPU acceleration)"
                 )
             self._initialized = True
         return self._backend
@@ -267,7 +276,9 @@ class ParallelMiner:
         """Return backend details for CLI / RPC status display."""
         return {
             "backend":     self._backend.upper(),
-            "cpu_threads": self._n_threads,
+            "cpu_threads": self._last_effective_threads,
+            "configured_cpu_threads": self._n_threads,
+            "hash_input_bytes": self._last_hash_input_bytes,
             "gpu_enabled": Config.MINING_GPU_ENABLED,
             "gpu_device":  self._gpu_device,
             "gpu_batch":   self._gpu_batch,
@@ -293,7 +304,7 @@ class ParallelMiner:
           • Pre-serialised JSON template  — no per-nonce json.dumps / dict alloc
           • bytes target comparison       — no per-nonce hex→bigint conversion
           • C-typed loop variables        — when compiled with Cython
-          • Same GIL-releasing hashlib    — true N-core parallel SHA-256
+          • C-level SHA-256 calls
 
         Compiled speedup vs interpreted:  3–8× on the mining inner loop.
         Interpreted speedup vs old code:  1.5–2× (template + bytes cmp alone).
@@ -313,7 +324,33 @@ class ParallelMiner:
         header_base.pop('nonce', None)
         fmt_template = _build_mine_template(header_base)
 
-        N           = self._n_threads
+        configured_threads = max(1, int(self._n_threads))
+        # CPython's hashlib releases the GIL only when one hash call receives
+        # more than 2047 bytes. A canonical Visold header preimage is normally
+        # ~674 bytes, so multiple Python worker threads serialize around each
+        # hashlib.sha256() call. Summing their independently timed rates then
+        # inflates the governor's view of aggregate throughput. Use a single
+        # worker for short inputs; preserve configured parallel workers only
+        # when even the minimum-nonce input exceeds the threshold.
+        # This changes neither the preimage nor consensus validation.
+        try:
+            hash_input_bytes = len(
+                (fmt_template % (0, orig_ts)).encode('ascii'))
+        except Exception:
+            # Unknown formatting means we must not assume GIL-free hashing.
+            hash_input_bytes = 2047
+        N = configured_threads if hash_input_bytes > 2047 else 1
+        self._last_effective_threads = N
+        self._last_hash_input_bytes = hash_input_bytes
+        if N < configured_threads and not self._thread_limit_notice_emitted:
+            # This is an expected runtime detail, not an error or degraded-mode failure.
+            log.info(
+                "Mining header input is %d bytes; hashlib releases the GIL "
+                "only for inputs >2047 bytes. Using 1 CPU worker instead of "
+                "%d configured workers to avoid overstated aggregate "
+                "hashrate (consensus hash is unchanged).",
+                hash_input_bytes, configured_threads)
+            self._thread_limit_notice_emitted = True
         result      = []
         result_lock = threading.Lock()
         thread_stop = threading.Event()

@@ -97,6 +97,9 @@ class VisoldNode:
         self._shutdown_started = False
         self._shutdown_complete = False
         self._startup_timers: list = []
+        # Serialises updates to the local incoming-transfer inbox.  Inbox data
+        # lives in node_meta (not consensus state) and must never affect blocks.
+        self._incoming_transfer_lock = threading.RLock()
         # Load config before selecting the default listen port. A default argument
         # bound to Config.DEFAULT_PORT at import time would ignore config.json.
         Config.ensure_dirs()
@@ -832,6 +835,171 @@ class VisoldNode:
             else:
                 log.info("Node stopped cleanly")
 
+
+    # ── Local incoming-transfer inbox (non-consensus UI metadata) ────────────
+    _INCOMING_TRANSFER_MAX_ENTRIES = 500
+
+    def _incoming_transfer_meta_key(self) -> str:
+        """Wallet-scoped metadata key so inboxes never bleed across wallets."""
+        return "incoming_transfers_v1:" + sha256(
+            str(self.wallet.address).encode("utf-8"))[:24]
+
+    def _load_incoming_transfer_inbox_unlocked(self) -> dict:
+        """Load and defensively normalise the small, local-only transfer inbox.
+
+        Called while ``_incoming_transfer_lock`` is held.  Only a bounded
+        history is retained; ``total_count`` is cumulative and survives trim.
+        The inbox is presentation metadata only and is never read by consensus.
+        """
+        empty = {"version": 1, "total_count": 0, "entries": []}
+        try:
+            raw = self.storage.get_meta(self._incoming_transfer_meta_key(), "")
+            if not raw:
+                return empty
+            data = json.loads(raw)
+            if not isinstance(data, dict) or data.get("version") != 1:
+                return empty
+            raw_entries = data.get("entries", [])
+            if not isinstance(raw_entries, list):
+                raw_entries = []
+            entries = []
+            for item in raw_entries[-self._INCOMING_TRANSFER_MAX_ENTRIES:]:
+                if not isinstance(item, dict):
+                    continue
+                tx_id = item.get("tx_id")
+                sender = item.get("sender")
+                try:
+                    amount_sat = int(item.get("amount_sat"))
+                    timestamp = int(item.get("timestamp", 0))
+                    received_at = int(item.get("received_at", timestamp))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if (not isinstance(tx_id, str) or not tx_id or len(tx_id) > 128
+                        or not isinstance(sender, str) or not sender
+                        or len(sender) > 256 or amount_sat <= 0):
+                    continue
+                name = item.get("sender_name", "")
+                if not isinstance(name, str):
+                    name = ""
+                entries.append({
+                    "tx_id": tx_id,
+                    "sender": sender,
+                    "sender_name": name[:64],
+                    "amount_sat": amount_sat,
+                    "timestamp": max(0, timestamp),
+                    "received_at": max(0, received_at),
+                })
+            try:
+                total_count = max(0, int(data.get("total_count", 0)))
+            except (TypeError, ValueError, OverflowError):
+                total_count = 0
+            return {
+                "version": 1,
+                "total_count": max(total_count, len(entries)),
+                "entries": entries,
+            }
+        except Exception as exc:
+            # A damaged UI inbox must never stop node startup or TX processing.
+            log.warning("Incoming-transfer inbox could not be read: %s", exc)
+            return empty
+
+    def get_incoming_transfer_inbox(self) -> dict:
+        """Return a defensive snapshot of the wallet's local transfer inbox."""
+        with self._incoming_transfer_lock:
+            data = self._load_incoming_transfer_inbox_unlocked()
+            return {
+                "version": 1,
+                "total_count": int(data["total_count"]),
+                "entries": [dict(item) for item in data["entries"]],
+            }
+
+    def get_incoming_transfer_total(self) -> int:
+        """Cumulative count of distinct incoming transfers recorded locally."""
+        return int(self.get_incoming_transfer_inbox()["total_count"])
+
+    def record_incoming_transfer(self, tx: Transaction) -> bool:
+        """Record one admitted transfer addressed to this wallet.
+
+        This is called by StateEngine *only after* ``mempool.add`` succeeds for
+        a remote transaction.  It intentionally does not claim confirmation.
+        Duplicate tx IDs do not increment the count or emit a second alert.
+        """
+        try:
+            if not isinstance(tx, Transaction):
+                return False
+            own_address = str(self.wallet.address)
+            sender = str(getattr(tx, "sender", "") or "")
+            receiver = str(getattr(tx, "receiver", "") or "")
+            if (getattr(tx, "tx_type", None) != Transaction.TYPE_TRANSFER
+                    or receiver != own_address or not sender or len(sender) > 256
+                    or sender == own_address or sender == "COINBASE"):
+                return False
+            amount_sat = int(to_satoshi(getattr(tx, "amount", 0.0)))
+            tx_id = str(getattr(tx, "tx_id", "") or "")
+            if amount_sat <= 0 or not tx_id or len(tx_id) > 128:
+                return False
+            try:
+                timestamp = max(0, int(getattr(tx, "timestamp", 0) or 0))
+            except (TypeError, ValueError, OverflowError):
+                timestamp = 0
+            received_at = int(time.time())
+
+            # Name display must come from a confirmed ownership claim, not the
+            # mutable peer-directory cache. Otherwise an attacker could make a
+            # different address appear to belong to a familiar registered name.
+            sender_name = ""
+            try:
+                candidate = self.storage.get_uid_by_wallet(sender)
+                if isinstance(candidate, str):
+                    candidate = candidate.strip().casefold()
+                    if re.fullmatch(
+                            r"(?:[a-z0-9_.-]{3,32}|[a-z0-9_]{3,32}#[0-9a-f]{10})",
+                            candidate):
+                        claim = self.storage.resolve_name_claim(candidate)
+                        if (claim and str(claim.get("wallet_addr", "")) == sender):
+                            sender_name = candidate
+            except Exception:
+                # Unknown names are normal; the address remains the safe fallback.
+                sender_name = ""
+
+            with self._incoming_transfer_lock:
+                data = self._load_incoming_transfer_inbox_unlocked()
+                entries = data["entries"]
+                if any(item.get("tx_id") == tx_id for item in entries):
+                    return False
+                entries.append({
+                    "tx_id": tx_id,
+                    "sender": sender,
+                    "sender_name": sender_name,
+                    "amount_sat": amount_sat,
+                    "timestamp": timestamp,
+                    "received_at": received_at,
+                })
+                entries = entries[-self._INCOMING_TRANSFER_MAX_ENTRIES:]
+                total_count = max(0, int(data["total_count"])) + 1
+                payload = {
+                    "version": 1,
+                    "total_count": total_count,
+                    "entries": entries,
+                }
+                self.storage.set_meta(
+                    self._incoming_transfer_meta_key(),
+                    json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+                )
+
+            # The activity message is an attention cue, not proof of payment.
+            try:
+                from visold.kernel.notifications import _push_incoming_transfer_notif
+                label = sender_name or sender
+                _push_incoming_transfer_notif(label, sender, amount_sat / 100_000_000)
+            except Exception:
+                pass
+            return True
+        except Exception as exc:
+            # Failure of a local UI feature must not reject/undo an otherwise
+            # valid network transaction or break StateEngine's relay path.
+            log.warning("Could not record incoming-transfer notification: %s", exc)
+            return False
 
     def send_transaction(self, to_user_or_addr: str, amount: float,
                          memo: str = "", protected=None) -> Tuple[bool, str]:

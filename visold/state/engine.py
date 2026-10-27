@@ -539,6 +539,17 @@ class StateEngine:
                 msg_out = {"type": "TX", "tx": tx.to_dict(),
                            "ttl": Config.GOSSIP_TTL}
                 self._network._gossip(msg_out, exclude=source_peer)
+            if ok and source_peer:
+                # A recipient inbox entry is created only after mempool
+                # validation/admission succeeds.  The inbox is local UI
+                # metadata; it does not alter transaction or consensus state.
+                try:
+                    node = getattr(self, "_node_ref", None)
+                    record_incoming = getattr(node, "record_incoming_transfer", None)
+                    if callable(record_incoming):
+                        record_incoming(tx)
+                except Exception as exc:
+                    log.debug("Incoming-transfer notification skipped: %s", exc)
             return ok, msg
         except Exception as e:
             return False, f"new_tx error: {e}"
@@ -1077,6 +1088,14 @@ class StateEngine:
                 if (report and self._circuit_breaker is not None
                         and isinstance(report, dict)):
                     for violation in report.get("violations", []):
+                        # Liveness is an operational progress warning.  A
+                        # quiet/stalled chain must remain diagnosable, but it
+                        # is not by itself evidence of corrupt state and must
+                        # not force this node into read-only mode. The breaker
+                        # also enforces this exclusion as defense in depth.
+                        if str(violation).lstrip().upper().startswith(
+                                "LIVENESS VIOLATION:"):
+                            continue
                         self._circuit_breaker.record_violation(violation)
         except Exception as e:
             log.debug(f"StateEngine timer error: {e}")

@@ -128,8 +128,17 @@ class PanicCircuitBreaker:
         """
         Record a safety violation.  If the violation count in the rolling
         window exceeds Config.CIRCUIT_BREAKER_VIOLATIONS, trip the breaker.
+
+        Liveness stalls are operational progress warnings, not evidence of
+        chain-state corruption. They are deliberately excluded from the
+        circuit-breaker path; a connected but quiet network must not be forced
+        read-only merely because no block was found during the warning window.
         """
         if not Config.CIRCUIT_BREAKER_ENABLED:
+            return
+        if str(reason).lstrip().upper().startswith("LIVENESS VIOLATION:"):
+            # Defense in depth: callers should filter these before reaching the
+            # breaker, but the breaker itself enforces the safety boundary too.
             return
         now = time.time()
         with self._lock:

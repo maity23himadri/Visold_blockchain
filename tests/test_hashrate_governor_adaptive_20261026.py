@@ -267,7 +267,11 @@ def test_parallel_miner_refreshes_cap_during_an_unsolved_candidate(monkeypatch):
     stopper.join(2.0)
     assert call_count[0] >= 2
     assert any(v == float("inf") for v in observations)
-    assert any(abs(v - 50.0) < 1e-9 for v in observations), observations[:10]
+    # The candidate header is shorter than hashlib's 2048-byte GIL-release
+    # threshold, so the miner now uses one effective worker. The advertised
+    # aggregate cap therefore applies to that worker without dividing by the
+    # configured (but not effectively parallel) thread count.
+    assert any(abs(v - 100.0) < 1e-9 for v in observations), observations[:10]
 
 
 def test_relayed_peer_rate_uses_origin_timestamp_for_decay(monkeypatch):

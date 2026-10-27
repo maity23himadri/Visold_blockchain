@@ -26,6 +26,7 @@ Origin: visold_vsd_.py L33348-33448
 
 import socket
 import threading
+import time
 from typing import Optional, TYPE_CHECKING
 
 from visold.kernel.config import Config
@@ -67,6 +68,15 @@ class DNSSeeder:
         self._network   = network
         self._thread: Optional[threading.Thread] = None
         self._stop_evt  = threading.Event()
+        # Serialize background refreshes with recovery-triggered refreshes.
+        # Without this guard, the reconnect loop and 600-second DNS timer can
+        # launch duplicate batches for the same endpoint at once.
+        self._query_lock = threading.Lock()
+        self._last_query_monotonic = 0.0
+        # Treat A/AAAA answers for one DNS name as alternative routes to that
+        # seed, not as two independent peers. If the first family keeps failing,
+        # rotate the preferred family on the next recovery refresh.
+        self._candidate_cursor: dict[str, int] = {}
 
     def start(self):
         if not Config.DNS_SEEDS:
@@ -88,9 +98,50 @@ class DNSSeeder:
         while not self._stop_evt.wait(timeout=Config.DNS_SEED_INTERVAL):
             self._query_all()
 
-    def _query_all(self):
+    def _query_all_locked(self) -> int:
+        scheduled = 0
         for hostname in Config.DNS_SEEDS:
-            self._query_one(hostname)
+            scheduled += self._query_one(hostname)
+        return scheduled
+
+    def _query_all(self) -> int:
+        with self._query_lock:
+            self._last_query_monotonic = time.monotonic()
+            return self._query_all_locked()
+
+    def refresh_now(self, min_interval_seconds: float = 15.0) -> int:
+        """Re-resolve DNS seeds during peer recovery, with a bounded rate.
+
+        The regular timer is intentionally slow (600 seconds by default).
+        That is suitable for steady-state discovery but too slow after an IP
+        migration: a one-shot dial may fail while the seed is restarting, and
+        the reconnect loop used to retry only static/cached IP addresses.
+        Recovery calls this method when below target. A non-blocking lock and
+        minimum interval prevent a stuck DNS query or concurrent caller from
+        stalling the reconnect loop or creating query storms.
+
+        Returns the number of endpoint dial attempts successfully scheduled;
+        that is not the same as authenticated connection success.
+        """
+        if not Config.DNS_SEEDS:
+            return 0
+        if not self._query_lock.acquire(blocking=False):
+            log.debug("DNSSeeder: recovery refresh skipped; another lookup is active")
+            return 0
+        try:
+            now = time.monotonic()
+            minimum = max(5.0, float(min_interval_seconds))
+            elapsed = now - float(self._last_query_monotonic or 0.0)
+            if elapsed < minimum:
+                log.debug(
+                    "DNSSeeder: recovery refresh throttled for %.1fs",
+                    minimum - elapsed)
+                return 0
+            self._last_query_monotonic = now
+            log.info("DNSSeeder: recovery refresh started (peer target not met)")
+            return self._query_all_locked()
+        finally:
+            self._query_lock.release()
 
     def _query_one(self, hostname: str):
         try:
@@ -119,35 +170,46 @@ class DNSSeeder:
                 else:
                     ipv4_ips.append((ip, port))
 
-            # v6.9.9: IPv6-first peer registration.
-            #
-            # When a seed hostname resolves to both A and AAAA records,
-            # register IPv6 addresses FIRST so that _try_add_peer spawns
-            # IPv6 connection threads before IPv4 ones.  On CGNAT networks
-            # IPv4 attempts will timeout / fail; having IPv6 threads already
-            # running means a working connection is established sooner rather
-            # than waiting for all IPv4 timeouts to expire.
-            #
-            # Each IP is still registered separately (existing behaviour) —
-            # this is intentional because the peer DB stores IPs, not
-            # hostnames, and each IP gets its own reconnect lifecycle.
-            for ip, port in (ipv6_ips + ipv4_ips):
-                _family_label = "AF_INET6" if _is_ipv6_address(ip) else "AF_INET"
-                # This runs in the background seeder thread. Route diagnostics
-                # through the queue-backed logger; direct stdout writes corrupt
-                # the interactive TUI and can move a waiting input cursor.
-                log.debug(
-                    "[SEED-ATTEMPT] %s %s via %s",
-                    _family_label, _format_peer_addr(ip, port), hostname,
+            candidates = ipv6_ips + ipv4_ips
+            if candidates:
+                # Log the actual answer, not only family counts. This makes it
+                # possible to distinguish a stale resolver answer from a later
+                # failure to connect to the refreshed address.
+                resolved = ", ".join(
+                    ("IPv6 " if _is_ipv6_address(ip) else "IPv4 ")
+                    + _format_peer_addr(ip, port)
+                    for ip, port in candidates
                 )
-                self._network._try_add_peer(
-                    ip, port, auto_discovery=True, dial_source="dns-seeder")
+                log.info("DNSSeeder: %s resolved to %s", hostname, resolved)
 
-            if ips_seen:
-                log.info(
-                    f"DNSSeeder: {hostname} → "
-                    f"{len(ipv6_ips)} IPv6 + {len(ipv4_ips)} IPv4 host(s) discovered")
+                # Prefer IPv6 initially, but rotate through the alternatives on
+                # each refresh. Only schedule one endpoint per hostname per
+                # pass: A and AAAA are alternate routes to the same seed, and
+                # parallel attempts could consume the soft peer-target budget
+                # before the usable family gets a chance to run.
+                start = int(self._candidate_cursor.get(hostname, 0) or 0) % len(candidates)
+                ordered = candidates[start:] + candidates[:start]
+                self._candidate_cursor[hostname] = (start + 1) % len(candidates)
+                for ip, port in ordered:
+                    family_label = "AF_INET6" if _is_ipv6_address(ip) else "AF_INET"
+                    endpoint = _format_peer_addr(ip, port)
+                    try:
+                        started = bool(self._network._try_add_peer(
+                            ip, port, auto_discovery=True, dial_source="dns-seeder"))
+                    except Exception as exc:
+                        started = False
+                        log.debug("DNSSeeder: scheduling %s via %s raised %s",
+                                  endpoint, hostname, exc)
+                    log.info("DNSSeeder: dial %s %s via %s scheduled=%s",
+                             family_label, endpoint, hostname, started)
+                    if started:
+                        return 1
+            else:
+                log.info("DNSSeeder: %s resolved to no usable endpoints", hostname)
+            return 0
         except socket.gaierror as e:
             log.debug(f"DNSSeeder: DNS lookup failed for {hostname}: {e}")
+            return 0
         except Exception as e:
             log.debug(f"DNSSeeder: unexpected error for {hostname}: {e}")
+            return 0

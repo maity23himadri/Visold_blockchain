@@ -183,3 +183,38 @@ def test_new_mobile_endpoint_is_kept_as_unverified_candidate_without_overwriting
     assert candidate["verified"] is False
     assert candidate["status"] == "DISCOVERED"
     assert candidate["chain_height"] == -1
+
+
+def test_under_target_auto_discovery_allows_one_half_open_probe_during_cooldown(monkeypatch):
+    monkeypatch.setattr(p2p.threading, "Thread", _NoStartThread)
+    _NoStartThread.created.clear()
+    net = _network()
+    ip, port, peer_id = "2001:db8::99", 8341, "recover-peer"
+    # Five failed dials triggered the normal 300 s cooldown. A node with no
+    # active peers must still make a bounded recovery probe without restart.
+    net._outbound_fail[(ip, port)] = [5, time.time() + 300, 0.0]
+
+    assert net._try_add_peer(
+        ip, port, peer_id, auto_discovery=True, dial_source="reconnect-cache") is True
+    assert len(_NoStartThread.created) == 1
+    assert net._outbound_fail[(ip, port)][2] > 0
+
+    # Simulate the attempt finishing, then ensure the same endpoint cannot be
+    # probed repeatedly inside the configured reconnect interval.
+    with net._pending_lock:
+        net._pending_connections.clear()
+        net._pending_peer_ids.clear()
+    assert net._try_add_peer(
+        ip, port, peer_id, auto_discovery=True, dial_source="reconnect-cache") is False
+    assert len(_NoStartThread.created) == 1
+
+
+def test_manual_dial_still_obeys_endpoint_cooldown(monkeypatch):
+    monkeypatch.setattr(p2p.threading, "Thread", _NoStartThread)
+    _NoStartThread.created.clear()
+    net = _network()
+    ip, port = "2001:db8::100", 8341
+    net._outbound_fail[(ip, port)] = [5, time.time() + 300, 0.0]
+
+    assert net._try_add_peer(ip, port, "manual-retry") is False
+    assert _NoStartThread.created == []

@@ -41,11 +41,13 @@ from visold.kernel.compat import cython
 #   2. OpenCL — AMD / Intel / NVIDIA via pyopencl.  pip install pyopencl
 #               Same parallel SHA-256 approach; cross-vendor support.
 #
-#   3. CPU threads — always available, zero extra dependencies.
-#               hashlib.sha256() releases Python's GIL during the C-level
-#               hash computation, so N threads truly run in parallel on
-#               N CPU cores.   Default: all logical cores (os.cpu_count()).
-#               Override: VISOLD_MINING_THREADS=N
+#   3. CPU workers — always available, zero extra dependencies.
+#               hashlib.sha256() releases the GIL only for a single input
+#               larger than 2047 bytes. Canonical Visold headers are normally
+#               shorter, so ParallelMiner uses one worker in that case rather
+#               than treating GIL-contending Python threads as parallel cores.
+#               Longer hash inputs may use multiple workers. The configured
+#               count is controlled with VISOLD_MINING_THREADS=N.
 #
 # NOTE ON GPU HASH FUNCTION
 # ─────────────────────────
@@ -143,9 +145,12 @@ def _cy_mine_worker(fmt_template: str,
        unsigned long long / ssize_t C variables — zero Python object overhead,
        zero refcount updates, zero heap allocation per loop iteration.
 
-    hashlib.sha256() releases Python's GIL during its C SHA-256 computation,
-    so N threads calling this function simultaneously achieve true N-core
-    parallelism regardless of whether Cython is compiled or not.
+    hashlib.sha256() releases Python's GIL only for input buffers larger than
+    2047 bytes. The canonical Visold header preimage is normally shorter, so
+    ParallelMiner selects one effective worker for those candidates. This
+    avoids GIL contention and prevents summing per-thread active-time rates
+    into an inflated aggregate hashrate. Longer inputs may use multiple
+    workers because hashlib releases the GIL during each hash call.
 
     Hashrate throttle (v7.6.0):
     ───────────────────────────

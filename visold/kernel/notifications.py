@@ -112,6 +112,29 @@ def _push_block_notif(height: int, miner: str, source: str = "network") -> None:
         pass
 
 
+def _push_incoming_transfer_notif(sender_label: str, sender_address: str,
+                                 amount_vsd: float) -> None:
+    """Push a just-admitted incoming VSD transfer to the live activity panel.
+
+    The caller must invoke this only after the transaction has successfully
+    entered the local mempool.  This is an *unconfirmed* notification, not a
+    payment receipt; confirmation is determined from the canonical chain.
+    Sender-provided memos are deliberately not displayed here.
+    """
+    try:
+        ts = datetime.now().strftime("%H:%M:%S")
+        label = str(sender_label or "").replace("\n", " ").replace("\r", " ")
+        address = str(sender_address or "").replace("\n", " ").replace("\r", " ")
+        label = label[:32]
+        address = address[:24]
+        entry = (f"[{ts}|INF] ↓ Incoming transfer: {label} ({address}) sent you "
+                 f"{float(amount_vsd):.8f} VSD — NOT CONFIRMED")
+        with _notify_buf_lock:
+            _notify_buf.append(entry)
+    except Exception:
+        pass
+
+
 def _push_peer_notif(event: str, ip: str, port: int) -> None:
     """Push an instant peer connection/disconnection notification to the live panel.
 
