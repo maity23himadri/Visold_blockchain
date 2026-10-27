@@ -622,13 +622,12 @@ class Config:
     KAD_BITS            = 160
 
     # DoS / Bandwidth protection
-    MAX_MESSAGE_SIZE    = 1_073_741_824 # 1 GB — was 16 MB which was too small
-                                        # for 200-block MSG_CHAIN sync responses
-                                        # (~8 KB/block × 200 = ~1.6 MB typical,
-                                        # up to ~12 MB with full transactions).
-                                        # Old value caused large syncs to trigger
-                                        # "oversized frame" bans, permanently
-                                        # disconnecting peers mid-sync.
+    # Hard ceiling for one complete application frame, including after
+    # decompression. 32 MiB leaves room for legitimate multi-block sync pages
+    # while preventing a single peer from expanding a tiny compressed frame into
+    # hundreds of MiB. MSG_CHAIN responses are byte-budgeted below this limit;
+    # snapshot/block payloads use bounded chunk messages.
+    MAX_MESSAGE_SIZE    = 32 * 1024 * 1024
     MAX_PEER_BANDWIDTH  = 10_485_760    # 10 MB/s per peer (bytes/sec)
     PEER_BAN_SCORE_THRESHOLD = 100      # ban peer when ban score reaches this
     PEER_SCORE_INVALID_MSG   = 10       # ban points for each invalid message
@@ -640,14 +639,14 @@ class Config:
                                         # accumulate and eventually trigger a ban.
     PEER_SCORE_RATE_LIMIT_HARD = 20     # v7.1.0: ban points for >2× msg-rate
                                         # overshoot.  100/20 = 5 hard breaches
-    # An application frame is newline-delimited JSON.  A peer is allowed to
-    # stream a frame over multiple TCP segments, but an unterminated frame must
-    # have both a byte and an absolute-age bound.  This is intentionally much
-    # smaller than MAX_MESSAGE_SIZE: complete legacy messages retain the larger
-    # compatibility ceiling, while a malicious peer cannot reserve hundreds of
-    # megabytes simply by never sending the final '\n'.
-    MAX_PARTIAL_FRAME_BYTES = int(os.environ.get(
-        "VISOLD_MAX_PARTIAL_FRAME_BYTES", str(32 * 1024 * 1024)))
+    # An application frame is newline-delimited JSON. A peer may stream a frame
+    # over multiple TCP segments, but an unterminated frame has both a byte and
+    # absolute-age bound. Keep this no larger than MAX_MESSAGE_SIZE so complete
+    # and incomplete frames share a hard memory ceiling.
+    MAX_PARTIAL_FRAME_BYTES = max(1, min(
+        int(os.environ.get(
+            "VISOLD_MAX_PARTIAL_FRAME_BYTES", str(MAX_MESSAGE_SIZE))),
+        MAX_MESSAGE_SIZE))
     MAX_PARTIAL_FRAME_AGE_SECS = float(os.environ.get(
         "VISOLD_MAX_PARTIAL_FRAME_AGE_SECS", "120"))
     MAX_FORK_SYNC_BLOCKS = int(os.environ.get(

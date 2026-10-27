@@ -39,6 +39,7 @@ import weakref
 from typing import Any, List, Optional
 
 from visold.kernel.config import Config
+from visold.kernel.compression_utils import DecompressedSizeLimitError
 from visold.kernel.logging_setup import log
 from visold.network.compression import CompressionEngine
 from visold.network.message_logger import P2PMessageLogger
@@ -912,6 +913,11 @@ class PeerConnection:
             # ARRIVING → CONNECTED cycling visible in the dashboard.
             self.last_seen = time.time()
             return json.loads(decompressed.decode())
+        except DecompressedSizeLimitError:
+            # An oversized compressed handshake/control frame is terminal for
+            # this session, not an ordinary read timeout.
+            self.connected = False
+            return None
         except Exception:
             return None
     def close(self):

@@ -12,6 +12,10 @@ do not depend upward on the P2P/network layer.
 import zlib
 
 
+class DecompressedSizeLimitError(ValueError):
+    """Raised when a compressed payload expands beyond its configured cap."""
+
+
 def bounded_zlib_decompress(data: bytes, max_output_size: int) -> bytes:
     """Safely zlib-decompress ``data`` without an unbounded inflate.
 
@@ -30,11 +34,13 @@ def bounded_zlib_decompress(data: bytes, max_output_size: int) -> bytes:
     while remaining_input:
         allowance = limit - len(out) + 1
         if allowance <= 0:
-            raise ValueError("decompressed output exceeds configured limit")
+            raise DecompressedSizeLimitError(
+                "decompressed output exceeds configured limit")
         part = dec.decompress(remaining_input, allowance)
         out.extend(part)
         if len(out) > limit:
-            raise ValueError("decompressed output exceeds configured limit")
+            raise DecompressedSizeLimitError(
+                "decompressed output exceeds configured limit")
         remaining_input = dec.unconsumed_tail
         if not remaining_input:
             break
@@ -42,11 +48,13 @@ def bounded_zlib_decompress(data: bytes, max_output_size: int) -> bytes:
     if not dec.eof:
         allowance = limit - len(out) + 1
         if allowance <= 0:
-            raise ValueError("decompressed output exceeds configured limit")
+            raise DecompressedSizeLimitError(
+                "decompressed output exceeds configured limit")
         tail = dec.flush(allowance)
         out.extend(tail)
         if len(out) > limit:
-            raise ValueError("decompressed output exceeds configured limit")
+            raise DecompressedSizeLimitError(
+                "decompressed output exceeds configured limit")
         if not dec.eof:
             raise ValueError("truncated zlib stream")
 

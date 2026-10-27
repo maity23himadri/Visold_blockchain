@@ -93,6 +93,7 @@ from visold.consensus.hashrate_reports import verify_hashrate_report
 from visold.crypto.ecc import ecdsa_sign, ecdsa_verify, pub_from_hex, sig_from_hex, sig_to_hex
 from visold.crypto.hashing import hash_obj, sha256
 from visold.kernel.config import Config
+from visold.kernel.compression_utils import DecompressedSizeLimitError
 from visold.kernel.events import Event, EventType
 from visold.kernel.logging_setup import log
 from visold.kernel.lru_cache import LRUCache
@@ -4436,9 +4437,21 @@ class P2PNetwork:
                         if not line.strip():
                             continue
                         try:
-                            # Decompress if compressed frame (transparent)
+                            # Decompress if compressed frame (transparent). The
+                            # decompressor raises a typed limit error before it can
+                            # allocate an attacker-controlled oversized payload.
                             decoded = CompressionEngine.decompress(line)
-                            msg = json.loads(decoded.decode(), parse_constant=_reject_nonfinite_json_constant)
+                            try:
+                                decoded_text = decoded.decode("utf-8")
+                            except UnicodeDecodeError:
+                                self.storage.add_ban_score(
+                                    peer.peer_id, Config.PEER_SCORE_INVALID_MSG)
+                                peer.connected = False
+                                _loop_exit_reason = "peer_invalid_utf8_frame"
+                                break
+                            msg = json.loads(
+                                decoded_text,
+                                parse_constant=_reject_nonfinite_json_constant)
                             # v7.1.7: inbound P2P message logging (no-op
                             # unless enabled).  Size is the on-wire byte
                             # count (pre-decompression) for symmetry with
@@ -4475,9 +4488,21 @@ class P2PNetwork:
                                     time.time()
                                     + Config.SOFT_BAN_THROTTLE_DELAY_SECS)
                             self._handle_message(peer, msg)
+                        except DecompressedSizeLimitError:
+                            self.storage.add_ban_score(
+                                peer.peer_id, Config.PEER_SCORE_OVERSIZED_MSG)
+                            peer.connected = False
+                            _loop_exit_reason = (
+                                "peer_decompressed_message_size_limit_exceeded")
+                            break
                         except json.JSONDecodeError:
                             self.storage.add_ban_score(
                                 peer.peer_id, Config.PEER_SCORE_INVALID_MSG)
+
+                    if not peer.connected:
+                        # A malformed-encoding or oversized frame ended this
+                        # session; do not continue recv() on the dead peer.
+                        break
 
                     # If a complete frame consumed the whole buffer, the next
                     # partial frame starts a fresh age window.  A partial suffix
@@ -6573,19 +6598,39 @@ class P2PNetwork:
                 # Bound every individual response to 200 blocks; pagination and
                 # block acceptance remain unchanged.
                 to_idx = min(to_idx, from_idx + 199)
-                chain = []
                 server_height = self.blockchain.height()
-                for index in range(from_idx, min(to_idx + 1, from_idx + 200)):
-                    block = self.blockchain.get_block(index)
-                    if block:
-                        chain.append(block.to_dict())
-                peer.send({
+                response = {
                     "type": MSG_CHAIN,
-                    "blocks": chain,
+                    "blocks": [],
                     "server_height": server_height,
                     "server_tip_hash": self._local_chain_tip_hash(),
                     "request_id": msg.get("request_id"),
-                })
+                }
+                # Count the exact JSON size as blocks are appended. The page
+                # remains limited to 200 blocks, but it must also fit inside the
+                # receiver's hard frame ceiling. Receivers already paginate a
+                # short page when its final index is below server_height.
+                response_size = len(json.dumps(response).encode())
+                # The receive buffer counts the trailing newline as part of its
+                # hard frame ceiling, so leave one byte for that delimiter even
+                # when a high-entropy page is sent without compression.
+                message_budget = max(1, Config.MAX_MESSAGE_SIZE - 1)
+                for index in range(from_idx, min(to_idx + 1, from_idx + 200)):
+                    block = self.blockchain.get_block(index)
+                    if not block:
+                        continue
+                    block_dict = block.to_dict()
+                    block_size = len(json.dumps(block_dict).encode())
+                    added_size = block_size if not response["blocks"] else block_size + 2
+                    if response_size + added_size > message_budget:
+                        if not response["blocks"]:
+                            log.warning(
+                                f"[ChainServe] Block {index} cannot fit in the "
+                                f"{message_budget}-byte message budget")
+                        break
+                    response["blocks"].append(block_dict)
+                    response_size += added_size
+                peer.send(response)
                 try:
                     log.info(
                         f"[ChainServe] Peer {peer.peer_id[:12]} requested blocks "

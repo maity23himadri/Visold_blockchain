@@ -28,6 +28,11 @@ class _FakeBlockchain:
     def __init__(self, height_hook=None):
         self.mempool = SimpleNamespace(all_txs=lambda: [])
         self._height_hook = height_hook
+        self.block_lookups = 0
+
+    def get_block(self, index):
+        self.block_lookups += 1
+        return None
 
     def height(self):
         if self._height_hook is not None:
@@ -83,6 +88,19 @@ def rpc_factory(tmp_path, monkeypatch):
 
     for rpc in reversed(servers):
         rpc.stop()
+
+
+
+
+def _get_headers(port: int, *, path="/headers?from=0&count=100", token=_TOKEN) -> int:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3.0)
+    try:
+        conn.request("GET", path, headers={"Authorization": f"Bearer {token}"})
+        response = conn.getresponse()
+        response.read()
+        return response.status
+    finally:
+        conn.close()
 
 
 def _freeze_rate_clock(monkeypatch):
@@ -223,3 +241,38 @@ def test_shutdown_does_not_hang_while_accept_loop_waits_for_worker(rpc_factory, 
         except (OSError, TimeoutError, http.client.HTTPException):
             pass
     pool.shutdown(wait=True)
+
+
+def test_headers_endpoint_uses_expensive_rpc_rate_limit(rpc_factory, monkeypatch):
+    rpc = rpc_factory()
+    _freeze_rate_clock(monkeypatch)
+
+    # GET /headers must enter the shared token bucket before any block lookup.
+    # Expensive-method cost is 10 tokens: two initial requests fit a 20-token
+    # bucket, while the third is rejected when the clock is frozen.
+    statuses = [_get_headers(rpc.rpc_port) for _ in range(3)]
+
+    assert statuses == [200, 200, 429]
+    assert rpc.node.blockchain.block_lookups == 200
+
+
+def test_headers_endpoint_rejects_invalid_ranges_without_block_lookups(rpc_factory):
+    rpc = rpc_factory()
+
+    assert _get_headers(rpc.rpc_port, path="/headers?from=-1&count=5") == 400
+    assert _get_headers(rpc.rpc_port, path="/headers?from=0&count=0") == 400
+    assert rpc.node.blockchain.block_lookups == 0
+
+
+def test_headers_endpoint_rejects_count_over_100_without_block_lookups(rpc_factory):
+    rpc = rpc_factory()
+
+    assert _get_headers(rpc.rpc_port, path="/headers?from=0&count=101") == 400
+    assert rpc.node.blockchain.block_lookups == 0
+
+
+def test_headers_endpoint_requires_authentication(rpc_factory):
+    rpc = rpc_factory()
+
+    assert _get_headers(rpc.rpc_port, token="wrong-token") == 401
+    assert rpc.node.blockchain.block_lookups == 0

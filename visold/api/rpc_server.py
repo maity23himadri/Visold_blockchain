@@ -148,7 +148,9 @@ class RPCServer:
         _rate_last      = [time.time()]
         _RATE_MAX       = 20.0
         _RATE_REFILL    = 20.0   # tokens per second
-        _SLOW_METHODS   = {"analyzecontract", "getmempool", "checkinvariants"}
+        _SLOW_METHODS   = {
+            "analyzecontract", "getmempool", "checkinvariants", "getheaders"
+        }
 
         def _consume_token(method: str = "") -> bool:
             cost = 10.0 if method in _SLOW_METHODS else 1.0
@@ -251,15 +253,29 @@ class RPCServer:
                     self._send_text(200, text,
                                     "text/plain; version=0.0.4; charset=utf-8")
                     return
-                if self.path.startswith("/headers"):
+                import urllib.parse as _up
+                parsed_path = _up.urlparse(self.path)
+                if parsed_path.path == "/headers":
                     if not self._authenticate():
                         self._send_json(401, {"error": "Unauthorized"})
                         return
-                    import urllib.parse as _up
-                    qs   = _up.urlparse(self.path).query
-                    args = dict(_up.parse_qsl(qs))
-                    from_idx = int(args.get("from", 0))
-                    count    = min(int(args.get("count", 20)), 100)
+                    # Header retrieval scans block storage and serializes up to
+                    # 100 entries. Charge it as an expensive RPC before parsing
+                    # parameters or touching the chain, just like slow POSTs.
+                    if not self._check_rate("getheaders"):
+                        return
+                    try:
+                        args = dict(_up.parse_qsl(parsed_path.query, max_num_fields=8))
+                        from_idx = int(args.get("from", 0))
+                        count = int(args.get("count", 20))
+                    except (ValueError, TypeError):
+                        self._send_json(400, {"error": "Invalid headers query"})
+                        return
+                    if from_idx < 0 or count < 1 or count > 100:
+                        self._send_json(400, {
+                            "error": "'from' must be non-negative and 'count' must be 1..100"
+                        })
+                        return
                     headers  = []
                     for i in range(from_idx, from_idx + count):
                         b = node.blockchain.get_block(i)

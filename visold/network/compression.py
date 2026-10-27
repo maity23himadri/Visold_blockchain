@@ -29,7 +29,8 @@ import zlib
 
 from visold.kernel.compat import _ZSTD_AVAILABLE
 from visold.kernel.config import Config
-from visold.kernel.compression_utils import bounded_zlib_decompress
+from visold.kernel.compression_utils import (
+    DecompressedSizeLimitError, bounded_zlib_decompress)
 from visold.kernel.logging_setup import log
 
 try:  # optional dependency: name may be undefined, exactly as in the monolith
@@ -117,13 +118,13 @@ class CompressionEngine:
     def decompress(cls, data: bytes) -> bytes:
         """Decompress `data` if it starts with MAGIC.  Returns original bytes.
 
-        CRIT-02 FIX: Enforce a hard output-size cap equal to MAX_MESSAGE_SIZE
-        to prevent zip-bomb attacks.  A peer could craft a ~50 KB compressed
-        frame that expands to gigabytes, exhausting the node's heap.
-          • zlib: max_length argument raises zlib.error if exceeded.
-          • zstd: read_across_frames=False + max_output_size via stream reader.
-        On any decompression error the raw (compressed) bytes are returned so
-        the JSON parse step will fail cleanly rather than crashing the process.
+        Enforce the same hard frame-size ceiling after decompression as on the
+        wire. Decompression must remain bounded while inflating; checking the
+        length only after ``decompress()`` would already have allocated the
+        attacker-controlled expanded payload.
+        Malformed/non-compressed data retains the legacy fail-closed behavior;
+        exceeding the decompressed-size ceiling raises a typed exception so
+        the peer layer can score and disconnect the sender deterministically.
         """
         if not data.startswith(cls.MAGIC):
             return data
@@ -137,32 +138,38 @@ class CompressionEngine:
             log.debug(f"Base64 decode failed, treating as raw: {e}")
             return data
         payload = raw_compressed
-        _limit  = Config.MAX_MESSAGE_SIZE  # 1 GB hard cap (matches recv-buffer limit)
+        _limit  = Config.MAX_MESSAGE_SIZE
         try:
             with cls._lock:
                 cls._init_zstd()
                 if _ZSTD_AVAILABLE and cls._zstd_dctx:
-                    # zstd: decompress with output size cap
-                    result = cls._zstd_dctx.decompress(payload,
-                                                        max_output_size=_limit)
-                    if len(result) >= _limit:
+                    # Use streaming reads rather than decompress() so the
+                    # output ceiling bounds allocation during inflation even
+                    # when the frame advertises an unknown or hostile size.
+                    import io as _io
+                    with cls._zstd_dctx.stream_reader(
+                            _io.BytesIO(payload),
+                            read_size=min(128 * 1024, _limit + 1),
+                            read_across_frames=False) as _reader:
+                        result = _reader.read(_limit + 1)
+                    if len(result) > _limit:
                         log.warning(
                             "CRIT-02: zstd decompression hit output cap "
-                            f"({_limit} bytes) — possible zip-bomb, dropping frame")
-                        return data   # return raw so JSON parse fails cleanly
+                            f"({_limit} bytes) — dropping oversized frame")
+                        raise DecompressedSizeLimitError(
+                            f"decompressed output exceeds {_limit}-byte limit")
                     return result
                 else:
                     # zlib: ``zlib.decompress(..., bufsize=...)`` does NOT
                     # cap decompressed output.  Use a Decompress object with
                     # an explicit max_length so the memory bound is enforced
                     # while inflation is happening, not after the allocation.
-                    result = bounded_zlib_decompress(payload, _limit)
-                    if len(result) >= _limit:
-                        log.warning(
-                            "CRIT-02: zlib decompression hit output cap "
-                            f"({_limit} bytes) — possible zip-bomb, dropping frame")
-                        return data
-                    return result
+                    return bounded_zlib_decompress(payload, _limit)
+        except DecompressedSizeLimitError:
+            log.warning(
+                "CRIT-02: compressed message exceeded decompressed output cap "
+                f"({_limit} bytes) — rejecting frame")
+            raise
         except zlib.error as e:
             log.debug(f"Decompression size-cap triggered or corrupt frame: {e}")
             return data
