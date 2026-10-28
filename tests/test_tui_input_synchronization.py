@@ -14,12 +14,14 @@ class _FakeThread:
         self.daemon = daemon
         self.name = name
         self.alive = False
+        self.join_timeouts = []
 
     def start(self):
         self.alive = True
 
     def join(self, timeout=None):
         # Simulate a worker that does not exit before the join timeout.
+        self.join_timeouts.append(timeout)
         return None
 
     def is_alive(self):
@@ -67,6 +69,7 @@ def test_refresh_thread_timeout_does_not_allow_overlapping_workers(monkeypatch):
 
     cli._stop_refresh_thread()
     assert cli._refresh_stop.is_set()
+    assert old_thread.join_timeouts == [0.10]
     assert cli._refresh_thread is old_thread  # timed-out worker remains tracked
 
     cli._start_refresh_thread()
@@ -164,6 +167,38 @@ def test_stopped_refresh_worker_does_not_write_after_input(monkeypatch):
 
     assert not worker.is_alive()
     assert stream.getvalue() == ""
+
+
+
+def test_live_refresh_cancels_remaining_node_reads_after_input_arrives():
+    """A stop request during one status read must prevent all later DB reads."""
+    cli = CLI()
+    cli._ansi_ok = lambda: True
+    cli._layout = {"W": 80, "notif_n": 0, "pa_n": 0}
+    cli._up_notif = []
+    cli._up_pa = []
+    calls = []
+
+    class Mining:
+        def status(self):
+            calls.append("mining.status")
+            cli._refresh_stop.set()
+            return {"hashrate": "10 H/s", "running": True}
+
+    class Storage:
+        def get_balance(self, _address):
+            calls.append("storage.get_balance")
+            return 0.0
+
+    class Node:
+        mining = Mining()
+        storage = Storage()
+        wallet = type("Wallet", (), {"address": "test-address"})()
+
+    cli.node = Node()
+    cli._redraw_live(update_stats=True)
+
+    assert calls == ["mining.status"]
 
 
 def test_resize_redraw_is_abandoned_if_menu_input_is_active(monkeypatch):

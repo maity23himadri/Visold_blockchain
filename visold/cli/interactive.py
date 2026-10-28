@@ -790,6 +790,29 @@ class CLI:
             emit(f"  {clr('User   ', DIM)} : {bold(uid)}")
             emit(f"  {clr('Address', DIM)} : {addr}")
 
+    def _tui_timed_call(self, operation: str, fn, *args, **kwargs):
+        """Run one node read and log only calls that are slow enough to matter.
+
+        The operation label is a fixed call-site name; arguments and user input
+        are deliberately never logged. This lets an Android run distinguish a
+        slow terminal frame from a storage/chain/network read without changing
+        the node operation itself.
+        """
+        started = time.monotonic()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            if elapsed_ms >= 100.0:
+                try:
+                    INPUT_DIAG.event(
+                        "tui_data_call_slow", operation=operation,
+                        elapsed_ms=round(elapsed_ms, 2),
+                    )
+                except Exception:
+                    # Diagnostics must never break a menu render.
+                    pass
+
     # ── Tab 0: Dashboard ──────────────────────────────────────────────────────
     def _render_tab_dashboard(self, emit, get_row) -> None:
         """Compact overview: stats + small peer + notif panels."""
@@ -798,13 +821,20 @@ class CLI:
         pa_n    = self._layout["pa_n"]
         notif_n = self._layout["notif_n"]
         try:
-            ms    = n.mining.status()
-            bal   = n.storage.get_balance(n.wallet.address)
-            role  = n.roles.get_my_role()
-            peers = len(n.network.active_peer_count())
-            diff  = n.blockchain.get_difficulty()
-            ht    = n.blockchain.height()
-            mplen = n.blockchain.mempool.size()
+            ms    = self._tui_timed_call("dashboard_mining_status", n.mining.status)
+            bal   = self._tui_timed_call("dashboard_balance", n.storage.get_balance, n.wallet.address)
+            role  = self._tui_timed_call("dashboard_role", n.roles.get_my_role)
+            peers = len(self._tui_timed_call("dashboard_active_peers", n.network.active_peer_count))
+            # MiningEngine.status() already snapshots chain difficulty and
+            # height. Reuse that snapshot rather than taking the same chain
+            # reads again on the foreground TUI path while mining is busy.
+            diff = ms.get("difficulty")
+            if diff is None:
+                diff = self._tui_timed_call("dashboard_difficulty", n.blockchain.get_difficulty)
+            ht = ms.get("chain_height")
+            if ht is None:
+                ht = self._tui_timed_call("dashboard_height", n.blockchain.height)
+            mplen = self._tui_timed_call("dashboard_mempool_size", n.blockchain.mempool.size)
         except Exception:
             return
 
@@ -821,8 +851,10 @@ class CLI:
         pending_xfer_vsd = 0.0
         pending_fee_vsd = 0.0
         try:
-            p_reg_sat, p_xfer_sat, p_fee_sat = \
-                n.blockchain.mempool.pending_outflow_sat(n.wallet.address)
+            p_reg_sat, p_xfer_sat, p_fee_sat = self._tui_timed_call(
+                "dashboard_pending_outflow", n.blockchain.mempool.pending_outflow_sat,
+                n.wallet.address,
+            )
             pending_reg_vsd  = from_satoshi(p_reg_sat)
             pending_xfer_vsd = from_satoshi(p_xfer_sat)
             pending_fee_vsd  = from_satoshi(p_fee_sat)
@@ -901,8 +933,8 @@ class CLI:
         W = self._layout["W"]
         emit(f"  {clr('─' * max(10, W - 4), DIM)}")
         try:
-            bal  = n.storage.get_balance(n.wallet.address)
-            role = n.roles.get_my_role()
+            bal  = self._tui_timed_call("wallet_balance", n.storage.get_balance, n.wallet.address)
+            role = self._tui_timed_call("wallet_role", n.roles.get_my_role)
         except Exception:
             bal, role = 0.0, None
         staked_amt = float(role['stake']) if role and role.get('role') in ('miner', 'investor') else 0.0
@@ -911,8 +943,10 @@ class CLI:
         pending_xfer_vsd = 0.0
         pending_fee_vsd = 0.0
         try:
-            p_reg_sat, p_xfer_sat, p_fee_sat = \
-                n.blockchain.mempool.pending_outflow_sat(n.wallet.address)
+            p_reg_sat, p_xfer_sat, p_fee_sat = self._tui_timed_call(
+                "wallet_pending_outflow", n.blockchain.mempool.pending_outflow_sat,
+                n.wallet.address,
+            )
             pending_reg_vsd  = from_satoshi(p_reg_sat)
             pending_xfer_vsd = from_satoshi(p_xfer_sat)
             pending_fee_vsd  = from_satoshi(p_fee_sat)
@@ -950,7 +984,10 @@ class CLI:
         # Pull last ~10 txs involving this wallet from storage.
         txs = []
         try:
-            txs = n.storage.get_address_txs(n.wallet.address)[:10]
+            txs = self._tui_timed_call(
+                "wallet_recent_transactions", n.storage.get_address_txs,
+                n.wallet.address,
+            )[:10]
         except Exception:
             txs = []
         if not txs:
@@ -977,10 +1014,14 @@ class CLI:
         W = self._layout["W"]
         emit(f"  {clr('─' * max(10, W - 4), DIM)}")
         try:
-            ms   = n.mining.status()
-            diff = n.blockchain.get_difficulty()
-            ht   = n.blockchain.height()
-            mpl  = n.blockchain.mempool.size()
+            ms   = self._tui_timed_call("mining_tab_status", n.mining.status)
+            diff = ms.get("difficulty")
+            if diff is None:
+                diff = self._tui_timed_call("mining_tab_difficulty", n.blockchain.get_difficulty)
+            ht = ms.get("chain_height")
+            if ht is None:
+                ht = self._tui_timed_call("mining_tab_height", n.blockchain.height)
+            mpl  = self._tui_timed_call("mining_tab_mempool_size", n.blockchain.mempool.size)
         except Exception:
             return
         status_str = clr(" ● RUNNING ", GREEN) if ms.get('running') else clr(" ○ STOPPED ", RED)
@@ -1004,7 +1045,7 @@ class CLI:
                              "Difficulty:", f"{diff:.6f}{_boot_tag2}", W=W))
         self._row_balance = get_row()
         emit(self._live_line("Mempool  :", f"{mpl} TXs",
-                             "Chain Ht :", str(ms.get('chain_height', ht)), W=W))
+                             "Chain Ht :", str(ht), W=W))
         emit()
         # Backend specifics if present
         backend = ms.get('backend', 'CPU')
@@ -1036,7 +1077,10 @@ class CLI:
             emit(clr("  (no peers connected — use [4] Add Peer or [29] Network Directory)", DIM))
         else:
             try:
-                dir_rows = n.network.get_network_directory(refresh_sources=False)
+                dir_rows = self._tui_timed_call(
+                    "nodes_network_directory", n.network.get_network_directory,
+                    refresh_sources=False,
+                )
                 by_id = {str(row.get("peer_id", "")): row for row in dir_rows}
             except Exception:
                 by_id = {}
@@ -1169,13 +1213,17 @@ class CLI:
         if not self._ansi_ok():
             n = self.node
             try:
-                ms    = n.mining.status()
-                bal   = n.storage.get_balance(n.wallet.address)
-                role  = n.roles.get_my_role()
-                peers = len(n.network.active_peer_count())
-                diff  = n.blockchain.get_difficulty()
-                ht    = n.blockchain.height()
-                mplen = n.blockchain.mempool.size()
+                ms    = self._tui_timed_call("plain_mining_status", n.mining.status)
+                bal   = self._tui_timed_call("plain_balance", n.storage.get_balance, n.wallet.address)
+                role  = self._tui_timed_call("plain_role", n.roles.get_my_role)
+                peers = len(self._tui_timed_call("plain_active_peers", n.network.active_peer_count))
+                diff  = ms.get("difficulty")
+                if diff is None:
+                    diff = self._tui_timed_call("plain_difficulty", n.blockchain.get_difficulty)
+                ht = ms.get("chain_height")
+                if ht is None:
+                    ht = self._tui_timed_call("plain_height", n.blockchain.height)
+                mplen = self._tui_timed_call("plain_mempool_size", n.blockchain.mempool.size)
             except Exception:
                 return
             tab_name = self._TABS[self._tab][0] if 0 <= self._tab < len(self._TABS) else 'Dashboard'
@@ -1276,7 +1324,7 @@ class CLI:
         stays clean.
         """
         n = self.node
-        if n is None:
+        if n is None or self._refresh_stop.is_set():
             return
         if not self._ansi_ok():
             return   # no live refresh on piped / dumb output
@@ -1291,13 +1339,33 @@ class CLI:
         # ── Stat rows ──────────────────────────────────────────────────────────
         if update_stats:
             try:
-                ms    = n.mining.status()
-                bal   = n.storage.get_balance(n.wallet.address)
-                role  = n.roles.get_my_role()
-                peers = len(n.network.active_peer_count())
-                diff  = n.blockchain.get_difficulty()
-                ht    = n.blockchain.height()
-                mplen = n.blockchain.mempool.size()
+                ms = self._tui_timed_call("live_mining_status", n.mining.status)
+                if self._refresh_stop.is_set():
+                    return
+                bal = self._tui_timed_call("live_balance", n.storage.get_balance, n.wallet.address)
+                if self._refresh_stop.is_set():
+                    return
+                role = self._tui_timed_call("live_role", n.roles.get_my_role)
+                if self._refresh_stop.is_set():
+                    return
+                peers = len(self._tui_timed_call("live_active_peers", n.network.active_peer_count))
+                if self._refresh_stop.is_set():
+                    return
+                # These fields were already sampled by MiningEngine.status().
+                # Avoid redundant blockchain lock/DB reads on the refresh path.
+                diff = ms.get("difficulty")
+                if diff is None:
+                    diff = self._tui_timed_call("live_difficulty", n.blockchain.get_difficulty)
+                if self._refresh_stop.is_set():
+                    return
+                ht = ms.get("chain_height")
+                if ht is None:
+                    ht = self._tui_timed_call("live_height", n.blockchain.height)
+                if self._refresh_stop.is_set():
+                    return
+                mplen = self._tui_timed_call("live_mempool_size", n.blockchain.mempool.size)
+                if self._refresh_stop.is_set():
+                    return
             except Exception:
                 return   # tolerate transient errors during node shutdown
 
@@ -1397,7 +1465,12 @@ class CLI:
             raise
 
     def _stop_refresh_thread(self) -> None:
-        """Signal the refresh thread to stop and wait up to two seconds."""
+        """Signal the refresh thread and wait briefly without blocking menu input.
+
+        The worker checks the stop event between each live-stat query and before
+        terminal output. Keep its reference if this bounded join expires so a
+        new refresh generation cannot overlap it.
+        """
         self._refresh_stop.set()
         thread = self._refresh_thread
         if thread is None:
@@ -1406,7 +1479,7 @@ class CLI:
             # A thread cannot join itself.  Keep the reference so a later
             # caller can observe its termination.
             return
-        thread.join(timeout=2.0)
+        thread.join(timeout=0.10)
         # If the join timed out, retain the reference.  The start method will
         # refuse to create another worker until this one has actually exited.
         if not thread.is_alive() and self._refresh_thread is thread:
@@ -2002,11 +2075,25 @@ class CLI:
                                     → re-render → restart refresh.
         6. On exit                — leave alternate-screen buffer.
         """
+        def _record_slow_tui_stage(stage: str, started_at: float) -> None:
+            # Record only slow stages to keep diagnostics low-overhead.  The
+            # input logger never records the actual key/command entered.
+            elapsed_ms = (time.monotonic() - started_at) * 1000.0
+            if elapsed_ms >= 100.0:
+                INPUT_DIAG.event(
+                    "tui_stage_slow", stage=stage,
+                    elapsed_ms=round(elapsed_ms, 2),
+                )
+
         self._enter_alt_screen()
         try:
+            _stage_start = time.monotonic()
             self._full_render()
+            _record_slow_tui_stage("initial_full_render", _stage_start)
             if self._ansi_ok():
+                _stage_start = time.monotonic()
                 self._start_refresh_thread()
+                _record_slow_tui_stage("start_refresh_thread", _stage_start)
             while self._running:
                 INPUT_DIAG.event("main_menu_wait_start", ui_lock_locked=self._ui_lock.locked(),
                                  refresh_thread_alive=bool(self._refresh_thread and self._refresh_thread.is_alive()))
@@ -2037,9 +2124,12 @@ class CLI:
                     continue
                 INPUT_DIAG.event("main_menu_input_returned", input_length=len(choice),
                                  refresh_stop_set=self._refresh_stop.is_set())
+                _stage_start = time.monotonic()
                 self._stop_refresh_thread()
+                _record_slow_tui_stage("stop_refresh_thread", _stage_start)
                 INPUT_DIAG.event("main_menu_dispatch_start", input_length=len(choice))
                 # Terminal hygiene — only emit ANSI if TTY; otherwise just a newline.
+                _stage_start = time.monotonic()
                 if self._ansi_ok():
                     sys.stdout.write('\033[?25h\033[0m\033[9999;1H')
                     sys.stdout.flush()
@@ -2049,9 +2139,11 @@ class CLI:
                 else:
                     print()
                     _flush_log_queue()
+                _record_slow_tui_stage("terminal_cleanup_and_log_drain", _stage_start)
                 activity_id = INPUT_DIAG.begin_activity("menu_dispatch")
                 INPUT_DIAG.update(activity_id, state="dispatching_menu_action")
                 activity_status = "returned"
+                _stage_start = time.monotonic()
                 try:
                     self._dispatch(choice)
                 except BaseException as exc:
@@ -2062,10 +2154,15 @@ class CLI:
                 finally:
                     INPUT_DIAG.finish_activity(activity_id, activity_status, running=self._running)
                     INPUT_DIAG.event("main_menu_dispatch_finished", running=self._running)
+                    _record_slow_tui_stage("dispatch_including_handler_prompts", _stage_start)
                 if self._running:
+                    _stage_start = time.monotonic()
                     self._full_render()
+                    _record_slow_tui_stage("post_input_full_render", _stage_start)
                     if self._ansi_ok():
+                        _stage_start = time.monotonic()
                         self._start_refresh_thread()
+                        _record_slow_tui_stage("restart_refresh_thread", _stage_start)
         finally:
             self._stop_refresh_thread()
             self._leave_alt_screen()

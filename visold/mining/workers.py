@@ -28,6 +28,14 @@ import threading
 from visold.kernel.compat import cython
 
 
+# Cooperative scheduling for the CPU miner. Check cheaply every 1024 hashes,
+# but yield only after a bounded uninterrupted wall-clock interval. This avoids
+# paying thousands of sleep(0) calls/second on fast devices while allowing the
+# CLI/TUI and networking threads to run promptly even in Cython-compiled builds.
+_COOPERATIVE_YIELD_CHECK_MASK = 0x3FF
+_COOPERATIVE_YIELD_INTERVAL_SECONDS = 0.010
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 14A: PARALLEL MINING ENGINE  (CPU multi-thread + GPU CUDA / OpenCL)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,6 +179,11 @@ def _cy_mine_worker(fmt_template: str,
     import hashlib as _hl, time as _t
 
     REFRESH  = 50_000          # re-read wall-clock every 50 k hashes
+    # Do not let a long-running CPU worker monopolize an interpreter/native
+    # execution slice. `time.sleep(0)` is a cooperative scheduler/GIL yield,
+    # not a timed pause. The cheap counter check runs every 1024 hashes; actual
+    # yields are time-bounded to avoid excessive overhead on fast devices.
+    _last_cooperative_yield = _t.perf_counter()
     nonce    = nonce_start
     step_c   = nonce_step
     local_ts = initial_ts
@@ -221,6 +234,17 @@ def _cy_mine_worker(fmt_template: str,
 
         nonce += step_c
         tick  += 1
+
+        # A CPU miner must not starve unrelated application threads while
+        # hashing continuously, especially when the hashrate governor is
+        # unthrottled (in that case the normal throttle path does not sleep).
+        # Check wall time only once per 1024 hashes and yield when 10 ms elapsed.
+        if (tick & _COOPERATIVE_YIELD_CHECK_MASK) == 0:
+            _yield_now = _t.perf_counter()
+            if (_yield_now - _last_cooperative_yield
+                    >= _COOPERATIVE_YIELD_INTERVAL_SECONDS):
+                _t.sleep(0)
+                _last_cooperative_yield = _t.perf_counter()
 
         # Flush calibration telemetry independently of the throttle batch size.
         # Otherwise a slow/low-power device might need to hash 1024 nonces

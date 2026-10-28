@@ -134,3 +134,60 @@ def test_option_29_remains_visible_in_narrow_mobile_layout():
     assert "NETWORK-WIDE NODE DIRECTORY" in joined
     assert "Network-wide Node Directory" in joined
     assert any("Network-wide Node Directory" in line for line in lines)
+
+
+def test_mining_tab_reuses_chain_snapshot_from_mining_status():
+    """The foreground mining page must not repeat difficulty/height reads."""
+    cli = CLI()
+    cli._layout = {"W": 80}
+    rendered = []
+    row = [0]
+
+    def emit(line=""):
+        rendered.append(line)
+
+    def get_row():
+        value = row[0]
+        row[0] += 1
+        return value
+
+    class Mining:
+        @staticmethod
+        def status():
+            return {
+                "running": True,
+                "paused": False,
+                "hashrate": "123 H/s",
+                "blocks_found": 2,
+                "backend": "CPU",
+                "difficulty": 3.25,
+                "chain_height": 42,
+            }
+
+    class Mempool:
+        @staticmethod
+        def size():
+            return 7
+
+    class Blockchain:
+        mempool = Mempool()
+
+        @staticmethod
+        def get_difficulty():
+            raise AssertionError("difficulty was redundantly queried")
+
+        @staticmethod
+        def height():
+            raise AssertionError("height was redundantly queried")
+
+    class Node:
+        mining = Mining()
+        blockchain = Blockchain()
+
+    cli.node = Node()
+    cli._render_tab_mining(emit, get_row)
+
+    joined = "\n".join(rendered)
+    assert "3.250000" in joined
+    assert "42" in joined
+    assert "7 TXs" in joined

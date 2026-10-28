@@ -468,8 +468,18 @@ class MiningEngine:
                 # prewarm is stale and _consume_prewarm() discards it.
                 alpha = (tip.block_hash if tip is not None else "genesis").encode()
                 vrf_proof, vrf_beta = vrf_prove(self.wallet.priv, alpha)
+                _candidate_started = time.perf_counter()
                 candidate = self.consensus.build_candidate_block(
                     self.wallet.address, vrf_proof.hex(), vrf_beta.hex())
+                _candidate_elapsed_ms = (time.perf_counter() - _candidate_started) * 1000.0
+                if _candidate_elapsed_ms >= 1000.0:
+                    # A slow prewarm build can contend with a foreground TUI
+                    # render for chain/state locks. Log duration only; do not
+                    # alter candidate timing or mining behavior.
+                    log.info(
+                        "[MiningPrewarm] candidate_build_slow "
+                        f"elapsed_ms={_candidate_elapsed_ms:.1f} height={tip_height + 1}"
+                    )
 
                 # Store only if it still matches the observed tip height + 1.
                 # (A race with apply_block could have advanced the tip while
