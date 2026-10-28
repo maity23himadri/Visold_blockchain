@@ -281,11 +281,12 @@ class RollingWindowPruner:
         Prune old canonical block bodies without ever deleting a transaction
         projection before its authoritative block body has been compacted.
 
-        SQLite mode keeps the entire operation in one local transaction.
-        LevelDB/RocksDB and PGX modes use their canonical KV/RocksDB block store
-        directly; the auxiliary SQLite database is only a shadow/archive store.
-        Cross-store paths deliberately fail closed if canonical compaction or
-        projection cleanup cannot be completed.
+        SQLite mode commits each successfully pruned block as one local
+        transaction, allowing a later block's archive failure to stop the pass
+        without undoing already-accounted earlier blocks. LevelDB/RocksDB and PGX
+        modes use their canonical KV/RocksDB block store directly; the auxiliary
+        SQLite database is only a shadow/archive store. Cross-store paths fail
+        closed if required archival or canonical compaction cannot complete.
         """
         cutoff = self._recoverability_aligned_cutoff(current_height)
         if cutoff <= 0:
@@ -341,7 +342,8 @@ class RollingWindowPruner:
         # backwards and could weaken rollback protection.
 
         # SQLite's canonical body lives in the same connection that also stores
-        # transaction metadata.  Keep those changes ACID in one transaction.
+        # transaction metadata. Each individual block's archive, compaction and
+        # projection deletion are committed together as one ACID unit.
         is_sqlite_canonical = bool(
             not getattr(self._storage, "_pgx_enabled", False)
             and not getattr(getattr(self._storage, "_block_db", None), "enabled", False)
@@ -482,10 +484,13 @@ class RollingWindowPruner:
                     header["bootstrap_commitment"] = _bootstrap_meta
 
                 # ── Archive before any irreversible transaction deletion ────
-                # For PGX/KV the archive lives in auxiliary SQLite, while the
-                # transaction projection may live elsewhere.  Commit the archive
-                # first so a later PG/KV cleanup failure can never lose the only
-                # preserved copy of a critical transaction.
+                # An archive write failure is a hard stop for this block.  The
+                # containing block body and transaction projections are the last
+                # recoverable copies until every required archive row is durable.
+                # For SQLite, commit each successfully pruned block separately so
+                # rolling back a failed later block does not undo earlier work
+                # while leaving ``pruned``/watermark counters claiming it did.
+                archive_failed = False
                 if not already_pruned:
                     block_ts = int(full.get("timestamp", 0) or 0)
                     for tx in full.get("transactions", []) or []:
@@ -504,9 +509,9 @@ class RollingWindowPruner:
                             ))
                             if not (is_contract or is_large or is_system or is_self):
                                 continue
-                            tx_hash = tx.get("tx_id") or ""
+                            tx_hash = str(tx.get("tx_id") or "")
                             if not tx_hash:
-                                continue
+                                raise ValueError("archive-eligible transaction has no tx_id")
                             sender = tx.get("sender") or ""
                             receiver = tx.get("receiver") or ""
                             tx_ts = int(tx.get("timestamp") or block_ts)
@@ -529,9 +534,24 @@ class RollingWindowPruner:
                             )
                             archived += c.execute("SELECT changes()").fetchone()[0]
                         except Exception as arc_exc:
-                            log.debug(
-                                "RollingWindowPruner: archive error block=%d tx=%s: %s",
+                            archive_failed = True
+                            log.warning(
+                                "RollingWindowPruner: required archive failed for "
+                                "block=%d tx=%s; retaining canonical body and "
+                                "transaction projection: %s",
                                 idx, tx.get("tx_id", "?"), arc_exc)
+                            break
+
+                if archive_failed:
+                    # Discard any partial archive rows for this block.  Previous
+                    # SQLite blocks have already been committed one-by-one; for
+                    # cross-store backends the current block's aux-SQLite archive
+                    # has not yet been committed.  In either case, do not compact.
+                    try:
+                        c.rollback()
+                    except Exception:
+                        pass
+                    break
 
                 if not is_sqlite_canonical and not already_pruned:
                     # Commit archive rows before touching the canonical KV body.
@@ -622,14 +642,24 @@ class RollingWindowPruner:
                         (slim_json, idx),
                     )
                     c.commit()
+                else:
+                    # Isolate each canonical SQLite block as one transaction.
+                    # A failure on the next block can then roll back only that
+                    # block while the contiguous watermark still matches disk.
+                    try:
+                        c.commit()
+                    except Exception as commit_exc:
+                        try:
+                            c.rollback()
+                        except Exception:
+                            pass
+                        log.warning(
+                            "RollingWindowPruner: commit failed for block=%d; "
+                            "retaining it for retry: %s", idx, commit_exc)
+                        break
 
                 pruned += 1
                 contiguous = idx + 1
-
-            # SQLite mode has not committed the batch yet; commit only the work
-            # that made it through the canonical + transaction-delete sequence.
-            if is_sqlite_canonical and pruned:
-                c.commit()
 
             # Advance the watermark only through successfully compacted heights.
             # Do not jump to ``cutoff`` when the configured batch only handled a

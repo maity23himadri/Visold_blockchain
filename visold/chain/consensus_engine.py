@@ -394,17 +394,28 @@ class ConsensusEngine:
         if not self._is_canonical(block):
             return False, "block is not canonical; no finalization"
 
-        # ── Detect consensus mode based on live validator set ─────────────────
-        validators      = self.blockchain.storage.get_all_by_role("investor")
-        total_stake     = sum(v["stake"] for v in validators) if validators else 0
+        # ── Detect consensus mode from the block-height validator snapshot ──
+        # The live role table is post-application state and already includes
+        # REGISTER transactions from this block. Using it here would let a new
+        # investor vote on the very block that registers it (registration is
+        # effective starting at N+1). Never substitute today's role table when
+        # the historical snapshot cannot be established safely.
+        validators = self.blockchain.get_validator_set_for_block(block)
+        if validators is None:
+            log.warning(
+                "Block #%s finalization deferred: eligible validator snapshot unavailable",
+                block.index)
+            return False, "eligible validator snapshot unavailable; refusing BFT vote"
+        total_stake_sat = sum(int(v["stake_sat"]) for v in validators)
         validator_count = len(validators)
+        eligible_addresses = {str(v["address"]) for v in validators}
 
         # F-09 FIX: Require MIN_VALIDATORS_FOR_BFT validators before BFT mode
         # is considered active.  Below this threshold the network uses PoW-only
         # finality — a pure-PoW bootstrap window is inherently more vulnerable
         # to 51% attacks, so we apply a deeper confirmation depth as compensation.
         bft_active = (validator_count >= Config.MIN_VALIDATORS_FOR_BFT
-                      and total_stake > 0)
+                      and total_stake_sat > 0)
 
         if not bft_active:
             # ── Bootstrap / PoW-only mode ─────────────────────────────────────
@@ -423,8 +434,7 @@ class ConsensusEngine:
                           f"(no validators, finalized by depth)")
         else:
             # ── Full hybrid mode (PoW + PoS + BFT) ───────────────────────────
-            role = self.blockchain.storage.get_role(self.wallet.address)
-            if role and role["role"] == "investor":
+            if self.wallet.address in eligible_addresses:
                 # This node is a registered validator — cast a BFT vote.
                 try:
                     sig     = self.wallet.sign(block.block_hash.encode())
@@ -450,7 +460,7 @@ class ConsensusEngine:
                     log.info(
                         f"Block #{block.index}: BFT vote cast "
                         f"(validators={validator_count}, "
-                        f"total_stake={total_stake} sat)"
+                        f"total_stake={total_stake_sat} sat)"
                     )
                 except Exception as e:
                     log.warning(f"Block #{block.index}: BFT vote failed: {e}")
@@ -458,7 +468,7 @@ class ConsensusEngine:
                 log.debug(
                     f"Block #{block.index}: pending BFT finality "
                     f"({validator_count} validators, "
-                    f"total_stake={total_stake} sat)"
+                    f"total_stake={total_stake_sat} sat)"
                 )
 
 

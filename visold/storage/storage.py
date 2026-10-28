@@ -2110,6 +2110,9 @@ class Storage:
                                 await c.execute(
                                     "DELETE FROM node_meta WHERE key=$1",
                                     f"block_role_undo:{idx}")
+                                await c.execute(
+                                    "DELETE FROM node_meta WHERE key=$1",
+                                    f"bft_validator_snapshot:{idx}")
                     self._pg.run(_cleanup_pgx())
                 except Exception as exc:
                     # Do not silently claim rollback succeeded when the PG
@@ -2127,6 +2130,8 @@ class Storage:
                                   f"block_apply:{idx}")
                     self._pg_exec("DELETE FROM node_meta WHERE key=$1",
                                   f"block_role_undo:{idx}")
+                    self._pg_exec("DELETE FROM node_meta WHERE key=$1",
+                                  f"bft_validator_snapshot:{idx}")
                 except Exception as exc:
                     log.error(
                         "delete_block(%d): PG transaction cleanup failed: %s",
@@ -2150,6 +2155,8 @@ class Storage:
                               (f"block_apply:{idx}",))
                     c.execute("DELETE FROM node_meta WHERE key=?",
                               (f"block_role_undo:{idx}",))
+                    c.execute("DELETE FROM node_meta WHERE key=?",
+                              (f"bft_validator_snapshot:{idx}",))
                     c.commit()
             except Exception as exc:
                 if c is not None:
@@ -2187,6 +2194,7 @@ class Storage:
             c.execute("DELETE FROM blocks WHERE idx=?", (idx,))
             c.execute("DELETE FROM node_meta WHERE key=?", (f"block_apply:{idx}",))
             c.execute("DELETE FROM node_meta WHERE key=?", (f"block_role_undo:{idx}",))
+            c.execute("DELETE FROM node_meta WHERE key=?", (f"bft_validator_snapshot:{idx}",))
             if rollback_ids:
                 c.executemany(
                     "DELETE FROM tx_replay_guard WHERE tx_id=?",
@@ -2852,6 +2860,31 @@ class Storage:
         rows = self._conn().execute(
             "SELECT * FROM roles WHERE role=? AND slashed=0", (role,)).fetchall()
         return [dict(r) for r in rows]
+
+    def get_all_roles(self) -> List[dict]:
+        """Return every role row, including inactive and slashed records.
+
+        This is intentionally distinct from ``get_all_by_role`` (which
+        returns only active, non-slashed rows).  Historical validator-set
+        reconstruction must fail closed when a later slash makes the old
+        validator set ambiguous; silently treating the slashed record as if
+        it never existed can produce a different quorum denominator.
+        """
+        if self._pgx_enabled:
+            rows = self._pg_fetch(
+                """SELECT address, role, stake_sat AS stake, score,
+                          (CASE WHEN slashed THEN 1 ELSE 0 END) AS slashed,
+                          registered_at
+                     FROM validators ORDER BY address ASC""", [])
+            out = []
+            for row in rows:
+                item = dict(row)
+                item["stake"] = from_satoshi(int(item.get("stake", 0)))
+                out.append(item)
+            return out
+        rows = self._conn().execute(
+            "SELECT * FROM roles ORDER BY address ASC").fetchall()
+        return [dict(row) for row in rows]
 
     def slash(self, address: str):
         r = self.get_role(address)
@@ -4702,6 +4735,91 @@ class Storage:
             (key, value))
         self._conn().commit()
 
+    def restore_meta_values(self, values: Dict[str, Optional[str]]) -> None:
+        """Atomically restore node_meta values, deleting keys recorded as absent.
+
+        This is used by durable recovery journals.  Unlike ``set_meta_batch``,
+        a ``None`` value means that a key did not exist before the interrupted
+        operation and must be removed during rollback.
+        """
+        if not values:
+            return
+        if self._pgx_enabled:
+            async def _restore(conn, *, use_tx: bool):
+                if use_tx:
+                    async with conn.transaction():
+                        for key, value in values.items():
+                            if value is None:
+                                await conn.execute("DELETE FROM node_meta WHERE key=$1", key)
+                            else:
+                                await conn.execute(
+                                    "INSERT INTO node_meta (key,value) VALUES ($1,$2) "
+                                    "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                                    key, str(value))
+                else:
+                    for key, value in values.items():
+                        if value is None:
+                            await conn.execute("DELETE FROM node_meta WHERE key=$1", key)
+                        else:
+                            await conn.execute(
+                                "INSERT INTO node_meta (key,value) VALUES ($1,$2) "
+                                "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                                key, str(value))
+            active = self._pgx_active_conn()
+            if active is not None:
+                self._pg.run(_restore(active, use_tx=False))
+            else:
+                async def _tx():
+                    async with self._pg._pool.acquire() as conn:
+                        await _restore(conn, use_tx=True)
+                self._pg.run(_tx())
+            # Keep the SQLite mirror best-effort and non-authoritative in PGX.
+            try:
+                with self._aux_lock:
+                    c = self._conn()
+                    c.execute("BEGIN")
+                    for key, value in values.items():
+                        if value is None:
+                            c.execute("DELETE FROM node_meta WHERE key=?", (key,))
+                        else:
+                            c.execute(
+                                "INSERT OR REPLACE INTO node_meta (key,value) VALUES (?,?)",
+                                (key, str(value)))
+                    c.commit()
+            except Exception:
+                try:
+                    self._conn().rollback()
+                except Exception:
+                    pass
+            return
+
+        c = self._conn()
+        with self._sqlite_api_lock:
+            if c.atomic_active():
+                raise RuntimeError("cannot restore node_meta during another SQLite atomic block")
+            # A failed SQLite statement (for example an injected trigger or a
+            # constraint/storage error in set_meta) may leave the connection in
+            # an implicit transaction. Clear that failed statement's transaction
+            # before starting the all-or-nothing recovery metadata transaction.
+            # The project connection wrapper does not expose sqlite3's
+            # in_transaction property on every backend/version. Roll back
+            # unconditionally (after the atomic-owner guard) to clear any
+            # implicit transaction left by the failed operation.
+            c.rollback()
+            c.execute("BEGIN")
+            try:
+                for key, value in values.items():
+                    if value is None:
+                        c.execute("DELETE FROM node_meta WHERE key=?", (key,))
+                    else:
+                        c.execute(
+                            "INSERT OR REPLACE INTO node_meta (key,value) VALUES (?,?)",
+                            (key, str(value)))
+                c.commit()
+            except Exception:
+                c.rollback()
+                raise
+
     # ╔════════════════════════════════════════════════════════════════════════╗
     # ║  PRUNING                                                               ║
     # ╚════════════════════════════════════════════════════════════════════════╝
@@ -4976,18 +5094,36 @@ class Storage:
         contract_code = payload.get("contract_code", {}) or {}
         contract_storage = payload.get("contract_storage", {}) or {}
         contract_storage_tags = payload.get("contract_storage_tags", {}) or {}
+        recovery_contract_accounts = payload.get("recovery_contract_accounts")
+        recovery_contract_code = payload.get("recovery_contract_code")
+        recovery_contract_storage = payload.get("recovery_contract_storage")
+        recovery_contract_storage_tags = payload.get("recovery_contract_storage_tags")
+        contract_accounts_to_restore = (
+            recovery_contract_accounts if isinstance(recovery_contract_accounts, dict)
+            else contracts)
+        contract_storage_to_restore = (
+            recovery_contract_storage if isinstance(recovery_contract_storage, dict)
+            else contract_storage)
+        contract_storage_tags_to_restore = (
+            recovery_contract_storage_tags
+            if isinstance(recovery_contract_storage_tags, dict)
+            else contract_storage_tags)
 
         # Typed-storage metadata is state belonging to an existing contract.
         # Reject orphan tag entries instead of restoring them into RocksDB: an
         # attacker-supplied snapshot must not be able to plant hidden metadata
         # at an address which may only become a contract later.
-        contract_addr_set = {str(a) for a in contracts}
-        for addr in contract_storage_tags:
+        contract_addr_set = {str(a) for a in contract_accounts_to_restore}
+        tags_to_validate = contract_storage_tags_to_restore
+        for addr in tags_to_validate:
             if str(addr) not in contract_addr_set:
                 raise ValueError(f"contract_storage_tags contains unknown contract {addr}")
 
+        code_payload = (
+            recovery_contract_code if isinstance(recovery_contract_code, dict)
+            else contract_code)
         normalized_code = {}
-        for code_hash, code_hex in contract_code.items():
+        for code_hash, code_hex in code_payload.items():
             try:
                 normalized_code[str(code_hash)] = bytes.fromhex(str(code_hex))
             except ValueError as exc:
@@ -4997,7 +5133,15 @@ class Storage:
 
         # Never restore a contract account whose authenticated bytecode or
         # storage commitment cannot be reconstructed from the supplied state.
-        for addr, ct in contracts.items():
+        for addr, ct in contract_accounts_to_restore.items():
+            if not isinstance(ct, dict):
+                raise ValueError(f"contract account metadata for {addr} must be an object")
+            # Destroyed-contract tombstones are present only in a local recovery
+            # journal, not an authenticated peer snapshot. Preserve them byte-for-
+            # byte during rollback without requiring their deliberately inactive
+            # code/storage commitment to satisfy live-contract invariants.
+            if int(ct.get("destroyed", 0)):
+                continue
             code_hash = str(ct.get("code_hash", ""))
             if code_hash:
                 code = normalized_code.get(code_hash)
@@ -5005,10 +5149,10 @@ class Storage:
                     raise ValueError(f"missing bytecode for contract {addr}")
                 if __import__("hashlib").sha256(code).hexdigest() != code_hash:
                     raise ValueError(f"bytecode hash mismatch for contract {addr}")
-            slots = contract_storage.get(addr, {})
+            slots = contract_storage_to_restore.get(addr, {})
             if not isinstance(slots, dict):
                 raise ValueError(f"contract_storage[{addr}] must be an object")
-            tags = contract_storage_tags.get(addr, {})
+            tags = contract_storage_tags_to_restore.get(addr, {})
             if not isinstance(tags, dict):
                 raise ValueError(f"contract_storage_tags[{addr}] must be an object")
             for _slot, _tag in tags.items():
@@ -5044,13 +5188,13 @@ class Storage:
             self._rocks.clear_all_contract_storage(batch)
             for code_hash, bytecode in normalized_code.items():
                 self._rocks.put_contract_code(batch, code_hash, bytecode)
-            for addr, slots in contract_storage.items():
+            for addr, slots in contract_storage_to_restore.items():
                 if not isinstance(slots, dict):
                     raise ValueError(f"contract_storage[{addr}] must be an object")
                 for slot, value in slots.items():
                     self._rocks.put_cstorage(
                         batch, str(addr), str(slot), str(value).encode("ascii"))
-            for addr, tags in contract_storage_tags.items():
+            for addr, tags in contract_storage_tags_to_restore.items():
                 if not isinstance(tags, dict):
                     raise ValueError(f"contract_storage_tags[{addr}] must be an object")
                 for slot, tag in tags.items():
@@ -5078,18 +5222,18 @@ class Storage:
                                 "ON CONFLICT (address) DO UPDATE "
                                 "SET nonce=EXCLUDED.nonce",
                                 [(a, n) for a, n in nonces.items()])
-                        if contracts:
+                        if contract_accounts_to_restore:
                             await c.executemany(
                                 "INSERT INTO contract_accounts "
                                 "(address,code_hash,storage_root,nonce,creator,"
                                 "created_at,destroyed,contract_name) "
-                                "VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7)",
+                                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
                                 [(
                                     str(a), ct.get("code_hash", ""),
                                     ct.get("storage_root", ""), int(ct.get("nonce", 0)),
                                     ct.get("creator", ""), int(ct.get("created_at", 0)),
-                                    ct.get("name", ""),
-                                ) for a, ct in contracts.items()])
+                                    bool(int(ct.get("destroyed", 0))), ct.get("name", ""),
+                                ) for a, ct in contract_accounts_to_restore.items()])
                         if roles:
                             await c.executemany(
                                 "INSERT INTO validators "
@@ -5167,13 +5311,13 @@ class Storage:
                 c.executemany(
                     "INSERT INTO contract_accounts "
                     "(address,code_hash,storage_root,nonce,creator,created_at,"
-                    "contract_name,destroyed) VALUES (?,?,?,?,?,?,?,0)",
+                    "contract_name,destroyed) VALUES (?,?,?,?,?,?,?,?)",
                     [(
                         str(a), ct.get("code_hash", ""),
                         ct.get("storage_root", ""), int(ct.get("nonce", 0)),
                         ct.get("creator", ""), int(ct.get("created_at", 0)),
-                        ct.get("name", ""),
-                    ) for a, ct in contracts.items()])
+                        ct.get("name", ""), int(ct.get("destroyed", 0)),
+                    ) for a, ct in contract_accounts_to_restore.items()])
                 c.executemany(
                     "INSERT INTO roles "
                     "(address,role,stake,score,slashed,registered_at) "
@@ -5225,7 +5369,7 @@ class Storage:
                     "VALUES (?,?,?)",
                     [
                         (str(addr), str(slot), str(value))
-                        for addr, slots in contract_storage.items()
+                        for addr, slots in contract_storage_to_restore.items()
                         for slot, value in (slots.items() if isinstance(slots, dict) else [])
                     ])
                 c.executemany(
@@ -5233,7 +5377,7 @@ class Storage:
                     "VALUES (?,?,?)",
                     [
                         (str(addr), str(slot), int(tag))
-                        for addr, tags in contract_storage_tags.items()
+                        for addr, tags in contract_storage_tags_to_restore.items()
                         for slot, tag in (tags.items() if isinstance(tags, dict) else [])
                     ])
                 c.commit()
@@ -5519,6 +5663,103 @@ class Storage:
             return out
         except Exception:
             return None
+
+    # ── durable pre-block BFT validator snapshots ──────────────────────────
+    def record_block_validator_snapshot(self, height: int, block_hash: str,
+                                        validators: List[dict]) -> None:
+        """Persist the validator set eligible to vote on this exact block.
+
+        The snapshot is captured from the state *before* applying the block.
+        This matters because REGISTER transactions in block N change the live
+        role table after rewards but only activate voting eligibility at N+1.
+        The block hash is included so a reorg cannot accidentally reuse a
+        snapshot from an orphan at the same height.
+
+        ``validators`` is a sorted sequence of ``{address, stake_sat}`` rows.
+        ``set_meta`` participates in SQLite's active block transaction and in
+        the active PG transaction, so the snapshot is committed with the
+        canonical block application.
+        """
+        normalized = []
+        seen = set()
+        for item in validators or []:
+            if not isinstance(item, dict):
+                continue
+            address = str(item.get("address", ""))
+            if not address or address in seen:
+                continue
+            try:
+                stake_sat = int(item.get("stake_sat", 0))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if stake_sat < 0:
+                continue
+            seen.add(address)
+            normalized.append({"address": address, "stake_sat": stake_sat})
+        normalized.sort(key=lambda row: row["address"])
+        payload = {
+            "version": 1,
+            "height": int(height),
+            "block_hash": str(block_hash),
+            "validators": normalized,
+        }
+        self.set_meta(
+            f"bft_validator_snapshot:{int(height)}",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+
+    def get_block_validator_snapshot(self, height: int,
+                                    block_hash: str) -> Optional[List[dict]]:
+        """Return the exact eligible validator set for ``block_hash``.
+
+        ``None`` means missing, malformed, or belonging to a different fork;
+        an empty list is a valid snapshot of a height with no eligible
+        validators.  Callers must not replace a missing snapshot with the
+        current live validator table unless a safe historical reconstruction
+        succeeds.
+        """
+        raw = self.get_meta(f"bft_validator_snapshot:{int(height)}")
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw)
+            if (int(payload.get("version", 0)) != 1
+                    or int(payload.get("height", -1)) != int(height)
+                    or str(payload.get("block_hash", "")) != str(block_hash)):
+                return None
+            rows = payload.get("validators")
+            if not isinstance(rows, list):
+                return None
+            out = []
+            seen = set()
+            for item in rows:
+                if not isinstance(item, dict):
+                    return None
+                address = str(item.get("address", ""))
+                stake_sat = int(item.get("stake_sat", -1))
+                if not address or address in seen or stake_sat < 0:
+                    return None
+                seen.add(address)
+                out.append({"address": address, "stake_sat": stake_sat})
+            return sorted(out, key=lambda row: row["address"])
+        except (TypeError, ValueError, OverflowError, json.JSONDecodeError):
+            return None
+
+    def delete_block_validator_snapshot(self, height: int) -> None:
+        """Delete the validator snapshot when its canonical block is orphaned."""
+        key = f"bft_validator_snapshot:{int(height)}"
+        if self._pgx_enabled:
+            self._pg_exec("DELETE FROM node_meta WHERE key=$1", key)
+            try:
+                with self._aux_lock:
+                    self._conn().execute(
+                        "DELETE FROM node_meta WHERE key=?", (key,))
+                    self._conn().commit()
+            except Exception:
+                pass
+            return
+        self._conn().execute("DELETE FROM node_meta WHERE key=?", (key,))
+        self._conn().commit()
 
     def delete_block_role_snapshot(self, height: int) -> None:
         key = f"block_role_undo:{int(height)}"

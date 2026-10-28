@@ -104,6 +104,10 @@ class Blockchain:
         # In-memory guard closes the small window between a successful
         # apply_block() return and the caller's durable block_apply marker.
         self._applied_block_hashes: set[str] = set()
+        # Equivocation penalties/evidence discovered from embedded votes are
+        # deferred until the enclosing block transaction commits. Thread-local
+        # storage avoids mixing events from concurrent peer/apply threads.
+        self._vote_evidence_local = threading.local()
         # VSA-26: a chain whose reorg left it partially mutated refuses writes until
         # an operator repairs it and clears the persisted marker.
         self._critical_recovery: Optional[str] = (
@@ -118,6 +122,10 @@ class Blockchain:
         # _init_highest_finalized_height() below, which seeds it correctly
         # for a node restarting against an existing chain.
         self._highest_finalized_height = -1
+        # Reorg replacement blocks are tentative until the complete branch has
+        # validated.  apply_block(..., defer_finality=True) suppresses finality
+        # side effects while that tentative branch (or a rollback restoration)
+        # is being replayed; reorg() commits finality only after full success.
         self._proto_mgr     = ProtocolVersionManager(storage)
         self._eco_mon       = EconomicMonitor(storage)
         # GovernanceEngine wraps _proto_mgr and drives the upgrade lifecycle
@@ -130,6 +138,8 @@ class Blockchain:
         self._rolling_pruner   = RollingWindowPruner(storage)
         self._snapshot_engine  = StateSnapshotEngine(storage, self._rolling_pruner)
         self._rolling_pruner.set_snapshot_engine(self._snapshot_engine)
+        # SnapshotEngine may have recovered an interrupted bootstrap during init.
+        self._critical_recovery = storage.get_meta("chain_recovery_required") or None
         # Injected by VisoldNode after construction
         self._slash_evidence: Optional[Any] = None
         # ── v7.7.0 Rate defection auditor ────────────────────────────────────
@@ -188,19 +198,56 @@ class Blockchain:
         a per-reorg one. Safe to call on a fresh/empty chain (loop body
         never executes when height() < 0).
         """
+        self._recompute_highest_finalized_height()
+
+    def _recompute_highest_finalized_height(self) -> int:
+        """Rebuild the finality fence from the current canonical chain only.
+
+        This is used after a successful reorg (including the explicitly allowed
+        no-validator deep-fork path).  A monotonic in-memory max is correct
+        during ordinary extension, but not across a canonical-branch change.
+        """
         try:
-            h = self.height()
+            h = int(self.height())
             for idx in range(h, -1, -1):
                 blk = self.storage.get_block(idx)
-                if blk and blk.finalized:
+                if blk and bool(blk.finalized):
                     self._highest_finalized_height = idx
-                    return
+                    return idx
+            self._highest_finalized_height = -1
+            return -1
         except Exception as exc:
-            log.warning(
-                "_init_highest_finalized_height scan failed: %s — "
-                "starting from -1 (safe default: fence will only "
-                "protect blocks finalized from this point forward "
-                "until the next full rescan)", exc)
+            log.error(
+                "Unable to recompute finality fence from canonical chain: %s", exc)
+            raise
+
+    def _reconcile_finality_after_failed_apply(self, block: Block,
+                                               fallback_fence: int) -> None:
+        """Restore the in-memory fence after a failed/rolled-back block apply."""
+        # Avoid scanning the canonical chain on the common invalid-peer-block
+        # path; only reconcile when the failed attempt actually changed the
+        # in-memory fence. Ordinary rejection then remains O(1) in chain height.
+        if int(self._highest_finalized_height) != int(fallback_fence):
+            try:
+                self._recompute_highest_finalized_height()
+            except Exception as exc:
+                self._highest_finalized_height = int(fallback_fence)
+                log.error("Unable to reconcile finality after failed block apply: %s", exc)
+                try:
+                    self._mark_critical_recovery(
+                        f"finality fence reconciliation after failed apply failed: {exc}")
+                except Exception:
+                    pass
+        # A failed candidate is not an authoritative source of finalized=True.
+        # Preserve the object flag only if the exact block is actually present
+        # after the backend resolves the transaction outcome (including PGX's
+        # ambiguous-commit recovery path).
+        try:
+            canonical_hash = self.storage.get_block_hash(int(block.index))
+        except Exception:
+            canonical_hash = None
+        if canonical_hash != str(block.block_hash):
+            block.finalized = False
 
     def set_network(self, network: 'P2PNetwork') -> None:
         """Inject the P2PNetwork reference after both objects are created.
@@ -685,9 +732,10 @@ class Blockchain:
             # removing a transaction — breaks at least one link in this chain
             # and is rejected before any other check runs.
             #
-            # v7.5.0-OPT: pass self.mempool so Block.integrity_check() can skip
-            # ECDSA recheck for txs already validated at gossip time.  See the
-            # detailed rationale at the top of Block.integrity_check().
+            # Pass the mempool only as an exact-signature-fingerprint cache.
+            # A tx_id-only cache hit must never bypass block signature checks;
+            # Block.integrity_check() fails closed on a missing/mismatched
+            # signature-context fingerprint.
             # ═══════════════════════════════════════════════════════════════════
             # The integrity pass is the authoritative signature check for
             # this block.  Record exactly which transaction IDs were proven
@@ -1298,10 +1346,18 @@ class Blockchain:
             if tx.tx_id in seen:
                 raise CandidateTxRejected(pos, tx, "duplicate tx_id in candidate")
             seen.add(tx.tx_id)
+            # Candidate pre-checks may reuse only a fingerprint for this exact
+            # signed payload. A stale tx_id-only marker is never sufficient.
+            try:
+                _sig_payload = tx.signing_bytes(block_index)
+                _signature_cached = self.mempool.is_verified(
+                    tx.tx_id, tx=tx, signing_payload=_sig_payload)
+            except Exception:
+                _signature_cached = False
             ok, msg = tx.is_valid(
                 reference_time=block_timestamp,
                 block_height=block_index,
-                signature_already_verified=True,
+                signature_already_verified=_signature_cached,
             )
             if not ok:
                 raise CandidateTxRejected(pos, tx, f"invalid transaction: {msg}")
@@ -2269,6 +2325,22 @@ class Blockchain:
                     "Target height ({}) must be below "
                     "current tip ({}).".format(target_height, current))
 
+            # Manual rollback follows the same irreversible-finality rule as
+            # reorg(). Rebuild the fence from the actual canonical chain before
+            # any mutation; this also repairs a stale in-memory fence left by an
+            # older process version.
+            try:
+                highest_finalized = self._recompute_highest_finalized_height()
+            except Exception as exc:
+                return False, (
+                    "Rollback rejected: unable to verify canonical finality fence; "
+                    f"no state was changed ({exc}).")
+            if highest_finalized > target_height:
+                return False, (
+                    f"Rollback rejected: target height {target_height} would delete "
+                    f"finalized block #{highest_finalized}. Finalized history is "
+                    "irreversible; rollback only to the finalized height or above.")
+
             # Full transaction bodies below this watermark are not guaranteed
             # to exist after rolling pruning. Exact rollback therefore cannot be
             # performed safely; fail closed before touching any persistent state.
@@ -2442,6 +2514,14 @@ class Blockchain:
                 pass  # metadata write failure is non-fatal
 
             new_height = self.height()  # re-read from storage
+            try:
+                self._recompute_highest_finalized_height()
+            except Exception as exc:
+                self._mark_critical_recovery(
+                    f"finality fence recomputation after manual rollback failed: {exc}")
+                return False, (
+                    "Rollback changed chain state, but finality-fence reconciliation "
+                    f"failed; {self._critical_recovery}")
 
             summary = (
                 "Rollback OK: {} -> {} "
@@ -2621,7 +2701,8 @@ class Blockchain:
                     "apply_block VVM-undo: storage_root recompute failed "
                     "for %s: %s", addr, _root_e)
 
-    def apply_block(self, block: Block) -> Tuple[bool, str]:
+    def apply_block(self, block: Block, *,
+                    defer_finality: bool = False) -> Tuple[bool, str]:
         """Apply one block atomically at the persistent-storage boundary.
 
         SQLite uses one database transaction.  PGX uses a PostgreSQL
@@ -2637,53 +2718,101 @@ class Blockchain:
         # waiting for _lock here formed a circular wait.  The chain lock now spans
         # the whole atomic apply, from begin through commit.
         with self._lock:
+            if self.storage.get_meta("bootstrap_restore_in_progress"):
+                return False, (
+                    "Block rejected: authenticated bootstrap recovery is incomplete; "
+                    "restart the node to retry the durable recovery journal")
             self._reconcile_tip_marker()
             if self._critical_recovery:
                 return False, (
                     f"Block rejected: chain requires operator recovery "
                     f"({self._critical_recovery})")
-            atomic_storage = self.storage
-            if getattr(atomic_storage, "_pgx_enabled", False):
-                with atomic_storage.pgx_atomic_block() as pgx_tx:
-                    result = self._apply_block_unwrapped(block)
-                    if result[0] and pgx_tx is not None:
-                        pgx_tx["commit"] = True
-                if result[0]:
-                    self._applied_block_hashes.add(block.block_hash)
-                return result
 
-            atomic_started = False
-            atomic_storage.begin_sqlite_atomic_block()
-            atomic_started = True
+            # A top-level apply owns the deferred-equivocation queue. Nested
+            # apply calls (if any) append to the parent queue and may not flush
+            # evidence before the parent's outer transaction commits.
+            evidence_local = getattr(self, "_vote_evidence_local", None)
+            if evidence_local is None:
+                evidence_local = threading.local()
+                self._vote_evidence_local = evidence_local
+            pending = getattr(evidence_local, "pending", None)
+            owns_pending = pending is None
+            pending_start = len(pending) if pending is not None else 0
+            if owns_pending:
+                pending = []
+                pending_start = 0
+                evidence_local.pending = pending
+
+            atomic_storage = self.storage
+            result = None
+            finality_fence_before = int(self._highest_finalized_height)
             try:
-                result = self._apply_block_unwrapped(block)
-            except BaseException:
-                if atomic_started:
-                    atomic_storage.rollback_sqlite_atomic_block()
-                raise
-            if atomic_started:
-                if result[0]:
-                    # VSA-06: the in-memory applied marker is recorded only after the
-                    # atomic COMMIT has returned.  If COMMIT raises, the block is not
-                    # marked applied and a retry is applied for real.
-                    # VSA-24: the durable block_apply marker is written inside the same
-                    # atomic transaction as the block and its state changes, so a crash
-                    # cannot leave an applied block without its marker.  A duplicate
-                    # delivery is not re-marked.  If the marker cannot be written the
-                    # whole block is rolled back and the failure is propagated.
-                    try:
-                        if result[1] != BLOCK_ALREADY_APPLIED_MSG:
-                            atomic_storage.record_block_apply_result(block.index, True)
-                    except BaseException:
-                        atomic_storage.rollback_sqlite_atomic_block()
-                        raise
-                    atomic_storage.commit_sqlite_atomic_block()
-                    self._applied_block_hashes.add(block.block_hash)
+                if getattr(atomic_storage, "_pgx_enabled", False):
+                    with atomic_storage.pgx_atomic_block() as pgx_tx:
+                        result = self._apply_block_unwrapped(
+                            block, defer_finality=defer_finality)
+                        if result[0] and pgx_tx is not None:
+                            pgx_tx["commit"] = True
+                    if result[0]:
+                        self._applied_block_hashes.add(block.block_hash)
                 else:
-                    atomic_storage.rollback_sqlite_atomic_block()
+                    atomic_started = False
+                    atomic_storage.begin_sqlite_atomic_block()
+                    atomic_started = True
+                    try:
+                        result = self._apply_block_unwrapped(
+                            block, defer_finality=defer_finality)
+                    except BaseException:
+                        if atomic_started:
+                            atomic_storage.rollback_sqlite_atomic_block()
+                        raise
+                    if atomic_started:
+                        if result[0]:
+                            # VSA-06: record the applied marker only after commit;
+                            # VSA-24 keeps the durable marker in this same txn.
+                            try:
+                                if result[1] != BLOCK_ALREADY_APPLIED_MSG:
+                                    atomic_storage.record_block_apply_result(block.index, True)
+                            except BaseException:
+                                atomic_storage.rollback_sqlite_atomic_block()
+                                raise
+                            atomic_storage.commit_sqlite_atomic_block()
+                            self._applied_block_hashes.add(block.block_hash)
+                        else:
+                            atomic_storage.rollback_sqlite_atomic_block()
+            except BaseException:
+                self._reconcile_finality_after_failed_apply(
+                    block, finality_fence_before)
+                if not owns_pending:
+                    # This nested block transaction failed. Remove only the
+                    # evidence queued by this attempt; retain the parent's
+                    # earlier pending evidence for its own eventual commit.
+                    del pending[pending_start:]
+                raise
+            finally:
+                if owns_pending:
+                    try:
+                        del evidence_local.pending
+                    except AttributeError:
+                        pass
+
+            if result is not None and not result[0]:
+                # A false result means the backend transaction was rolled back;
+                # discard any tentative finality/fence side effects as well.
+                self._reconcile_finality_after_failed_apply(
+                    block, finality_fence_before)
+                if not owns_pending:
+                    del pending[pending_start:]
+
+            # Evidence/slashing effects happen only after the enclosing SQLite
+            # commit or PGX transaction has returned successfully. A rejected
+            # block's pending queue is discarded with its rolled-back DB writes.
+            if owns_pending and result is not None and result[0] and pending:
+                self._flush_vote_equivocations(pending)
             return result
 
-    def _apply_block_unwrapped(self, block: Block) -> Tuple[bool, str]:
+    def _apply_block_unwrapped(self, block: Block, *,
+                               defer_finality: bool = False) -> Tuple[bool, str]:
         with self._lock:
             # DUPLICATE-BLOCK IDEMPOTENCY FIX:
             # A peer may relay the same block more than once.  Once a block
@@ -2704,6 +2833,12 @@ class Blockchain:
             ok, msg = self.validate_block(block)
             if not ok:
                 return False, msg
+
+            # Capture the role/stake set that existed immediately BEFORE this
+            # block is applied. REGISTER changes in this block activate only at
+            # the next height, so neither embedded votes nor later-arriving
+            # votes for this block may use the post-application role table.
+            _bft_eligible_before_block = self._current_validator_snapshot()
 
             # ═══════════════════════════════════════════════════════════════════
             # GENESIS IDEMPOTENCY (v7.1.5)
@@ -3364,10 +3499,21 @@ class Blockchain:
             # batch has been flushed (inside compute_state_root → flush()).
             self.storage = _real_storage
 
-            # Check if block already achieves BFT finality via existing sigs
-            self._maybe_finalize_by_bft(block)
-            # Check PoW depth finality (fallback for no-investor networks)
-            self._maybe_finalize_by_depth(block.index)
+            # The validator eligibility snapshot is consensus-critical state.
+            # Persist it only for a successfully applied canonical block, and
+            # in the same block transaction where the backend supports it.
+            self.storage.record_block_validator_snapshot(
+                block.index, block.block_hash, _bft_eligible_before_block)
+
+            # A reorg branch is tentative until every replacement block has
+            # passed validation/application.  Do not finalize any of its
+            # blocks (or advance the irreversible fence) until reorg() commits
+            # the entire branch.  Normal block application keeps the existing
+            # BFT + PoW-depth finality flow.
+            if not defer_finality:
+                self._maybe_finalize_by_bft(
+                    block, eligible_validators=_bft_eligible_before_block)
+                self._maybe_finalize_by_depth(block.index)
 
             confirmed_ids = [tx.tx_id for tx in block.transactions]
             self.mempool.clear_confirmed(confirmed_ids)
@@ -4224,77 +4370,337 @@ class Blockchain:
         return self._event_index.get_events_by_topic(
             topic0, from_block, to_block)
 
-    def _maybe_finalize_by_bft(self, block: Block):
+    def _current_validator_snapshot(self) -> List[dict]:
+        """Return a deterministic snapshot of the active validator set.
+
+        Snapshots use integer satoshi stake and stable address ordering.  They
+        are captured before applying a block and are therefore the only safe
+        voter/quorum input for that block's embedded signatures.
         """
-        Check if block already has ≥ 2/3 weighted stake votes and mark finalized.
-
-        Consensus Fix #5: If validators exist but the threshold is not yet met,
-        the block is saved as un-finalized (pending).  It can be upgraded to
-        BFT-finalized later via add_validator_sig() when additional votes arrive
-        from the network.  The block is NEVER dropped here — only promoted.
-
-        BUG-2 FIX: stake comparison now uses the integer bft_threshold_met()
-        helper (cross-multiplication, no float division) so that two nodes
-        accumulating votes in different orders always agree on finality.
-
-        AUDIT-FIX (Batch D): this used to check only "if not validators: return"
-        (i.e. ran with validator_count >= 1), so a single registered validator
-        holding a majority of registered stake could BFT-finalize a block --
-        which reorg()'s Fix #2 fence and accept_chain()'s Case 3 guard both
-        treat as permanently, unconditionally irreversible -- during exactly
-        the bootstrap window Config.MIN_VALIDATORS_FOR_BFT and
-        BOOTSTRAP_POW_FINALITY_DEPTH exist to protect (see SEC-FIX H-04).
-        _maybe_finalize_by_depth already gated its depth choice on this same
-        threshold; add_validator_sig()'s own inline copy of this check is
-        fixed the same way.
-        """
-        validators = self.storage.get_all_by_role("investor")
-        if len(validators) < Config.MIN_VALIDATORS_FOR_BFT:
-            return
-        # BUG-2 FIX: convert stake to satoshi integers — no float division
-        total_stake_sat = sum(to_satoshi(v["stake"]) for v in validators)
-        if total_stake_sat <= 0:
-            return
-        voted_stake_sat = 0
-        seen_voters = set()
-        for vs in block.validator_sigs:
-            voter_addr = vs.get("addr")
-            if voter_addr in seen_voters:
+        rows = []
+        for validator in self.storage.get_all_by_role("investor"):
+            address = str(validator.get("address", ""))
+            if not address:
                 continue
-            seen_voters.add(voter_addr)
-            for v in validators:
-                if v["address"] == voter_addr:
-                    voted_stake_sat += to_satoshi(v["stake"])
-        if bft_threshold_met(voted_stake_sat, total_stake_sat):
-            block.finalized = True
-            # AUDIT-FIX (Batch D): keep the incremental finality-fence
-            # tracker in sync — see _highest_finalized_height in __init__.
+            stake_sat = to_satoshi(float(validator.get("stake", 0.0)))
+            if stake_sat < 0:
+                continue
+            rows.append({"address": address, "stake_sat": int(stake_sat)})
+        rows.sort(key=lambda row: row["address"])
+        return rows
+
+    def _reconstruct_legacy_validator_snapshot(self, block: Block) -> Optional[List[dict]]:
+        """Safely reconstruct an old block's pre-state voter set when possible.
+
+        Earlier V10 databases predate per-block BFT snapshots.  Reconstruct by
+        starting with the current active set and reversing each canonical
+        REGISTER block's durable role-undo record, including the target block
+        itself (whose registrations activate only at the next height).
+        If any role is currently slashed or a needed undo record/body is
+        unavailable, historical stake/slash state is ambiguous and this method
+        fails closed rather than using today's set for an old block.
+        """
+        try:
+            height = int(block.index)
+            if self.storage.get_block_hash(height) != block.block_hash:
+                return None
+            tip = int(self.height())
+            if height < 0 or height > tip:
+                return None
+
+            # A slash may occur outside block application; without a durable
+            # height-indexed slash history it is unsafe to pretend the current
+            # table describes historical stake.  New blocks always have exact
+            # snapshots, so this restriction affects only legacy backfill.
+            all_roles = self.storage.get_all_roles()
+            if any(bool(row.get("slashed", 0)) for row in all_roles):
+                return None
+
+            current = {
+                row["address"]: int(row["stake_sat"])
+                for row in self._current_validator_snapshot()
+            }
+            for idx in range(tip, height - 1, -1):
+                historical = self.storage.get_block(idx)
+                if historical is None or getattr(historical, "is_pruned", False):
+                    return None
+                changes_role = any(
+                    getattr(tx, "tx_type", None) == Transaction.TYPE_REGISTER
+                    and not Transaction.is_identity_claim(tx)
+                    for tx in (getattr(historical, "transactions", None) or []))
+                if not changes_role:
+                    continue
+                undo = self.storage.get_block_role_snapshot(
+                    idx, historical.block_hash)
+                if undo is None:
+                    return None
+                for address, item in undo.items():
+                    # Snapshot tuple: role, stake_sat, score, slashed,
+                    # registered_at, existed. Restore the *pre-block* role.
+                    role = item[0]
+                    stake_sat = int(item[1])
+                    slashed = bool(item[3])
+                    existed = bool(item[5] if len(item) >= 6 else item[4])
+                    if existed and role == "investor" and not slashed:
+                        current[address] = stake_sat
+                    else:
+                        current.pop(address, None)
+            rebuilt = [
+                {"address": address, "stake_sat": int(stake_sat)}
+                for address, stake_sat in current.items()
+            ]
+            rebuilt.sort(key=lambda row: row["address"])
+            self.storage.record_block_validator_snapshot(
+                height, block.block_hash, rebuilt)
+            return rebuilt
+        except Exception as exc:
+            log.warning(
+                "Unable to reconstruct legacy validator snapshot for block #%s: %s",
+                getattr(block, "index", "?"), exc)
+            return None
+
+    def get_validator_set_for_block(self, block: Block) -> Optional[List[dict]]:
+        """Return the validators eligible for this exact block height/hash.
+
+        An empty list is a known empty set; ``None`` means no trustworthy
+        snapshot could be obtained.  The latter must never be replaced by the
+        current live role table, since that reintroduces activation-height
+        consensus divergence.
+        """
+        try:
+            snapshot = self.storage.get_block_validator_snapshot(
+                int(block.index), str(block.block_hash))
+        except Exception:
+            snapshot = None
+        if snapshot is not None:
+            return snapshot
+        return self._reconstruct_legacy_validator_snapshot(block)
+
+    def _authenticated_block_votes(self, block: Block,
+                                   eligible_validators: List[dict]) -> List[dict]:
+        """Return one cryptographically authenticated vote per eligible address."""
+        eligible = {str(v["address"]): int(v["stake_sat"])
+                    for v in eligible_validators}
+        digest = hashlib.sha256(str(block.block_hash).encode("utf-8")).digest()
+        valid = []
+        seen = set()
+        for entry in (getattr(block, "validator_sigs", None) or []):
+            if not isinstance(entry, dict):
+                continue
+            address = str(entry.get("addr", ""))
+            if not address or address in seen or address not in eligible:
+                continue
+            pub_hex = entry.get("pub")
+            sig_hex = entry.get("sig")
+            if not isinstance(pub_hex, str) or not isinstance(sig_hex, str):
+                continue
+            try:
+                pub = pub_from_hex(pub_hex)
+                if pub_to_address(pub) != address:
+                    continue
+                signature = sig_from_hex(sig_hex)
+                if not ecdsa_verify(pub, digest, signature):
+                    continue
+            except Exception:
+                continue
+            seen.add(address)
+            valid.append({"addr": address, "sig": sig_hex, "pub": pub_hex})
+        return valid
+
+    def _slash_validator_for_equivocation(self, validator_address: str) -> None:
+        """Apply the local equivocation penalty at most once as a fallback."""
+        try:
+            role = self.storage.get_role(validator_address)
+            if not role or bool(role.get("slashed", False)):
+                return
+            self.storage.slash(validator_address)
+        except Exception as exc:
+            log.error(
+                "Unable to apply equivocation slash for %s: %s",
+                str(validator_address)[:16], exc)
+
+    def _queue_or_handle_vote_equivocation(self, validator_address: str,
+                                           target_block: Block, sig_hex: str,
+                                           pub_hex: str, prior_vote: dict) -> None:
+        """Defer equivocation side effects when an atomic block is in flight."""
+        evidence_local = getattr(self, "_vote_evidence_local", None)
+        queue = getattr(evidence_local, "pending", None)
+        if queue is not None:
+            queue.append((
+                str(validator_address), target_block, str(sig_hex),
+                str(pub_hex), dict(prior_vote)))
+            return
+        self._handle_vote_equivocation(
+            validator_address, target_block, sig_hex, pub_hex, prior_vote)
+
+    def _flush_vote_equivocations(self, pending: List[tuple]) -> None:
+        """Apply queued evidence only after the corresponding DB commit."""
+        for validator_address, target_block, sig_hex, pub_hex, prior_vote in pending:
+            try:
+                self._handle_vote_equivocation(
+                    validator_address, target_block, sig_hex, pub_hex, prior_vote)
+            except Exception as exc:
+                # The vote rows were durably committed and the vote was already
+                # excluded from quorum. Keep the accepted block intact but make
+                # any post-commit penalty failure explicit in logs.
+                log.error(
+                    "Post-commit equivocation handling failed for %s at height %s: %s",
+                    str(validator_address)[:16],
+                    getattr(target_block, "index", "?"), exc)
+
+    def _handle_vote_equivocation(self, validator_address: str,
+                                  target_block: Block, sig_hex: str,
+                                  pub_hex: str, prior_vote: dict) -> None:
+        """Persist the penalty/evidence for an authenticated conflicting vote."""
+        role = self.storage.get_role(validator_address)
+        if not role or bool(role.get("slashed", False)):
+            return
+        if Config.AUTO_SLASH_EVIDENCE and getattr(self, "_slash_evidence", None):
+            try:
+                prior_hash = str(prior_vote["block_hash"])
+                prior_block = self.storage.get_block_by_hash(prior_hash)
+                evidence = self._slash_evidence.build_evidence(
+                    validator_address=validator_address,
+                    pub_hex=pub_hex,
+                    block_hash_a=prior_hash,
+                    sig_a=str(prior_vote["sig_hex"]),
+                    block_hash_b=str(target_block.block_hash),
+                    sig_b=sig_hex,
+                    height=int(target_block.index),
+                    own_address=self.storage.get_meta("own_address") or "unknown",
+                    block_header_a=(prior_block.header_dict()
+                                    if prior_block is not None else None),
+                    block_header_b=target_block.header_dict(),
+                )
+                applied, _message = self._slash_evidence.apply_evidence(evidence)
+                if applied:
+                    log.info(
+                        "Automatic equivocation slash evidence applied for %s at height %d",
+                        str(validator_address)[:16], int(target_block.index))
+                    metrics.inc("slash_evidence_auto_built")
+                    return
+            except Exception as exc:
+                log.debug("Automatic slash evidence processing failed: %s", exc)
+        self._slash_validator_for_equivocation(validator_address)
+
+    def _maybe_finalize_by_bft(self, block: Block,
+                               eligible_validators: Optional[List[dict]] = None):
+        """Authenticate embedded votes against the block's pre-state voter set.
+
+        ``validator_sigs`` and ``finalized`` are mutable post-mining metadata,
+        so block integrity/PoW alone cannot authenticate them.  Invalid or
+        ineligible vote entries are ignored and removed; they never contribute
+        stake.  If a trustworthy historical validator snapshot is unavailable,
+        this method fails closed and does not advance finality.
+        """
+        if eligible_validators is None:
+            eligible_validators = self.get_validator_set_for_block(block)
+        if eligible_validators is None:
+            log.warning(
+                "BFT finality deferred for block #%s: eligible validator snapshot unavailable",
+                getattr(block, "index", "?"))
+            return
+
+        eligible = sorted(
+            ({"address": str(v.get("address", "")),
+              "stake_sat": int(v.get("stake_sat", 0))}
+             for v in eligible_validators
+             if isinstance(v, dict) and v.get("address")),
+            key=lambda row: row["address"])
+        # Duplicate addresses in persisted state must not inflate the quorum
+        # denominator or count more than once.
+        unique = {}
+        for row in eligible:
+            if row["stake_sat"] >= 0:
+                unique.setdefault(row["address"], row["stake_sat"])
+        eligible = [
+            {"address": address, "stake_sat": stake}
+            for address, stake in sorted(unique.items())
+        ]
+
+        authenticated = self._authenticated_block_votes(block, eligible)
+        votes_changed = authenticated != (getattr(block, "validator_sigs", None) or [])
+        if votes_changed:
+            block.validator_sigs = authenticated
+
+        # Vote history is independent of the canonical block table: it must
+        # survive a later reorg so a validator cannot erase equivocation by
+        # having its signed block orphaned. Read history BEFORE inserting this
+        # block's embedded votes, then persist every authenticated vote in the
+        # surrounding block transaction (SQLite atomic block / PGX txn). A vote
+        # that conflicts with a prior vote is durable evidence but must never
+        # contribute stake to this block's quorum.
+        prior_votes = self.storage.get_validator_votes_at_height(int(block.index))
+        prior_by_validator = {}
+        for prior in prior_votes:
+            address = str(prior.get("validator_addr", ""))
+            if address:
+                prior_by_validator.setdefault(address, []).append(prior)
+
+        quorum_votes = []
+        for vote in authenticated:
+            address = str(vote["addr"])
+            block_hash = str(block.block_hash)
+            conflicts = [
+                prior for prior in prior_by_validator.get(address, [])
+                if str(prior.get("block_hash", "")) != block_hash
+            ]
+            # The Storage API's inner commit is suppressed by SQLite's
+            # enclosing atomic transaction; PGX uses its active block txn.
+            self.storage.record_validator_vote(
+                block_hash, address, str(vote["sig"]), str(vote["pub"]),
+                block_idx=int(block.index))
+            if conflicts:
+                log.warning(
+                    "SLASH: embedded double-sign by %s at height %d",
+                    address[:16], int(block.index))
+                # Slashing/evidence has in-memory side effects in addition to
+                # DB writes. Queue it until apply_block's atomic transaction is
+                # committed; if the candidate is rejected, the queue is dropped.
+                self._queue_or_handle_vote_equivocation(
+                    address, block, str(vote["sig"]), str(vote["pub"]),
+                    conflicts[0])
+                continue
+            quorum_votes.append(vote)
+
+        validator_count = len(eligible)
+        min_validators = int(getattr(Config, "MIN_VALIDATORS_FOR_BFT", 3))
+        total_stake_sat = sum(row["stake_sat"] for row in eligible)
+        voted_addresses = {entry["addr"] for entry in quorum_votes}
+        voted_stake_sat = sum(
+            row["stake_sat"] for row in eligible
+            if row["address"] in voted_addresses)
+
+        was_finalized = bool(block.finalized)
+        newly_finalized = False
+        if (validator_count >= min_validators
+                and total_stake_sat > 0
+                and bft_threshold_met(voted_stake_sat, total_stake_sat)):
+            if not block.finalized:
+                block.finalized = True
+                newly_finalized = True
             self._highest_finalized_height = max(
-                self._highest_finalized_height, block.index)
-            self.storage.save_block(block)
+                self._highest_finalized_height, int(block.index))
             pct = voted_stake_sat * 100 // total_stake_sat
-            log.info(f"Block #{block.index} BFT-finalized ({pct}% stake)")
-            metrics.inc("blocks_finalized_bft")
+            if newly_finalized:
+                log.info(f"Block #{block.index} BFT-finalized ({pct}% stake)")
+                metrics.inc("blocks_finalized_bft")
+
+        if votes_changed or newly_finalized:
+            self.storage.save_block(block)
 
     def _maybe_finalize_by_depth(self, applied_height: int):
         """
         Finalize blocks that are POW_FINALITY_DEPTH confirmations deep.
 
-        Fix #9 — Finality Liveness Guarantee:
-        The original code only used PoW-depth finality when there were NO
-        investors.  This leaves the chain in a liveness-stall if validators
-        are registered but a majority is offline (their total stake < 2/3).
-        The chain would keep growing (PoW continues) but no blocks would ever
-        be finalized, which blocks RPC callers waiting on finality.
-
-        The fix adds an explicit degraded-participation fallback:
-          • If validators exist but BFT finality has not progressed for more
-            than FINALITY_LIVENESS_TIMEOUT blocks, automatically fall back to
-            PoW-depth finality for those blocks.
-          • A metric counter and a WARNING log are emitted so operators know
-            that BFT finality is degraded and should restore validators.
-          • Once BFT recovers (validators come back online), BFT finality
-            resumes and PoW-depth fallback stops being triggered.
+        Finality liveness policy:
+          • Below MIN_VALIDATORS_FOR_BFT, the chain is still in PoW bootstrap
+            mode and uses BOOTSTRAP_POW_FINALITY_DEPTH directly (including
+            when one or two validators exist).
+          • Once BFT is active, stalled participation triggers the configured
+            timeout-based PoW-depth fallback.
+          • A metric counter and WARNING log identify degraded BFT finality;
+            once participation recovers, normal BFT finality can resume.
 
         This preserves liveness under partial validator failure without
         weakening the safety guarantee: BFT-finalized blocks cannot be reorged
@@ -4325,8 +4731,12 @@ class Blockchain:
         if target < 0:
             return
 
-        if not validators:
-            # Bootstrap mode: no validators at all — pure PoW finality
+        if not bft_active:
+            # The protocol remains in PoW-bootstrap mode until the configured
+            # minimum validator count is reached. One or two registered
+            # validators cannot form BFT quorum and must not force the node
+            # through the degraded-BFT timeout path; apply bootstrap depth
+            # directly for zero, one, or two validators.
             blk = self.storage.get_block(target)
             if blk and not blk.finalized:
                 blk.finalized = True
@@ -5326,6 +5736,10 @@ class Blockchain:
         PoW-only chains to converge when no investor/BFT validator set exists.
         """
         with self._lock:
+            if self.storage.get_meta("bootstrap_restore_in_progress"):
+                return False, (
+                    "Reorg rejected: authenticated bootstrap recovery is incomplete; "
+                    "restart the node to retry the durable recovery journal")
             if not new_chain:
                 return False, "Empty chain"
             if self._critical_recovery:
@@ -5433,6 +5847,18 @@ class Blockchain:
                     _saved_old_blocks.append(blk)
             # _saved_old_blocks is in descending order; reverse for re-apply.
             _saved_old_blocks.reverse()   # now ascending: fork_height … tip
+            # Finality is a transactional side effect of adopting a branch.
+            # Remember the old canonical flags/fence before rollback so a
+            # rejected replacement can restore them exactly.
+            _old_finality_by_height = {
+                int(blk.index): bool(blk.finalized)
+                for blk in _saved_old_blocks
+            }
+            _old_hash_by_height = {
+                int(blk.index): str(blk.block_hash)
+                for blk in _saved_old_blocks
+            }
+            _pre_reorg_finality_fence = int(self._highest_finalized_height)
 
             # ── AUDIT-FIX-4: heaviest-chain rule, not longest-chain ────────────
             # The check above (new_tip <= tip) only compares block COUNT.
@@ -5551,7 +5977,10 @@ class Blockchain:
             # Apply new chain — on any failure, restore the old chain.
             _applied: list = []
             for b in new_chain:
-                ok, msg = self.apply_block(b)
+                # Do not allow a not-yet-fully-validated replacement branch to
+                # advance finality. If a later replacement block fails, this
+                # branch is discarded and must leave no finality side effects.
+                ok, msg = self.apply_block(b, defer_finality=True)
                 if not ok:
                     log.error(
                         f"Reorg apply failed at block {b.index}: {msg} — "
@@ -5569,6 +5998,7 @@ class Blockchain:
                             log.error(f"Restore rollback failed at "
                                       f"block {_rb.index}: {_rbe}")
                     if _unwind_errors:
+                        self._highest_finalized_height = _pre_reorg_finality_fence
                         self._mark_critical_recovery(
                             f"rollback of replacement block {_unwind_errors[0][0]} "
                             f"failed: {_unwind_errors[0][1]}")
@@ -5585,6 +6015,7 @@ class Blockchain:
                             log.error(
                                 f"[L2-REORG] failed to restore fork-point L2 state: "
                                 f"{_l2_restore_e}")
+                            self._highest_finalized_height = _pre_reorg_finality_fence
                             self._mark_critical_recovery(
                                 f"L2 fork-point restore failed: {_l2_restore_e}")
                             return False, (
@@ -5600,16 +6031,43 @@ class Blockchain:
                     _restore_failure = None
                     for _ob in _saved_old_blocks:
                         try:
-                            _r_ok, _r_msg = self.apply_block(_ob)
+                            _r_ok, _r_msg = self.apply_block(
+                                _ob, defer_finality=True)
                         except Exception as _obe:
                             _r_ok, _r_msg = False, f"exception: {_obe}"
                         if not _r_ok:
                             _restore_failure = (_ob.index, _r_msg)
                             break
                     if _restore_failure is not None:
+                        self._highest_finalized_height = _pre_reorg_finality_fence
                         self._mark_critical_recovery(
                             f"restoration of the old chain failed at height "
                             f"{_restore_failure[0]}: {_restore_failure[1]}")
+                        return False, (
+                            f"Reorg apply block {b.index}: {msg}; "
+                            f"{self._critical_recovery}")
+                    # apply_block deliberately distrusts a peer-supplied
+                    # finalized flag. During restoration these are not peer
+                    # claims: restore the exact flags captured from the old
+                    # canonical branch, and only after every block re-applied.
+                    try:
+                        for _ob in _saved_old_blocks:
+                            idx = int(_ob.index)
+                            restored = self.storage.get_block(idx)
+                            if (restored is None
+                                    or restored.block_hash != _old_hash_by_height[idx]):
+                                raise RuntimeError(
+                                    f"restored block identity mismatch at height {idx}")
+                            old_flag = _old_finality_by_height[idx]
+                            if bool(restored.finalized) != old_flag:
+                                restored.finalized = old_flag
+                                self.storage.save_block(restored)
+                        self._highest_finalized_height = _pre_reorg_finality_fence
+                    except Exception as _finality_restore_e:
+                        self._highest_finalized_height = _pre_reorg_finality_fence
+                        self._mark_critical_recovery(
+                            f"restoration of original finality state failed: "
+                            f"{_finality_restore_e}")
                         return False, (
                             f"Reorg apply block {b.index}: {msg}; "
                             f"{self._critical_recovery}")
@@ -5621,6 +6079,29 @@ class Blockchain:
             # The new chain may have different timestamps and therefore different
             # computed difficulties from the fork point onwards.
             DifficultyEngine.invalidate_cache(from_height=fork_height)
+
+            # The replacement branch is now fully validated and canonical.
+            # Only now may embedded authenticated votes or depth finality
+            # promote blocks. Recompute (rather than max) the fence afterward
+            # so the explicitly permitted deep-PoW/no-validator reorg cannot
+            # retain a height finalized only on the discarded branch.
+            try:
+                for candidate in new_chain:
+                    canonical = self.storage.get_block(int(candidate.index))
+                    if canonical is None or canonical.block_hash != candidate.block_hash:
+                        raise RuntimeError(
+                            f"canonical replacement block missing at height {candidate.index}")
+                    self._maybe_finalize_by_bft(canonical)
+                for idx in range(int(fork_height), int(new_tip) + 1):
+                    self._maybe_finalize_by_depth(idx)
+                self._recompute_highest_finalized_height()
+            except Exception as _finality_commit_e:
+                self._mark_critical_recovery(
+                    f"finality reconciliation after successful reorg failed: "
+                    f"{_finality_commit_e}")
+                return False, (
+                    f"Replacement branch applied, but finality reconciliation failed; "
+                    f"{self._critical_recovery}")
 
             log.info(f"Chain reorg: rolled back to {fork_height}, new tip={new_tip}")
             return True, "OK"
@@ -6226,182 +6707,108 @@ class Blockchain:
     # ── BFT finality + slashing ───────────────────────────────────────────────
     def add_validator_sig(self, block_hash: str, validator_address: str,
                           sig_hex: str, pub_hex: str) -> bool:
-        """
-        Record a validator vote.
-        • Double-sign detection → slash.
-        • On BFT threshold → mark block finalized.
-        • Logs economic collusion patterns.
+        """Authenticate and record a vote for a validator-eligible block.
 
-        Fix #5 — Cross-Layer Identity Binding:
-        Before accepting a validator signature, we verify that the pub_hex
-        supplied with the sig derives to the same wallet address as the
-        validator_address claimed.  This binds the transport-layer identity
-        (pub_hex from the P2P session) to the validator role identity
-        (validator_address from the role registry), preventing a peer from
-        submitting BFT votes on behalf of a different validator by spoofing
-        the address field.
-
-        Additionally, the signature itself is verified against the pub_hex so
-        that a forged or replayed sig from a different key is rejected even if
-        the address matches (key reuse attack prevention).
+        Every entry path uses the same block-height validator snapshot as
+        embedded votes.  The live role table is deliberately not consulted for
+        eligibility because it already includes REGISTER transactions from the
+        block being voted on.
         """
-        # Locate the canonical block directly by hash. A fixed five-block
-        # lookback could discard a valid validator vote when peer gossip was
-        # delayed behind several locally received blocks, preventing quorum
-        # finality even though the block remained pending and canonical.
         target_block = self.storage.get_block_by_hash(block_hash)
-        if target_block is None:
+        if target_block is None or target_block.block_hash != block_hash:
             return False
-        for idx in (target_block.index,):
-            block = target_block
-            if block and block.block_hash == block_hash:
-                if block.finalized: return True
+        idx = int(target_block.index)
+        eligible = self.get_validator_set_for_block(target_block)
+        if eligible is None:
+            log.warning(
+                "Validator vote rejected for block #%d: eligible validator snapshot unavailable",
+                idx)
+            return False
+        eligible_by_addr = {
+            str(item["address"]): int(item["stake_sat"])
+            for item in eligible
+            if isinstance(item, dict) and item.get("address")
+        }
+        if validator_address not in eligible_by_addr:
+            log.warning(
+                "Validator vote rejected: %s was not eligible for block #%d",
+                str(validator_address)[:16], idx)
+            return False
 
-                # ── Fix #5: Cross-layer identity binding ─────────────────────
-                # Verify that pub_hex → address matches the claimed validator
-                # address.  This prevents a peer from injecting votes for a
-                # validator it does not control by sending a valid sig with a
-                # mismatched pub_hex/address pair.
-                try:
-                    claimed_pub  = pub_from_hex(pub_hex)
-                    derived_addr = pub_to_address(claimed_pub)
-                    if derived_addr != validator_address:
-                        log.warning(
-                            f"Validator sig identity mismatch: "
-                            f"pub_hex derives to {derived_addr[:16]}... "
-                            f"but claimed validator is {validator_address[:16]}... "
-                            f"— rejected (Fix #5)")
-                        return False
-                except Exception as e:
-                    log.warning(f"Validator sig pub_hex parse failed: {e}")
-                    return False
+        # Cross-layer identity binding and signature verification must happen
+        # before either duplicate-vote handling or double-sign detection.
+        try:
+            claimed_pub = pub_from_hex(pub_hex)
+            derived_addr = pub_to_address(claimed_pub)
+            if derived_addr != validator_address:
+                log.warning(
+                    "Validator sig identity mismatch: pub derives to %s but claimed validator is %s",
+                    derived_addr[:16], str(validator_address)[:16])
+                return False
+            signature = sig_from_hex(sig_hex)
+            digest = hashlib.sha256(str(block_hash).encode("utf-8")).digest()
+            if not ecdsa_verify(claimed_pub, digest, signature):
+                log.warning(
+                    "Validator signature verification failed for %s",
+                    str(validator_address)[:16])
+                return False
+        except Exception as exc:
+            log.warning("Validator signature parse/verification failed: %s", exc)
+            return False
 
-                # ── Verify the signature itself ───────────────────────────────
-                try:
-                    sig  = sig_from_hex(sig_hex)
-                    h_bytes = hashlib.sha256(block_hash.encode()).digest()
-                    if not ecdsa_verify(claimed_pub, h_bytes, sig):
-                        log.warning(
-                            f"Validator sig cryptographic verification failed "
-                            f"for {validator_address[:16]}...")
-                        return False
-                except Exception as e:
-                    log.warning(f"Validator sig verification error: {e}")
-                    return False
-
-                # ── Double-sign detection ─────────────────────────────────────
-                prior_votes = self.storage.get_validator_votes_at_height(idx)
-                for pv in prior_votes:
-                    if (pv["validator_addr"] == validator_address and
-                            pv["block_hash"] != block_hash):
-                        log.warning(f"SLASH: double-sign by {validator_address[:16]} "
-                                    f"at height {idx}")
-                        self.storage.slash(validator_address)
-                        # ── NEW: Auto-broadcast slashing evidence ─────────────
-                        # Build and broadcast a verifiable evidence packet so ALL
-                        # honest nodes independently slash the double-signer.
-                        if (Config.AUTO_SLASH_EVIDENCE and
-                                hasattr(self, "_slash_evidence") and
-                                self._slash_evidence):
-                            try:
-                                evidence = self._slash_evidence.build_evidence(
-                                    validator_address = validator_address,
-                                    pub_hex           = pub_hex,
-                                    block_hash_a      = pv["block_hash"],
-                                    sig_a             = pv["sig_hex"],
-                                    block_hash_b      = block_hash,
-                                    sig_b             = sig_hex,
-                                    height            = idx,
-                                    own_address       = self.storage.get_meta(
-                                        "own_address") or "unknown",
-                                    block_header_a    = (
-                                        self.storage.get_block_by_hash(
-                                            pv["block_hash"]).header_dict()
-                                        if self.storage.get_block_by_hash(
-                                            pv["block_hash"]) is not None else None),
-                                    block_header_b    = target_block.header_dict(),
-                                )
-                                # Mark as already processed locally
-                                self._slash_evidence.apply_evidence(evidence)
-                                # Let the network handle the gossip
-                                log.info(
-                                    f"Auto-slashing evidence built for "
-                                    f"{validator_address[:16]} at height {idx}")
-                                metrics.inc("slash_evidence_auto_built")
-                            except Exception as e:
-                                log.debug(f"Slash evidence build error: {e}")
-                        return False
-
-                # A block can arrive through multiple peers. Once this
-                # validator has already voted for this exact block, accept the
-                # duplicate transport event without appending a second,
-                # independently-randomized ECDSA signature or counting the
-                # stake twice. A different block hash at this height remains a
-                # double-sign and is handled above.
-                same_block_vote = next(
-                    (pv for pv in prior_votes
-                     if pv["validator_addr"] == validator_address
-                     and pv["block_hash"] == block_hash),
-                    None,
-                )
-                if same_block_vote is not None:
-                    if not any(vs.get("addr") == validator_address
-                               for vs in block.validator_sigs):
-                        block.validator_sigs.append({
-                            "addr": validator_address,
-                            "sig": same_block_vote["sig_hex"],
-                            "pub": same_block_vote["pub_hex"],
-                        })
-                        self.storage.save_block(block)
-                    return True
-
-                # Record vote
+        prior_votes = self.storage.get_validator_votes_at_height(idx)
+        for prior in prior_votes:
+            if (prior["validator_addr"] == validator_address
+                    and prior["block_hash"] != block_hash):
+                # Preserve the second valid signature as durable evidence even
+                # though it must not be accepted as a normal vote.
                 self.storage.record_validator_vote(
                     block_hash, validator_address, sig_hex, pub_hex,
                     block_idx=idx)
+                log.warning(
+                    "SLASH: double-sign by %s at height %d",
+                    str(validator_address)[:16], idx)
+                self._queue_or_handle_vote_equivocation(
+                    validator_address, target_block, sig_hex, pub_hex, prior)
+                return False
 
-                entry = {"addr": validator_address, "sig": sig_hex, "pub": pub_hex}
-                if entry not in block.validator_sigs:
-                    block.validator_sigs.append(entry)
+        same_block_vote = next(
+            (prior for prior in prior_votes
+             if prior["validator_addr"] == validator_address
+             and prior["block_hash"] == block_hash),
+            None,
+        )
+        if same_block_vote is not None:
+            if not any(
+                    isinstance(vote, dict)
+                    and vote.get("addr") == validator_address
+                    for vote in (target_block.validator_sigs or [])):
+                target_block.validator_sigs.append({
+                    "addr": validator_address,
+                    "sig": same_block_vote["sig_hex"],
+                    "pub": same_block_vote["pub_hex"],
+                })
+            self._maybe_finalize_by_bft(
+                target_block, eligible_validators=eligible)
+            # Persist even when this vote did not newly cross quorum.
+            self.storage.save_block(target_block)
+            return True
 
-                # BUG-2 FIX: integer BFT threshold — no float division
-                # AUDIT-FIX (Batch D): this inline copy of the threshold check
-                # had no MIN_VALIDATORS_FOR_BFT gate at all (not even the
-                # zero-validators guard _maybe_finalize_by_bft had), so as
-                # few as one registered validator could BFT-finalize a block
-                # via this path too. Same fix, same rationale as
-                # _maybe_finalize_by_bft above.
-                validators = self.storage.get_all_by_role("investor")
-                if len(validators) >= Config.MIN_VALIDATORS_FOR_BFT:
-                    total_stake_sat = sum(to_satoshi(v["stake"]) for v in validators)
-                    voted_stake_sat = 0
-                    seen_voters = set()
-                    for vs in block.validator_sigs:
-                        voter_addr = vs.get("addr")
-                        if voter_addr in seen_voters:
-                            continue
-                        seen_voters.add(voter_addr)
-                        for v in validators:
-                            if v["address"] == voter_addr:
-                                voted_stake_sat += to_satoshi(v["stake"])
+        self.storage.record_validator_vote(
+            block_hash, validator_address, sig_hex, pub_hex, block_idx=idx)
+        entry = {"addr": validator_address, "sig": sig_hex, "pub": pub_hex}
+        if entry not in target_block.validator_sigs:
+            target_block.validator_sigs.append(entry)
 
-                    if bft_threshold_met(voted_stake_sat, total_stake_sat):
-                        block.finalized = True
-                        # AUDIT-FIX (Batch D): keep the incremental
-                        # finality-fence tracker in sync — see
-                        # _highest_finalized_height in __init__.
-                        self._highest_finalized_height = max(
-                            self._highest_finalized_height, block.index)
-                        pct = (voted_stake_sat * 100 // total_stake_sat
-                               if total_stake_sat > 0 else 0)
-                        log.info(f"Block #{block.index} finalized via BFT ({pct}% stake)")
-                        metrics.inc("blocks_finalized_bft")
+        # Shared quorum path authenticates every stored entry, filters invalid
+        # votes, applies the height-specific eligible stake denominator, and
+        # advances the fence only if the authenticated quorum is met.
+        self._maybe_finalize_by_bft(
+            target_block, eligible_validators=eligible)
+        self.storage.save_block(target_block)
 
-                self.storage.save_block(block)
-
-                # Economic collusion monitoring
-                all_sig_addrs = [vs["addr"] for vs in block.validator_sigs]
-                self._eco_mon.record_validator_sigs(all_sig_addrs)
-
-                return True
-        return False
+        self._eco_mon.record_validator_sigs([
+            vote["addr"] for vote in target_block.validator_sigs
+            if isinstance(vote, dict) and vote.get("addr")
+        ])
+        return True

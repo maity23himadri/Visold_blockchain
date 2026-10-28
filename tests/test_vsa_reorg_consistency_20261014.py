@@ -183,10 +183,12 @@ def test_failed_restoration_marks_critical_recovery_and_refuses_writes(monkeypat
             real_apply = bc.apply_block
             failing_hash = local[0].block_hash
 
-            def injected_apply(block):
+            def injected_apply(block, *, defer_finality=False):
                 if block.block_hash == failing_hash:
                     return False, "injected restoration failure"
-                return real_apply(block)
+                # reorg() now defers finality until the complete candidate or
+                # restoration suffix is known to be valid.
+                return real_apply(block, defer_finality=defer_finality)
 
             monkeypatch.setattr(bc, "apply_block", injected_apply)
             # Cold cache isolates the restoration check from VSA-21.
@@ -214,6 +216,14 @@ def _validator_fixture(monkeypatch, st, bc, voter):
     monkeypatch.setattr(
         st, "get_role",
         lambda addr: {"role": "investor", "stake": 1.0} if addr == voter.address else None)
+    # This test isolates the post-apply finalization dispatch.  Supply the
+    # protocol-defined pre-block validator snapshot explicitly, since a live
+    # role-table monkeypatch after block application must not retroactively
+    # change the validator set eligible for that block.
+    monkeypatch.setattr(
+        bc, "get_validator_set_for_block",
+        lambda block: [{"address": voter.address, "stake_sat": SAT}]
+        if st.get_block_hash(block.index) == block.block_hash else None)
     votes = []
     monkeypatch.setattr(
         bc, "add_validator_sig",

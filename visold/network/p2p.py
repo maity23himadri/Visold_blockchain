@@ -24,6 +24,7 @@ Defines: P2PNetwork
 Origin: visold_vsd_.py L33451-38510
 """
 
+import concurrent.futures as _futures
 import hashlib
 import hmac
 import ipaddress
@@ -209,6 +210,10 @@ def _close_quietly(sock) -> None:
 
 
 class P2PNetwork:
+    # At most one alternate full-block candidate per in-flight hash, with a
+    # global bound to prevent attacker-controlled payloads accumulating in RAM.
+    _BLOCK_GOSSIP_WAITING_MAX = 8
+
     # Per-IP inbound connection rate limit:
     # no more than _CONN_RATE_LIMIT new connections from one IP within
     # _CONN_RATE_WINDOW seconds.  Legitimate peers reconnect rarely.
@@ -355,6 +360,9 @@ class P2PNetwork:
         # same compact block concurrently before either post() stores it.
         self._block_gossip_lock = threading.Lock()
         self._block_gossip_inflight: set = set()
+        self._block_gossip_active: Dict[str, tuple] = {}
+        self._block_gossip_waiting: Dict[str, tuple] = {}
+        self._block_gossip_retried: set = set()
         self._id_cache   = LRUCache(Config.LRU_CACHE_SIZE)
         self._server     = None
         self._server_thread: Optional[threading.Thread] = None
@@ -5374,12 +5382,16 @@ class P2PNetwork:
             # after an unexpected failure.
             peer._pagination_active.clear()
 
-    def _claim_block_gossip(self, block_hash: Optional[str]) -> bool:
+    def _claim_block_gossip(self, block_hash: Optional[str],
+                            block_data: Optional[dict] = None,
+                            source_peer_id: str = "") -> bool:
         """Atomically claim a block hash before posting/applying it.
 
         Returns False when an identical block is already accepted or currently
-        being processed.  Missing hashes are left to normal block validation;
-        they are not cacheable gossip identities.
+        being processed. If a different full-block candidate for the same hash
+        arrives while one is in-flight, retain at most one bounded alternate:
+        should the first candidate fail validation, the alternate gets its own
+        processing attempt instead of being lost to a transient dedup race.
         """
         if not isinstance(block_hash, str) or not block_hash:
             return True
@@ -5394,27 +5406,163 @@ class P2PNetwork:
         with lock:
             if self._seen_msgs.get(("BLOCK", block_hash)):
                 return False
+            active = getattr(self, "_block_gossip_active", None)
+            if active is None:
+                active = {}
+                self._block_gossip_active = active
+            waiting = getattr(self, "_block_gossip_waiting", None)
+            if waiting is None:
+                waiting = {}
+                self._block_gossip_waiting = waiting
+            retried = getattr(self, "_block_gossip_retried", None)
+            if retried is None:
+                retried = set()
+                self._block_gossip_retried = retried
+
             if block_hash in inflight:
+                active_entry = active.get(block_hash)
+                active_data = active_entry[0] if active_entry else None
+                if (isinstance(block_data, dict)
+                        and isinstance(active_data, dict)
+                        and block_data != active_data
+                        and block_hash not in retried
+                        and block_hash not in waiting
+                        and len(waiting) < self._BLOCK_GOSSIP_WAITING_MAX):
+                    # The retry budget is one alternate per in-flight claim;
+                    # a stream of conflicting copies cannot create an endless
+                    # validation queue or unbounded memory growth.
+                    waiting[block_hash] = (block_data, str(source_peer_id or ""))
+                    retried.add(block_hash)
                 return False
             inflight.add(block_hash)
+            active[block_hash] = (block_data, str(source_peer_id or ""))
             return True
 
     def _finish_block_gossip(self, block_hash: Optional[str], accepted: bool) -> None:
-        """Release an in-flight block claim; cache only after queue/apply success."""
+        """Finish a claim and retry one alternate candidate after a rejection."""
         if not isinstance(block_hash, str) or not block_hash:
             return
         lock = getattr(self, "_block_gossip_lock", None)
         inflight = getattr(self, "_block_gossip_inflight", None)
         if lock is None or inflight is None:
-            # Lightweight compatibility path; normal P2PNetwork instances have
-            # both initialized in __init__.
             if accepted:
                 self._seen_msgs.put(("BLOCK", block_hash), True)
             return
+
+        retry_candidate = None
         with lock:
             inflight.discard(block_hash)
+            active = getattr(self, "_block_gossip_active", {})
+            active.pop(block_hash, None)
+            waiting = getattr(self, "_block_gossip_waiting", {})
+            retried = getattr(self, "_block_gossip_retried", set())
+            already_seen = bool(self._seen_msgs.get(("BLOCK", block_hash)))
+
             if accepted:
                 self._seen_msgs.put(("BLOCK", block_hash), True)
+                waiting.pop(block_hash, None)
+                retried.discard(block_hash)
+            elif already_seen:
+                # A local canonical broadcast may have won the race while this
+                # inbound event was in flight. Do not resurrect its alternate.
+                waiting.pop(block_hash, None)
+                retried.discard(block_hash)
+            else:
+                retry_candidate = waiting.pop(block_hash, None)
+                if retry_candidate is not None:
+                    block_data, source_peer_id = retry_candidate
+                    inflight.add(block_hash)
+                    active[block_hash] = (block_data, source_peer_id)
+                    # Keep retried marker during this one alternate attempt.
+                else:
+                    retried.discard(block_hash)
+
+        if retry_candidate is not None:
+            self._submit_deferred_block_gossip_candidate(
+                block_hash, retry_candidate[0], retry_candidate[1])
+
+    def _submit_deferred_block_gossip_candidate(self, block_hash: str,
+                                                block_data: dict,
+                                                source_peer_id: str) -> None:
+        """Submit the one retained alternate while its hash claim is reserved."""
+        try:
+            engine = getattr(self, "_state_engine", None)
+            if engine is not None:
+                event = Event(
+                    EventType.NEW_BLOCK,
+                    {"block": block_data},
+                    source_peer_id=source_peer_id,
+                    future=_futures.Future(),
+                )
+                posted = engine.post(event, timeout=5.0)
+                if posted:
+                    self._finish_block_gossip_after_event(
+                        block_hash, block_data, event.future)
+                    return
+                log.warning(
+                    "Deferred alternate block %s was refused by StateEngine; "
+                    "gossip claim released for retry", block_hash[:16])
+            else:
+                block = Block.from_dict(block_data)
+                ok, _reason = self.blockchain.apply_block(block)
+                canonical = self.blockchain.get_block(block.index) if ok else None
+                ok = bool(ok and canonical is not None
+                          and getattr(canonical, "block_hash", None) == block_hash)
+                self._finish_block_gossip(block_hash, ok)
+                return
+        except Exception as exc:
+            log.debug("Deferred alternate block %s failed to submit: %s",
+                      block_hash[:16], exc)
+        self._finish_block_gossip(block_hash, False)
+
+    def _block_gossip_hash_is_canonical(self, block_hash: str,
+                                        block_data: dict) -> bool:
+        """Fail-closed check that a successful result is now canonical."""
+        try:
+            if not isinstance(block_data, dict):
+                return False
+            index = block_data.get("index")
+            if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+                return False
+            canonical = self.blockchain.get_block(index)
+            return (canonical is not None
+                    and getattr(canonical, "block_hash", None) == block_hash)
+        except Exception:
+            return False
+
+    def _finish_block_gossip_after_event(self, block_hash: Optional[str],
+                                         block_data: dict,
+                                         future) -> None:
+        """Complete a block-gossip claim only after authoritative processing.
+
+        Queue admission is not validation. The claim remains in-flight until
+        StateEngine resolves the event future. Cache the hash only when the
+        event succeeded AND that exact hash is present at its canonical height;
+        invalid blocks, rejected writes, and merely stashed orphans release the
+        claim so an honest copy can be retried.
+        """
+        if future is None or not isinstance(block_hash, str) or not block_hash:
+            self._finish_block_gossip(block_hash, False)
+            return
+
+        def _complete(done_future):
+            accepted = False
+            try:
+                result = done_future.result()
+                if (isinstance(result, tuple) and result
+                        and bool(result[0])):
+                    accepted = self._block_gossip_hash_is_canonical(
+                        block_hash, block_data)
+            except Exception as exc:
+                # On uncertainty, release rather than poison the dedup cache.
+                log.debug("Block gossip completion check failed for %s: %s",
+                          block_hash[:16], exc)
+            self._finish_block_gossip(block_hash, accepted)
+
+        try:
+            future.add_done_callback(_complete)
+        except Exception:
+            self._finish_block_gossip(block_hash, False)
 
     def _mark_block_gossip_seen(self, block_hash: Optional[str]) -> None:
         """Mark an already-canonical locally broadcast block as seen."""
@@ -5426,6 +5574,8 @@ class P2PNetwork:
             return
         with lock:
             self._seen_msgs.put(("BLOCK", block_hash), True)
+            getattr(self, "_block_gossip_waiting", {}).pop(block_hash, None)
+            getattr(self, "_block_gossip_retried", set()).discard(block_hash)
 
     def _handle_message(self, peer: PeerConnection, msg: dict):
         mtype = msg.get("type", "")
@@ -6087,7 +6237,7 @@ class P2PNetwork:
                     _bh = (block_data.get("block_hash")
                            if isinstance(block_data, dict) else None)
                     if _bh:
-                        _block_claimed = self._claim_block_gossip(_bh)
+                        _block_claimed = self._claim_block_gossip(_bh, block_data, peer.peer_id)
                         if not _block_claimed:
                             return
                     if self._state_engine is not None:
@@ -6095,12 +6245,15 @@ class P2PNetwork:
                             EventType.NEW_BLOCK,
                             {"block": block_data},
                             source_peer_id=peer.peer_id,
+                            future=_futures.Future(),
                         )
                         accepted = self._state_engine.post(evt, timeout=5.0)
                         if accepted:
-                            # Reserve atomically across concurrent mesh deliveries;
-                            # completed queue admission makes later copies redundant.
-                            self._finish_block_gossip(_bh, True)
+                            # Queue admission is not block acceptance. Keep the
+                            # claim in-flight until the StateEngine reports its
+                            # result and the canonical chain confirms this hash.
+                            self._finish_block_gossip_after_event(
+                                _bh, block_data, evt.future)
                             _block_claimed = False
                         else:
                             self._finish_block_gossip(_bh, False)
@@ -6114,7 +6267,9 @@ class P2PNetwork:
                         # Fallback for tests / pre-engine startup.
                         block = Block.from_dict(block_data)
                         ok, reason = self.blockchain.apply_block(block)
-                        self._finish_block_gossip(_bh, bool(ok))
+                        _canonical_ok = bool(
+                            ok and self._block_gossip_hash_is_canonical(_bh, block_data))
+                        self._finish_block_gossip(_bh, _canonical_ok)
                         _block_claimed = False
                         if ok:
                             self._mark_peer_height_verified(peer.peer_id, [block])
@@ -6301,7 +6456,7 @@ class P2PNetwork:
                     # Claim only after reconstruction + merkle verification.  This
                     # atomically suppresses concurrent copies arriving via several
                     # mesh neighbours without poisoning retries on reconstruction failure.
-                    if not self._claim_block_gossip(_cbh):
+                    if not self._claim_block_gossip(_cbh, _block_dict, peer.peer_id):
                         return
                     _cmpct_claimed = bool(_cbh)
 
@@ -6311,14 +6466,16 @@ class P2PNetwork:
                             EventType.NEW_BLOCK,
                             {"block": _block_dict},
                             source_peer_id=peer.peer_id,
+                            future=_futures.Future(),
                         )
                         _accepted = self._state_engine.post(_evt, timeout=5.0)
                         if _accepted:
-                            self._finish_block_gossip(_cbh, True)
+                            self._finish_block_gossip_after_event(
+                                _cbh, _block_dict, _evt.future)
                             _cmpct_claimed = False
                             log.debug(
                                 f"[CMPCT] Fast-path block #{_hdr.get('index')} "
-                                f"from {peer.peer_id[:12]} posted to StateEngine"
+                                f"queued for StateEngine validation"
                             )
                         else:
                             log.warning(
@@ -6330,7 +6487,10 @@ class P2PNetwork:
                         try:
                             _blk = Block.from_dict(_block_dict)
                             _ok, _reason = self.blockchain.apply_block(_blk)
-                            self._finish_block_gossip(_cbh, bool(_ok))
+                            _canonical_ok = bool(
+                                _ok and self._block_gossip_hash_is_canonical(
+                                    _cbh, _block_dict))
+                            self._finish_block_gossip(_cbh, _canonical_ok)
                             _cmpct_claimed = False
                             if _ok:
                                 self._mark_peer_height_verified(peer.peer_id, [_blk])
@@ -6575,7 +6735,7 @@ class P2PNetwork:
 
                 # Claim immediately before processing so simultaneous completed
                 # replies/copies cannot enqueue the same canonical block twice.
-                if not self._claim_block_gossip(_fill_bh):
+                if not self._claim_block_gossip(_fill_bh, _block_dict, peer.peer_id):
                     return
                 _bktxn_claimed = True
 
@@ -6585,15 +6745,16 @@ class P2PNetwork:
                         EventType.NEW_BLOCK,
                         {"block": _block_dict},
                         source_peer_id=peer.peer_id,
+                        future=_futures.Future(),
                     )
                     _accepted = self._state_engine.post(_evt, timeout=5.0)
                     if _accepted:
-                        self._finish_block_gossip(_fill_bh, True)
+                        self._finish_block_gossip_after_event(
+                            _fill_bh, _block_dict, _evt.future)
                         _bktxn_claimed = False
                         log.debug(
                             f"[CMPCT] Slow-path block #{_hdr.get('index')} "
-                            f"from {peer.peer_id[:12]} posted to StateEngine "
-                            f"after BLOCKTXN fill"
+                            f"queued for StateEngine after BLOCKTXN fill"
                         )
                     else:
                         log.warning(
@@ -6605,7 +6766,10 @@ class P2PNetwork:
                     try:
                         _blk = Block.from_dict(_block_dict)
                         _ok, _reason = self.blockchain.apply_block(_blk)
-                        self._finish_block_gossip(_fill_bh, bool(_ok))
+                        _canonical_ok = bool(
+                            _ok and self._block_gossip_hash_is_canonical(
+                                _fill_bh, _block_dict))
+                        self._finish_block_gossip(_fill_bh, _canonical_ok)
                         _bktxn_claimed = False
                         if _ok:
                             _push_block_notif(_blk.index, _blk.miner_address, source="network")

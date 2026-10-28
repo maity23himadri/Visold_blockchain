@@ -34,8 +34,10 @@ def _bare_network(post_delay=0.0):
     net._compact_stash_lock = threading.RLock()
     net._compact_stash = {}
     net._callbacks = {}
+    canonical_blocks = {}
     net.blockchain = SimpleNamespace(
-        mempool=SimpleNamespace(_heap=_Heap())
+        mempool=SimpleNamespace(_heap=_Heap()),
+        get_block=lambda index: canonical_blocks.get(index),
     )
     calls = []
 
@@ -43,6 +45,17 @@ def _bare_network(post_delay=0.0):
         calls.append(evt)
         if post_delay:
             time.sleep(post_delay)
+        # Simulate completed StateEngine processing, not just queue admission.
+        if evt.future is not None and not evt.future.done():
+            data = evt.payload.get("block", {})
+            try:
+                index = data.get("index")
+                bh = data.get("block_hash")
+                if isinstance(index, int) and isinstance(bh, str):
+                    canonical_blocks[index] = SimpleNamespace(block_hash=bh)
+                evt.future.set_result((True, "OK"))
+            except Exception:
+                evt.future.set_result((False, "test engine error"))
         return True
 
     net._state_engine = SimpleNamespace(post=post)
@@ -112,7 +125,14 @@ def test_failed_state_engine_post_releases_claim_for_retry(monkeypatch):
     def post(evt, timeout=None):
         attempts["n"] += 1
         calls.append(evt)
-        return attempts["n"] > 1
+        if attempts["n"] > 1:
+            data = evt.payload.get("block", {})
+            index, bh = data.get("index"), data.get("block_hash")
+            net.blockchain.get_block = lambda i, _idx=index, _bh=bh: (
+                SimpleNamespace(block_hash=_bh) if i == _idx else None)
+            evt.future.set_result((True, "OK"))
+            return True
+        return False
 
     net._state_engine = SimpleNamespace(post=post)
     message = _compact_msg("retryable-block-hash")
@@ -173,3 +193,87 @@ def test_origin_drops_its_own_block_when_it_returns_through_mesh():
     # before it can be queued or relayed again.
     net._handle_message(peer, sent_msg)
     assert calls == []
+
+
+def test_invalid_first_candidate_does_not_poison_same_hash_honest_copy(monkeypatch):
+    """A rejected queued block must not suppress a differing in-flight copy."""
+    monkeypatch.setattr(p2p, "Block", _FakeBlockType)
+    net, peer, calls = _bare_network()
+    attempts = {"n": 0}
+    canonical = {}
+    net.blockchain.get_block = lambda index: canonical.get(index)
+
+    def processing_post(evt, timeout=None):
+        calls.append(evt)
+        attempts["n"] += 1
+        data = evt.payload["block"]
+        if attempts["n"] == 1:
+            # The attacker candidate is queued but fails consensus processing.
+            evt.future.set_result((False, "invalid block"))
+        else:
+            # The alternate body with the same claimed hash is the real block.
+            canonical[data["index"]] = SimpleNamespace(block_hash=data["block_hash"])
+            evt.future.set_result((True, "OK"))
+        return True
+
+    net._state_engine = SimpleNamespace(post=processing_post)
+    block_hash = "same-real-block-hash"
+    forged = {
+        "type": p2p.MSG_BLOCK,
+        "block": {"block_hash": block_hash, "index": 1, "garbage": True},
+    }
+    real = {
+        "type": p2p.MSG_BLOCK,
+        "block": {"block_hash": block_hash, "index": 1,
+                  "transactions": [{"sender": "COINBASE", "tx_id": "real"}]},
+    }
+
+    # First message fails; afterwards it no longer occupies the claim/cache.
+    net._handle_message(peer, forged)
+    assert len(calls) == 1
+    assert not net._seen_msgs.get(("BLOCK", block_hash))
+    assert not net._block_gossip_inflight
+
+    net._handle_message(peer, real)
+    assert len(calls) == 2
+    assert net._seen_msgs.get(("BLOCK", block_hash)) is True
+    assert not net._block_gossip_inflight
+
+
+def test_inflight_different_copy_is_retried_if_first_processing_fails(monkeypatch):
+    """A genuine copy arriving during validation survives the in-flight dedup race."""
+    monkeypatch.setattr(p2p, "Block", _FakeBlockType)
+    net, peer, calls = _bare_network()
+    canonical = {}
+    net.blockchain.get_block = lambda index: canonical.get(index)
+    pending = []
+
+    def delayed_post(evt, timeout=None):
+        calls.append(evt)
+        pending.append(evt)
+        return True
+
+    net._state_engine = SimpleNamespace(post=delayed_post)
+    block_hash = "race-real-block-hash"
+    forged = {"type": p2p.MSG_BLOCK, "block": {
+        "block_hash": block_hash, "index": 1, "garbage": True}}
+    real = {"type": p2p.MSG_BLOCK, "block": {
+        "block_hash": block_hash, "index": 1,
+        "transactions": [{"sender": "COINBASE", "tx_id": "real"}]}}
+
+    net._handle_message(peer, forged)
+    assert len(calls) == 1
+    net._handle_message(peer, real)
+    # The second message is retained as one bounded alternate, not posted yet.
+    assert len(calls) == 1
+    assert block_hash in net._block_gossip_waiting
+
+    pending[0].future.set_result((False, "invalid forged candidate"))
+    # Completion immediately re-posts the retained alternate.
+    assert len(calls) == 2
+    assert calls[1].payload["block"].get("transactions")
+    canonical[1] = SimpleNamespace(block_hash=block_hash)
+    pending[1].future.set_result((True, "OK"))
+    assert net._seen_msgs.get(("BLOCK", block_hash)) is True
+    assert not net._block_gossip_inflight
+    assert block_hash not in net._block_gossip_waiting

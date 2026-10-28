@@ -24,6 +24,7 @@ Defines: Mempool
 Origin: visold_vsd_.py L17919-17998, L18001-18866
 """
 
+import hashlib
 import threading
 import time
 import heapq as _heapq
@@ -204,15 +205,15 @@ class Mempool:
         # this reference falls through to the apply-time check as before.
         self._layer2_ref: Optional['Layer2State'] = None
         # ── v7.5.0-OPT Pre-Validation Pipeline ───────────────────────────────
-        # Tracks tx_ids whose full cryptographic signature check has already
-        # passed.  Populated by add() at gossip-arrival time; consulted by
-        # Block.integrity_check() to skip re-verifying signatures we have
-        # already checked.  This is a *cache* of verification work — it NEVER
-        # relaxes consensus: if a tx_id is not in the set the signature is
-        # checked the old way, and the set is cleared on every mempool mutation
-        # that could invalidate it.  Bounded in size so a tx-flood cannot OOM
-        # the node.
+        # Tracks transaction IDs that passed the mempool's admission checks.
+        # Consensus callers MUST NOT trust tx_id membership alone: tx_id does
+        # not include pub_hex/sig_hex, so an altered signature can retain the
+        # same ID.  _verified_fingerprints records the exact signed payload,
+        # public key, signature, sender, and tx_id that were verified.  The
+        # bounded cache is an optimization only; any missing/mismatched
+        # fingerprint forces normal cryptographic verification.
         self._verified: set = set()
+        self._verified_fingerprints: Dict[str, bytes] = {}
         self._VERIFIED_MAX = max(Config.MEMPOOL_MAX * 2, 20000)
         # MAJOR-05 FIX: Rebuild in-memory nonce/pair state from persisted txs
         # so that restarts do not cause all pending transactions from senders
@@ -587,8 +588,8 @@ class Mempool:
                     # the current heap (which is naturally bounded by
                     # mempool size and the heap caps itself).
                     live_ids = {t.tx_id for t in self._heap.get_all_live()}
-                    self._verified &= live_ids
-                self._verified.add(tx.tx_id)
+                    self._prune_verified_cache(live_ids)
+                self._record_signature_verified(tx)
             if tx.sender != "COINBASE":
                 self._pending_nonces[tx.sender].add(tx.nonce)
                 pair = (tx.sender, tx.receiver)
@@ -664,8 +665,8 @@ class Mempool:
             if tx.sender != "COINBASE":
                 if len(self._verified) >= self._VERIFIED_MAX:
                     live_ids = {t.tx_id for t in self._heap.get_all_live()}
-                    self._verified &= live_ids
-                self._verified.add(tx.tx_id)
+                    self._prune_verified_cache(live_ids)
+                self._record_signature_verified(tx)
                 self._pending_nonces[tx.sender].add(tx.nonce)
                 pair = (tx.sender, tx.receiver)
                 self._pending_pairs[pair] = self._pending_pairs.get(pair, 0) + 1
@@ -685,6 +686,7 @@ class Mempool:
             self._heap.remove(tx_id)
             # v7.5.0-OPT: drop verified-set entry (tx no longer resident).
             self._verified.discard(tx_id)
+            self._verified_fingerprints.pop(tx_id, None)
             if tx and tx.sender != "COINBASE":
                 self._pending_nonces[tx.sender].discard(tx.nonce)
                 pair = (tx.sender, tx.receiver)
@@ -810,6 +812,7 @@ class Mempool:
                 self._heap.remove(tx.tx_id)
                 # v7.5.0-OPT: drop verified-set entry (expired tx purged).
                 self._verified.discard(tx.tx_id)
+                self._verified_fingerprints.pop(tx.tx_id, None)
                 if tx.sender != "COINBASE":
                     self._pending_nonces[tx.sender].discard(tx.nonce)
                     # BUG-FIX: _pending_pairs was never updated on expiry, so
@@ -980,6 +983,7 @@ class Mempool:
             self._heap.clear()
             # v7.5.0-OPT: wipe verified-set so nothing stale survives rollback.
             self._verified.clear()
+            self._verified_fingerprints.clear()
             log.info("Mempool: clear_all() — all pending transactions flushed")
 
     def update_base_fee(self, fill_ratio: float):
@@ -995,18 +999,65 @@ class Mempool:
             metrics.set_gauge("base_fee_multiplier", self._base_fee_multiplier)
 
     # ── v7.5.0-OPT Pre-Validation Pipeline API ────────────────────────────
-    def is_verified(self, tx_id: str) -> bool:
-        """Return True iff ``tx_id`` has already passed the full crypto-
-        validation pipeline in this mempool (ECDSA + structural + nonce).
+    @staticmethod
+    def _signature_fingerprint(tx: Transaction, signing_payload: bytes) -> bytes:
+        """Fingerprint every input relevant to this exact signature check.
 
-        Used by Block.integrity_check() to skip the expensive ECDSA recheck
-        when a block arrives carrying transactions we already vetted at
-        gossip time.  Intentionally NOT wrapped in _lock: a set membership
-        check on CPython is atomic for reads, and a false negative (returning
-        False for a tx that WAS verified) is always safe — the caller will
-        just do the verify_signature() the old way.
+        tx_id deliberately excludes the signature and public key.  Therefore a
+        tx_id-only cache is NOT proof that the object in a block is the same
+        signed transaction previously admitted to the mempool.
         """
-        return tx_id in self._verified
+        digest = hashlib.sha256()
+        digest.update(b"VISOLD-SIGNATURE-CACHE-v1\x00")
+        for value in (tx.tx_id, tx.sender, tx.pub_hex, tx.sig_hex):
+            encoded = str(value).encode("utf-8", errors="strict")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+        if not isinstance(signing_payload, bytes):
+            signing_payload = bytes(signing_payload)
+        digest.update(len(signing_payload).to_bytes(8, "big"))
+        digest.update(signing_payload)
+        return digest.digest()
+
+    def _record_signature_verified(self, tx: Transaction) -> None:
+        """Record only after tx.is_valid() has actually verified its signature."""
+        try:
+            payload = tx.signing_bytes()
+            fingerprint = self._signature_fingerprint(tx, payload)
+        except Exception:
+            # A cache miss is always safe. Do not let cache bookkeeping reject
+            # a transaction that passed the ordinary admission validation.
+            fingerprint = None
+        if fingerprint is not None:
+            self._verified_fingerprints[tx.tx_id] = fingerprint
+        else:
+            self._verified_fingerprints.pop(tx.tx_id, None)
+        self._verified.add(tx.tx_id)
+
+    def _prune_verified_cache(self, live_ids: set) -> None:
+        self._verified.intersection_update(live_ids)
+        for cached_id in tuple(self._verified_fingerprints):
+            if cached_id not in live_ids:
+                self._verified_fingerprints.pop(cached_id, None)
+
+    def is_verified(self, tx_id: str, tx: Optional[Transaction] = None,
+                    signing_payload: Optional[bytes] = None) -> bool:
+        """Check a cached result for this exact transaction/signature context.
+
+        The one-argument form is retained for diagnostics/compatibility only;
+        consensus validation must pass both the transaction and the exact
+        signing payload it is about to validate. Any missing/invalid context
+        fails closed and causes real signature verification.
+        """
+        if tx is None or signing_payload is None or tx.tx_id != tx_id:
+            return tx_id in self._verified if tx is None else False
+        if tx_id not in self._verified:
+            return False
+        try:
+            expected = self._signature_fingerprint(tx, signing_payload)
+            return self._verified_fingerprints.get(tx_id) == expected
+        except Exception:
+            return False
 
     def mark_verified(self, tx_id: str) -> None:
         """External hook — mark a tx_id as fully verified.
@@ -1018,5 +1069,5 @@ class Mempool:
         with self._lock:
             if len(self._verified) >= self._VERIFIED_MAX:
                 live_ids = {t.tx_id for t in self._heap.get_all_live()}
-                self._verified &= live_ids
+                self._prune_verified_cache(live_ids)
             self._verified.add(tx_id)

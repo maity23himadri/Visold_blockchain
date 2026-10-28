@@ -180,21 +180,14 @@ class Block:
         Returns (True, "OK") or (False, reason).
         Call this at the start of every validate_block() invocation.
 
-        v7.5.0-OPT — Pre-Validation Pipeline
-        ────────────────────────────────────
-        If ``mempool`` is provided, transactions whose tx_id is present in
-        ``mempool._verified`` have ALREADY had their ECDSA signature
-        validated at gossip-arrival time — we skip the (expensive) ECDSA
-        recheck for those and only verify the remainder.  This is a pure
-        CPU-saving optimization: tx_id ties a transaction's signed payload
-        to its id (merkle_root step above already bound it), so skipping
-        the recheck is safe as long as:
-          (a) the tx_id we see in the block equals the tx_id in _verified,
-              which the merkle/id step has already proven, AND
-          (b) the _verified entry is only set after verify_signature()==True
-              inside Mempool.add(), which is enforced there.
-        Falling back to full verification when ``mempool`` is None preserves
-        the exact prior behaviour (used by tests and audit paths).
+        v7.5.0-OPT — Signature-cache fast path
+        ───────────────────────────────────────
+        If ``mempool`` is provided, the ECDSA check may be skipped only when
+        the cache matches this exact tx_id, sender, public key, signature and
+        signing payload. A tx_id-only hit is insufficient because public key
+        and signature are intentionally absent from tx_id. Cache misses,
+        malformed entries and legacy signing-context differences always fall
+        back to full cryptographic verification.
 
         ``verified_txids``, when supplied by the block validator, is populated
         with every non-coinbase tx_id whose signature was already established
@@ -316,40 +309,38 @@ class Block:
             if integrity_txids is not None:
                 integrity_txids.add(tx.tx_id)
 
-        # 4. Verify non-coinbase transaction signatures
-        #    TPS-OPT-1: fan out to ProcessPoolExecutor when the block carries
-        #    enough non-coinbase txs to justify the dispatch overhead.  Each
-        #    worker receives only primitives (pub_hex, sig_hex, signing_bytes)
-        #    and returns a bool — zero shared state, zero lock contention.
+        # 4. Verify non-coinbase transaction signatures.
         #
-        #    v7.5.0-OPT: if a mempool was provided, filter out transactions
-        #    whose tx_id is already in its _verified set (full ECDSA run at
-        #    gossip time).  We still iterate ALL non-coinbase txs to enforce
-        #    tx-id integrity (step 3 above) — we only skip the RE-verify
-        #    work here.  A missing mempool (None) falls back to full
-        #    verification, preserving historical behaviour and tests.
+        # Mempool verification may save ECDSA work only when its cache proves
+        # that the exact transaction ID, sender, public key, signature AND the
+        # exact block signing payload match.  A tx_id-only hit is unsafe because
+        # signatures/public keys are intentionally not included in tx_id.
+        # Legacy blocks that require a different signing payload naturally miss
+        # this cache and take the full verification path.
         non_cb = [(i, tx) for i, tx in enumerate(self.transactions)
                   if tx.sender != "COINBASE"]
-
         if mempool is not None:
-            try:
-                _to_verify = [(i, tx) for (i, tx) in non_cb
-                              if not mempool.is_verified(tx.tx_id)]
-                _skipped = len(non_cb) - len(_to_verify)
-                if verified_txids is not None and _skipped > 0:
-                    verified_txids.update(tx.tx_id for _, tx in non_cb if mempool.is_verified(tx.tx_id))
-                if _skipped > 0:
-                    # Record the win for observability.  Does not affect
-                    # consensus — same outcome regardless.
-                    try:
-                        metrics.inc("sig_verify_skipped", _skipped)
-                    except Exception:
-                        pass
-                non_cb = _to_verify
-            except Exception:
-                # Any failure in the pre-validation skip path falls back to
-                # full verification — safety over speed.
-                pass
+            _to_verify = []
+            _verified_cache_hits = []
+            for i, tx in non_cb:
+                try:
+                    _cached = mempool.is_verified(
+                        tx.tx_id, tx=tx,
+                        signing_payload=signing_payloads[id(tx)])
+                except Exception:
+                    _cached = False
+                if _cached:
+                    _verified_cache_hits.append(tx.tx_id)
+                else:
+                    _to_verify.append((i, tx))
+            if verified_txids is not None and _verified_cache_hits:
+                verified_txids.update(_verified_cache_hits)
+            if _verified_cache_hits:
+                try:
+                    metrics.inc("sig_verify_skipped", len(_verified_cache_hits))
+                except Exception:
+                    pass
+            non_cb = _to_verify
 
         if len(non_cb) >= _PAR_SIG_THRESHOLD:
             pool = _get_sig_pool()

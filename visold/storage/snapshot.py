@@ -23,6 +23,7 @@ Defines: StateSnapshotEngine
 Origin: visold_vsd_.py L17268-17758
 """
 
+import base64
 import hashlib
 import json
 import threading
@@ -60,6 +61,9 @@ class StateSnapshotEngine:
         self._rolling_pruner = rolling_pruner
         self._last_snap_h   = -1
         self._snap_lock     = threading.Lock()
+        # Any marker left by a crash means the bootstrap install did not finish
+        # its commit protocol. Recover it before the Blockchain can serve writes.
+        self._recover_interrupted_bootstrap()
 
     # ── Public: trigger point ─────────────────────────────────────────────────
     def maybe_snapshot(self, height: int, state_root: str, state_lock=None):
@@ -141,7 +145,8 @@ class StateSnapshotEngine:
                 log.warning("StateSnapshotEngine: create error at %d: %s", height, e)
 
     def _serialise_state(self, height: int, state_root: str,
-                         compress: bool = True) -> Optional[bytes]:
+                         compress: bool = True, *,
+                         validate_anchor: bool = True) -> Optional[bytes]:
         """Dump an authenticated complete state snapshot.
 
         A snapshot is only created for a locally persisted canonical block whose
@@ -149,15 +154,19 @@ class StateSnapshotEngine:
         anchor block hash and every state component needed for a local restore.
         """
         try:
-            if not isinstance(height, int) or height <= 0 or not state_root:
+            if not isinstance(height, int) or height < 0 or not state_root:
                 raise ValueError("invalid snapshot height/state_root")
+            if validate_anchor and height <= 0:
+                raise ValueError("authenticated snapshots require a positive height")
 
             header = self._storage.get_block_header(height)
-            if not header:
+            if validate_anchor and not header:
                 raise ValueError(f"canonical block header {height} is unavailable")
+            header = header or {}
             anchor_hash = str(header.get("block_hash", ""))
-            anchor_root = str(header.get("state_root", ""))
-            if not anchor_hash or not anchor_root or anchor_root != state_root:
+            anchor_root = str(header.get("state_root", "") or state_root)
+            if validate_anchor and (
+                    not anchor_hash or not anchor_root or anchor_root != state_root):
                 raise ValueError(
                     f"snapshot anchor mismatch at {height}: "
                     f"header_root={anchor_root[:16]}... supplied_root={state_root[:16]}..."
@@ -213,6 +222,35 @@ class StateSnapshotEngine:
                 for r in con_rows if r["address"]
             }
 
+            # A rollback journal must preserve local tombstones as well as live
+            # contracts. Ordinary peer snapshots intentionally omit destroyed
+            # contracts because they are not part of the live state commitment.
+            recovery_contract_accounts = None
+            if not validate_anchor:
+                if pgx:
+                    all_con_rows = self._storage._pg_fetch(
+                        """SELECT address, code_hash, storage_root, nonce,
+                                  creator, created_at, contract_name, destroyed
+                             FROM contract_accounts ORDER BY convert_to(address, 'UTF8') ASC""", [])
+                else:
+                    all_con_rows = self._storage._conn().execute(
+                        """SELECT address, code_hash, storage_root, nonce,
+                                  creator, created_at, contract_name, destroyed
+                             FROM contract_accounts ORDER BY CAST(address AS BLOB) ASC"""
+                    ).fetchall()
+                recovery_contract_accounts = {
+                    r["address"]: {
+                        "code_hash": r["code_hash"] or "",
+                        "storage_root": r["storage_root"] or "",
+                        "nonce": int(r["nonce"] or 0),
+                        "creator": r["creator"] or "",
+                        "created_at": int(r["created_at"] or 0),
+                        "name": r["contract_name"] or "",
+                        "destroyed": int(r["destroyed"] or 0),
+                    }
+                    for r in all_con_rows if r["address"]
+                }
+
             # Contract bytecode + storage are canonical state and are required
             # to make a trusted local snapshot complete.
             contract_code = {}
@@ -240,6 +278,74 @@ class StateSnapshotEngine:
                     str(k): int(v) for k, v in sorted(tags.items(), key=lambda kv: kv[0].encode("utf-8"))
                     if 1 <= int(v) <= 7
                 }
+
+            recovery_contract_code = None
+            recovery_contract_storage = None
+            recovery_contract_storage_tags = None
+            if recovery_contract_accounts is not None:
+                recovery_contract_code = dict(contract_code)
+                recovery_contract_storage = {k: dict(v) for k, v in contract_storage.items()}
+                recovery_contract_storage_tags = {k: dict(v) for k, v in contract_storage_tags.items()}
+                if pgx:
+                    all_code_hashes = {
+                        str(ct.get("code_hash", ""))
+                        for ct in recovery_contract_accounts.values()
+                        if ct.get("code_hash")
+                    }
+                    for code_hash in all_code_hashes:
+                        if code_hash in recovery_contract_code:
+                            continue
+                        code = self._storage.get_contract_code(code_hash)
+                        if code is not None:
+                            recovery_contract_code[code_hash] = code.hex()
+                    for addr in recovery_contract_accounts:
+                        slots = self._storage.get_all_contract_slots(addr)
+                        recovery_contract_storage[addr] = {
+                            str(k): str(v) for k, v in sorted(
+                                slots.items(), key=lambda kv: kv[0].encode("utf-8"))}
+                        tags = self._storage.get_all_contract_storage_tags(addr)
+                        recovery_contract_storage_tags[addr] = {
+                            str(k): int(v) for k, v in sorted(
+                                tags.items(), key=lambda kv: kv[0].encode("utf-8"))
+                            if 1 <= int(v) <= 7}
+                else:
+                    c = self._storage._conn()
+                    code_rows = c.execute(
+                        "SELECT code_hash, bytecode FROM contract_code ORDER BY code_hash"
+                    ).fetchall()
+                    def _stored_code_hex(raw_code):
+                        # SQLite stores bytecode as hex TEXT. Some legacy/test
+                        # rows may expose bytes-like values; preserve both forms.
+                        if isinstance(raw_code, str):
+                            value = raw_code.strip()
+                            if value.startswith(("0x", "0X")):
+                                value = value[2:]
+                            bytes.fromhex(value)  # reject corrupt recovery material
+                            return value.lower()
+                        return bytes(raw_code).hex()
+
+                    recovery_contract_code = {
+                        str(r["code_hash"]): _stored_code_hex(r["bytecode"])
+                        for r in code_rows if r["code_hash"]
+                    }
+                    slot_rows = c.execute(
+                        "SELECT contract_addr, slot_key, slot_value FROM contract_storage "
+                        "ORDER BY CAST(contract_addr AS BLOB), CAST(slot_key AS BLOB)"
+                    ).fetchall()
+                    tag_rows = c.execute(
+                        "SELECT contract_addr, slot_key, type_tag FROM contract_storage_tags "
+                        "ORDER BY CAST(contract_addr AS BLOB), CAST(slot_key AS BLOB)"
+                    ).fetchall()
+                    recovery_contract_storage = {}
+                    for r in slot_rows:
+                        recovery_contract_storage.setdefault(str(r["contract_addr"]), {})[
+                            str(r["slot_key"])] = str(r["slot_value"])
+                    recovery_contract_storage_tags = {}
+                    for r in tag_rows:
+                        tag = int(r["type_tag"])
+                        if 1 <= tag <= 7:
+                            recovery_contract_storage_tags.setdefault(
+                                str(r["contract_addr"]), {})[str(r["slot_key"])] = tag
 
             # Roles / validators, including registration timestamp.
             if pgx:
@@ -389,6 +495,13 @@ class StateSnapshotEngine:
                 "cumulative_issued_sat": cumulative_issued_sat,
                 "governance_proposals": governance_proposals,
             }
+            if recovery_contract_accounts is not None:
+                payload.update({
+                    "recovery_contract_accounts": recovery_contract_accounts,
+                    "recovery_contract_code": recovery_contract_code or {},
+                    "recovery_contract_storage": recovery_contract_storage or {},
+                    "recovery_contract_storage_tags": recovery_contract_storage_tags or {},
+                })
             # Canonical JSON bytes are the object committed by the next
             # bootstrap-commitment block.  sort_keys + compact separators make
             # the digest independent of database row iteration order.
@@ -750,6 +863,173 @@ class StateSnapshotEngine:
         )
         return True, "OK (canonical state already present)"
 
+    _BOOTSTRAP_MARKER = "bootstrap_restore_in_progress"
+    _BOOTSTRAP_JOURNAL = "bootstrap_restore_backup"
+
+    def _restore_bootstrap_side_tables(self, payload: dict) -> None:
+        """Restore replay-protection and governance tables from a recovery payload.
+
+        These tables are deliberately outside ``restore_snapshot_state``. Keep
+        the durable bootstrap journal until this method and metadata restoration
+        have both completed, so startup can safely retry after a crash.
+        """
+        replay = [str(x) for x in payload.get("tx_replay_guard", []) if x]
+        governance = list(payload.get("governance_proposals", []) or [])
+        storage = self._storage
+        if storage._pgx_enabled:
+            async def _replay_restore():
+                async with storage._pg._pool.acquire() as conn:
+                    async with conn.transaction():
+                        await conn.execute("DELETE FROM tx_replay_guard")
+                        if replay:
+                            await conn.executemany(
+                                "INSERT INTO tx_replay_guard (tx_id) VALUES ($1) "
+                                "ON CONFLICT DO NOTHING", [(x,) for x in replay])
+            storage._pg.run(_replay_restore())
+            storage._pg_exec("DELETE FROM upgrade_proposals")
+        else:
+            c = storage._conn()
+            with storage._sqlite_api_lock:
+                # A prior injected/real SQLite write error may leave an implicit
+                # transaction open. The state restore has already committed, and
+                # no outer atomic block may own this connection here.
+                if c.atomic_active():
+                    raise RuntimeError("cannot restore bootstrap side tables during an active atomic block")
+                c.rollback()
+                c.execute("BEGIN")
+                try:
+                    c.execute("CREATE TABLE IF NOT EXISTS tx_replay_guard (tx_id TEXT PRIMARY KEY)")
+                    c.execute("DELETE FROM tx_replay_guard")
+                    c.executemany(
+                        "INSERT INTO tx_replay_guard (tx_id) VALUES (?)", [(x,) for x in replay])
+                    c.execute("DELETE FROM upgrade_proposals")
+                    c.commit()
+                except Exception:
+                    c.rollback()
+                    raise
+        for proposal in governance:
+            storage.save_upgrade_proposal(
+                version=int(proposal["version"]),
+                phase=str(proposal.get("phase", "DORMANT")),
+                signal_start=int(proposal.get("signal_start_height", 0)),
+                signal_end=int(proposal.get("signal_end_height", 0)),
+                lock_in_height=int(proposal.get("lock_in_height", 0)),
+                activation_height=int(proposal.get("activation_height", 0)),
+                threshold=float(str(proposal.get("threshold", "0.75"))),
+                rollback_window=int(proposal.get("rollback_window", 0)),
+                disabled=bool(int(proposal.get("disabled", 0))),
+            )
+
+    def _rollback_bootstrap_journal(self, journal: dict) -> None:
+        """Roll back an interrupted bootstrap; leave its marker on any failure.
+
+        Marker removal is the final action. If any sub-step fails, the node stays
+        write-blocked and the same idempotent recovery is retried on next startup.
+        """
+        try:
+            # A failed SQLite metadata statement can leave the shared connection
+            # in an implicit transaction. Clear that failed statement before the
+            # multi-table restore begins; never discard an application-owned
+            # atomic transaction while attempting recovery.
+            if not self._storage._pgx_enabled:
+                c = self._storage._conn()
+                with self._storage._sqlite_api_lock:
+                    if c.atomic_active():
+                        raise RuntimeError(
+                            "cannot recover bootstrap while another SQLite atomic block is active")
+                    c.rollback()
+            encoded = journal["old_state_zlib_b64"]
+            old_raw = zlib.decompress(base64.b64decode(encoded.encode("ascii")))
+            old_state = json.loads(old_raw.decode("utf-8"))
+            if not isinstance(old_state, dict) or int(old_state.get("version", 0)) < 4:
+                raise ValueError("bootstrap recovery journal has invalid prior state")
+
+            # Restore execution state first. SQLite replaces its state in one
+            # transaction; PGX restores canonical SQL state and Rocks state using
+            # the same backend-aware storage routine as normal bootstrap.
+            self._storage.restore_snapshot_state(old_state)
+            self._restore_bootstrap_side_tables(old_state)
+            self._storage.restore_meta_values(journal.get("old_meta", {}))
+
+            for height in reversed([int(h) for h in journal.get("installed_heights", [])]):
+                if self._storage.get_block(height) is not None:
+                    if not self._storage.delete_block(height):
+                        raise RuntimeError(f"could not remove partially installed header {height}")
+
+            # Atomic marker/journal clear only after every rollback step succeeds.
+            self._storage.set_meta_batch({
+                self._BOOTSTRAP_MARKER: "",
+                self._BOOTSTRAP_JOURNAL: "",
+            })
+        except Exception as exc:
+            log.critical(
+                "StateSnapshotEngine: bootstrap recovery did not complete; "
+                "the persistent marker is retained and block writes must remain "
+                "disabled: %s", exc)
+            raise
+
+    def _recover_interrupted_bootstrap(self) -> None:
+        marker = self._storage.get_meta(self._BOOTSTRAP_MARKER, "") or ""
+        journal_raw = self._storage.get_meta(self._BOOTSTRAP_JOURNAL, "") or ""
+        if not marker:
+            if journal_raw:
+                # A successful install clears both keys in one metadata transaction;
+                # a journal without a marker is stale debris from an older build.
+                self._storage.set_meta(self._BOOTSTRAP_JOURNAL, "")
+            return
+        if not journal_raw:
+            raise RuntimeError(
+                "incomplete authenticated bootstrap has no recovery journal; "
+                "refusing to start with potentially inconsistent chain state")
+        try:
+            journal = json.loads(journal_raw)
+            if not isinstance(journal, dict) or int(journal.get("version", 0)) != 1:
+                raise ValueError("unsupported bootstrap recovery journal version")
+            self._rollback_bootstrap_journal(journal)
+            log.warning("StateSnapshotEngine: recovered interrupted bootstrap at marker %s", marker)
+        except Exception as exc:
+            raise RuntimeError(
+                "authenticated bootstrap recovery failed; refusing node startup "
+                f"to avoid using inconsistent execution state: {exc}") from exc
+
+    def _create_bootstrap_journal(self, local_h: int, snap_h: int,
+                                  sig_start: int) -> dict:
+        """Persist enough prior state to roll back a failed bootstrap or crash."""
+        marker = self._storage.get_meta(self._BOOTSTRAP_MARKER, "") or ""
+        if marker:
+            raise RuntimeError("another authenticated bootstrap recovery is pending")
+        header = self._storage.get_block_header(local_h) or {}
+        backup_root = str(header.get("state_root", "") or "local-state-recovery")
+        prior_raw = self._serialise_state(
+            int(local_h), backup_root, compress=False, validate_anchor=False)
+        if prior_raw is None:
+            raise RuntimeError("could not capture current execution state before bootstrap")
+        prior_z = zlib.compress(prior_raw, level=9)
+        meta_keys = {
+            "l2_tree", "l2_last_batch_id", "l2_history", "l2_history_first_height",
+            "cumulative_issued_sat", "rolling_pruned_until", "bootstrap_checkpoint_height",
+            "bootstrap_checkpoint_hash", "snap_restored_height", "snap_restored_root",
+            "chain_recovery_required", f"block_apply:{snap_h}",
+        }
+        meta_keys.update(f"proto_sig:{h}" for h in range(max(0, int(sig_start)), snap_h + 1))
+        old_meta = {key: self._storage.get_meta(key) for key in sorted(meta_keys)}
+        journal = {
+            "version": 1,
+            "local_height": int(local_h),
+            "snapshot_height": int(snap_h),
+            "installed_heights": list(range(int(local_h) + 1, int(snap_h) + 1)),
+            "old_state_zlib_b64": base64.b64encode(prior_z).decode("ascii"),
+            "old_meta": old_meta,
+        }
+        # Marker and journal are committed atomically before the first header/state
+        # mutation. A process death at any later point is recoverable on startup.
+        self._storage.set_meta_batch({
+            self._BOOTSTRAP_JOURNAL: json.dumps(
+                journal, separators=(",", ":"), sort_keys=True),
+            self._BOOTSTRAP_MARKER: str(int(snap_h)),
+        })
+        return journal
+
     def restore_authenticated_bootstrap(self, blob: bytes, expected_digest: str,
                                         verified_headers: list, *,
                                         allow_same_height_repair: bool = False
@@ -869,11 +1149,24 @@ class StateSnapshotEngine:
         except Exception as exc:
             return False, f"snapshot monetary/L2 metadata invalid: {exc}"
 
-        # Write a durable marker before the multi-store installation.  A crash
-        # can therefore never be mistaken for a completed bootstrap.  The
-        # operation is idempotent for a fresh node and can be retried.
-        self._storage.set_meta("bootstrap_restore_in_progress", str(snap_h))
-        installed = []
+        # A height beyond the reported local tip must not already contain an
+        # orphan/candidate row: rollback recovery owns only rows proven absent
+        # before this operation, never an existing local record.
+        for _h in range(local_h + 1, snap_h + 1):
+            try:
+                if self._storage.get_block(_h) is not None:
+                    return False, (
+                        f"authenticated bootstrap refuses pre-existing block row "
+                        f"above local tip at height {_h}")
+            except Exception as exc:
+                return False, f"cannot validate bootstrap install range: {exc}"
+
+        _sig_start = max(0, snap_h - int(Config.FORK_SIGNAL_WINDOW) - 1)
+        try:
+            journal = self._create_bootstrap_journal(local_h, snap_h, _sig_start)
+        except Exception as exc:
+            return False, f"cannot prepare durable bootstrap recovery journal: {exc}"
+        committed = False
         try:
             from visold.ledger.block import Block
 
@@ -887,12 +1180,6 @@ class StateSnapshotEngine:
                 d["validator_sigs"] = []
                 blk = Block.from_dict(d)
                 self._storage.save_block(blk)
-                installed.append(h)
-
-            # Replace all canonical execution state from the digest-authenticated
-            # payload, then restore state components intentionally kept outside
-            # the legacy L1 state_root.
-            self._storage.restore_snapshot_state(payload)
 
             if self._storage._pgx_enabled:
                 self._storage._pg_exec("DELETE FROM tx_replay_guard")
@@ -935,7 +1222,6 @@ class StateSnapshotEngine:
 
             # Reconstruct the signaling window from authenticated header fields
             # rather than trusting peer metadata.
-            _sig_start = max(0, snap_h - int(Config.FORK_SIGNAL_WINDOW) - 1)
             for _h in range(_sig_start, snap_h + 1):
                 _hd = verified_headers[_h]
                 self._storage.set_meta(
@@ -972,17 +1258,37 @@ class StateSnapshotEngine:
             # rollback below it must be refused rather than reset to empty.
             self._storage.set_meta("l2_history_first_height", "0")
             self._storage.set_meta("cumulative_issued_sat", str(cumulative))
-            # Do not set rolling_pruned_until=snap_h.  The local prefix can
-            # still contain full bodies even though the imported suffix is
-            # header-only.  Reconcile from persisted block markers and run the
-            # normal rolling pruner before declaring the restore complete.
+            # Keep the watermark conservative until the state/header installation
+            # has committed. Reconciliation can prune old local bodies, so it must
+            # not run while rollback is still possible.
+            self._storage.set_meta("rolling_pruned_until", "0")
+            self._storage.set_meta("bootstrap_checkpoint_height", str(snap_h))
+            self._storage.set_meta("bootstrap_checkpoint_hash", str(anchor.get("block_hash", "")))
+            self._storage.set_meta("snap_restored_height", str(snap_h))
+            self._storage.set_meta("snap_restored_root", str(payload.get("state_root", "")))
+            self._storage.record_block_apply_result(snap_h, True)
+
+            # Install the authenticated execution state only after every other
+            # required metadata write has succeeded. If the storage operation
+            # fails (including the PGX/RocksDB boundary), the durable journal
+            # restores the prior execution state, metadata and imported headers.
+            self._storage.restore_snapshot_state(payload)
+
+            # The installed headers + execution state now describe the same H
+            # checkpoint. Clear marker and journal atomically; any failure still
+            # enters the rollback handler while the recovery journal is durable.
+            self._storage.set_meta_batch({
+                self._BOOTSTRAP_MARKER: "",
+                self._BOOTSTRAP_JOURNAL: "",
+            })
+            committed = True
+
+            # Pruning is an irreversible post-commit housekeeping step. Failures
+            # are non-fatal and leave a conservative watermark for retry.
             if self._rolling_pruner is not None:
                 try:
                     self._rolling_pruner.reconcile_after_bootstrap(snap_h)
                 except Exception as _prune_exc:
-                    # Snapshot state is authenticated and already installed.  A
-                    # pruning failure must not undo that state transition, but
-                    # leave a conservative watermark and log so pruning retries.
                     log.warning(
                         "StateSnapshotEngine: post-bootstrap pruning reconciliation "
                         "failed at height=%d: %s", snap_h, _prune_exc)
@@ -990,16 +1296,6 @@ class StateSnapshotEngine:
                         self._storage.set_meta("rolling_pruned_until", "0")
                     except Exception:
                         pass
-            else:
-                # Conservative fallback for direct engine construction.  Never
-                # assert that the snapshot height itself proves old bodies gone.
-                self._storage.set_meta("rolling_pruned_until", "0")
-            self._storage.set_meta("bootstrap_checkpoint_height", str(snap_h))
-            self._storage.set_meta("bootstrap_checkpoint_hash", str(anchor.get("block_hash", "")))
-            self._storage.set_meta("snap_restored_height", str(snap_h))
-            self._storage.set_meta("snap_restored_root", str(payload.get("state_root", "")))
-            self._storage.set_meta("bootstrap_restore_in_progress", "")
-            self._storage.record_block_apply_result(snap_h, True)
 
             # A successfully authenticated bootstrap snapshot is safe to relay.
             # Persist the exact verified compressed bytes plus the digest that
@@ -1030,15 +1326,29 @@ class StateSnapshotEngine:
                 snap_h)
             return True, "OK"
         except Exception as exc:
-            # Best-effort rewind of imported headers.  The in-progress marker is
-            # deliberately retained if any part of state installation failed,
-            # so startup/operations cannot treat this as a clean checkpoint.
-            for h in reversed(installed):
+            if committed:
+                # After the atomic marker/journal clear, chain headers and state
+                # are already consistent. Cache/metrics diagnostics must never
+                # roll back canonical state after this commit point.
+                log.error(
+                    "StateSnapshotEngine: bootstrap h=%d committed; non-critical "
+                    "post-commit work failed: %s", snap_h, exc)
+                return True, "OK (snapshot state committed; post-commit work incomplete)"
+            try:
+                self._rollback_bootstrap_journal(journal)
+            except Exception as recovery_exc:
+                # The persistent marker remains. Blockchain write paths consult it
+                # dynamically and reject new blocks until startup recovery succeeds.
                 try:
-                    self._storage.delete_block(h)
+                    self._storage.set_meta(
+                        "chain_recovery_required",
+                        f"authenticated bootstrap recovery required at height {snap_h}: {recovery_exc}")
                 except Exception:
                     pass
-            return False, f"authenticated bootstrap installation failed: {exc}"
+                return False, (
+                    f"authenticated bootstrap installation failed: {exc}; "
+                    f"rollback recovery is pending and writes are blocked: {recovery_exc}")
+            return False, f"authenticated bootstrap installation failed and was rolled back: {exc}"
 
     # ── v7.5.0: Chunk-based serving ───────────────────────────────────────────
 
