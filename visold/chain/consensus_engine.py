@@ -402,9 +402,11 @@ class ConsensusEngine:
         # the historical snapshot cannot be established safely.
         validators = self.blockchain.get_validator_set_for_block(block)
         if validators is None:
-            log.warning(
-                "Block #%s finalization deferred: eligible validator snapshot unavailable",
-                block.index)
+            self.blockchain._report_missing_validator_snapshot(
+                block,
+                "Block #%s finalization deferred: eligible validator snapshot unavailable"
+                % block.index,
+            )
             return False, "eligible validator snapshot unavailable; refusing BFT vote"
         total_stake_sat = sum(int(v["stake_sat"]) for v in validators)
         validator_count = len(validators)

@@ -607,6 +607,11 @@ class Config:
     # one rebalance pass. Prevents a stuck preferred edge from starving every
     # other edge while keeping the number of proposal waits bounded.
     TOPOLOGY_PRUNE_CANDIDATES_PER_PASS = 3
+    # A bilateral prune tombstone suppresses immediate peer rediscovery.
+    TOPOLOGY_PRUNE_COOLDOWN_SECONDS = 180
+    # Keep UDP/TCP sessions alive briefly after FINALIZE_ACK so the ACK and
+    # transport-level reliable-UDP packet acknowledgement can complete.
+    TOPOLOGY_PRUNE_CLOSE_GRACE_SECONDS = 3.0
     # ``None`` means the designated seed has an unbounded discovery target and
     # remains exempt from topology pruning to preserve bootstrap availability.
     SEED_MIN_PEERS      = None

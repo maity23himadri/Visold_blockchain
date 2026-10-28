@@ -82,7 +82,11 @@ class UDPSession:
         self.inbound: queue.Queue = queue.Queue(maxsize=2048)
         # heartbeat
         self._last_hb_sent  = time.monotonic()
-        self._last_hb_recv  = time.monotonic()   # updated on any inbound packet
+        # Liveness uses every inbound packet, but topology-prune completion
+        # must distinguish actual heartbeat frames from control/data packets
+        # (notably TOPOLOGY_PRUNE_FINALIZE, which also refreshes _last_hb_recv).
+        self._last_hb_recv  = time.monotonic()   # any inbound packet; session liveness
+        self._last_hb_packet_recv = self._last_hb_recv  # only _F_HB frames
         self._liveness_lock = threading.Lock()
         self._liveness_expired = False
         # retransmit background thread (one per session, daemon)
@@ -181,8 +185,8 @@ class UDPSession:
                   frag_off: int, payload: bytes):
         """
         Called by UDPTransport._recv_loop for every packet destined for this
-        session.  Updates heartbeat timestamp unconditionally, then dispatches
-        by flag.
+        session.  Updates general session activity unconditionally and records
+        real heartbeat frames separately, then dispatches by flag.
         """
         with self._liveness_lock:
             # GC may have atomically expired this session immediately before a
@@ -190,7 +194,10 @@ class UDPSession:
             # the transport; the next packet will create/find a fresh session.
             if self._liveness_expired:
                 return
-            self._last_hb_recv = time.monotonic()
+            now = time.monotonic()
+            self._last_hb_recv = now
+            if flags & _F_HB:
+                self._last_hb_packet_recv = now
 
         # ── Control packets ───────────────────────────────────────────────
         if flags & _F_ACK:

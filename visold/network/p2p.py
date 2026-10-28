@@ -132,6 +132,10 @@ from visold.kernel.messages import (
     MSG_TX,
     MSG_TOPOLOGY_PRUNE_ACK,
     MSG_TOPOLOGY_PRUNE_PROPOSE,
+    MSG_TOPOLOGY_PRUNE_COMMIT,
+    MSG_TOPOLOGY_PRUNE_COMMIT_ACK,
+    MSG_TOPOLOGY_PRUNE_FINALIZE,
+    MSG_TOPOLOGY_PRUNE_FINALIZE_ACK,
     MSG_VALIDATOR_SIG,
     MSG_VERIFY,
 )
@@ -2428,6 +2432,14 @@ class P2PNetwork:
             self._topology_last_rebalance_at = 0.0
         if not isinstance(getattr(self, "_topology_pending_prunes", None), dict):
             self._topology_pending_prunes = {}
+        if not isinstance(getattr(self, "_topology_pending_commits", None), dict):
+            self._topology_pending_commits = {}
+        if not isinstance(getattr(self, "_topology_pending_finalizes", None), dict):
+            self._topology_pending_finalizes = {}
+        if not isinstance(getattr(self, "_topology_remote_prunes", None), dict):
+            self._topology_remote_prunes = {}
+        if not isinstance(getattr(self, "_topology_prune_cooldowns", None), dict):
+            self._topology_prune_cooldowns = {}
         return self._topology_lock
 
     def _local_topology_report(self) -> dict:
@@ -2628,42 +2640,263 @@ class P2PNetwork:
             peer_id, target, expected_view_hash=expected_view_hash)
         return result
 
+    def _topology_prune_cooldown_active(self, peer_id: str) -> bool:
+        """Return whether this identity was deliberately pruned recently.
+
+        This short-lived local tombstone prevents PEX/reconnect from immediately
+        recreating an edge both endpoints just agreed to remove. It is not a ban
+        and expires automatically.
+        """
+        self._ensure_topology_state()
+        peer_id = str(peer_id or "")
+        if not peer_id:
+            return False
+        now = time.monotonic()
+        with self._topology_lock:
+            expires = float(self._topology_prune_cooldowns.get(peer_id, 0.0) or 0.0)
+            if expires <= now:
+                self._topology_prune_cooldowns.pop(peer_id, None)
+                return False
+            return True
+
+    def _mark_topology_prune_cooldown(self, peer_id: str) -> None:
+        """Remember a committed edge removal long enough to suppress redial."""
+        self._ensure_topology_state()
+        peer_id = str(peer_id or "")
+        if not peer_id or peer_id == str(self.node_id):
+            return
+        try:
+            seconds = max(30.0, min(900.0, float(
+                getattr(Config, "TOPOLOGY_PRUNE_COOLDOWN_SECONDS", 180.0))))
+        except (TypeError, ValueError, OverflowError):
+            seconds = 180.0
+        now = time.monotonic()
+        with self._topology_lock:
+            # Bound memory when a node cycles through many peers over time.
+            for expired_id, expires_at in list(self._topology_prune_cooldowns.items()):
+                if float(expires_at or 0.0) <= now:
+                    self._topology_prune_cooldowns.pop(expired_id, None)
+            self._topology_prune_cooldowns[peer_id] = now + seconds
+
+    def _clear_topology_prune_cooldown(self, peer_id: str) -> None:
+        """Remove a tentative tombstone when bilateral finalization aborts."""
+        self._ensure_topology_state()
+        with self._topology_lock:
+            self._topology_prune_cooldowns.pop(str(peer_id or ""), None)
+
+    def _finalize_topology_pruned_peer(self, peer, reason: str = "topology_prune") -> None:
+        """Use the normal disconnect cleanup path for an intentional prune.
+
+        In particular, do not pop ``self.peers`` before _on_peer_disconnect():
+        that routine performs router/capability/rate-bucket cleanup and is
+        identity-safe when an old connection has already been replaced.
+        """
+        if peer is None:
+            return
+        peer_id = str(getattr(peer, "peer_id", "") or "")
+        if peer_id:
+            self._mark_topology_prune_cooldown(peer_id)
+        try:
+            setattr(peer, "_intentional_topology_prune", True)
+        except Exception:
+            pass
+
+        # Real P2PNetwork instances have all state required by the complete
+        # disconnect path. Small test harnesses may only provide peers/lock.
+        if (callable(getattr(self, "_on_peer_disconnect", None))
+                and hasattr(self, "storage") and hasattr(self, "router")
+                and hasattr(self, "_untrusted_rate_lock")):
+            try:
+                self._on_peer_disconnect(peer)
+                return
+            except Exception as exc:
+                log.warning("[TopologyPolicy] disconnect cleanup incomplete for %s: %s",
+                            peer_id[:12], type(exc).__name__)
+
+        try:
+            peer.connected = False
+        except Exception:
+            pass
+        try:
+            peer.close()
+        except Exception:
+            pass
+        lock = getattr(self, "_lock", None)
+        if lock is not None:
+            with lock:
+                if getattr(self, "peers", {}).get(peer_id) is peer:
+                    self.peers.pop(peer_id, None)
+                getattr(self, "_eager_peers", set()).discard(peer_id)
+
+    def _expire_remote_topology_prune(self, nonce: str, expected_state) -> None:
+        """Discard an uncompleted remote prune transaction without disconnecting."""
+        self._ensure_topology_state()
+        with self._topology_lock:
+            current = self._topology_remote_prunes.get(nonce)
+            if current is not expected_state or current.get("phase") == "finalizing":
+                return
+            if float(current.get("expires_at", 0.0) or 0.0) > time.monotonic():
+                return
+            self._topology_remote_prunes.pop(nonce, None)
+
+    def _schedule_remote_prune_expiry(self, nonce: str, state, delay: float) -> None:
+        timer = threading.Timer(max(0.1, float(delay)),
+                                self._expire_remote_topology_prune,
+                                args=(nonce, state))
+        timer.daemon = True
+        old_timer = state.get("expiry_timer")
+        if old_timer is not None:
+            try:
+                old_timer.cancel()
+            except Exception:
+                pass
+        state["expiry_timer"] = timer
+        timer.start()
+
+    def _finish_remote_topology_prune(self, nonce: str, expected_state,
+                                      generation: int) -> None:
+        """Complete receiver-side cleanup after FINALIZE_ACK had time to travel."""
+        self._ensure_topology_state()
+        with self._topology_lock:
+            current = self._topology_remote_prunes.get(nonce)
+            if (current is not expected_state or current.get("phase") != "finalizing"
+                    or int(current.get("finalize_generation", -1)) != int(generation)):
+                return
+            peer = current.get("peer")
+            baseline_last_seen = float(current.get("finalize_last_seen", 0.0) or 0.0)
+            latest_last_seen = float(getattr(peer, "last_seen", baseline_last_seen) or baseline_last_seen)
+            # UDP has no EOF. _last_hb_recv is deliberately refreshed by *any*
+            # inbound packet, including FINALIZE itself, so it cannot tell us
+            # whether the initiator kept the edge after FINALIZE_ACK. Compare
+            # actual heartbeat frames received after FINALIZE instead. Wait long
+            # enough for at least two heartbeat periods so an in-flight heartbeat
+            # sent before the initiator closed cannot make this look active.
+            udp_session = getattr(peer, "_session", None) if peer is not None else None
+            if udp_session is not None:
+                hb_interval = max(0.5, float(_UDP_HB_INTERVAL))
+                last_hb_packet_recv = getattr(udp_session, "_last_hb_packet_recv", None)
+                hb_baseline = current.get("finalize_hb_recv_baseline")
+                if last_hb_packet_recv is None or hb_baseline is None:
+                    # Unknown signal history must fail safe: do not remove the
+                    # receiver-side entry when we cannot prove the peer stopped.
+                    peer_still_alive = bool(getattr(peer, "connected", False))
+                else:
+                    last_hb_packet_recv = float(last_hb_packet_recv or 0.0)
+                    hb_baseline = float(hb_baseline or 0.0)
+                    hb_age = (time.monotonic() - last_hb_packet_recv
+                              if last_hb_packet_recv > 0.0 else float("inf"))
+                    heartbeat_after_finalize = last_hb_packet_recv > hb_baseline + 1e-6
+                    recent_heartbeat = hb_age < 1.5 * hb_interval
+                    peer_still_alive = (bool(getattr(peer, "connected", False))
+                                        and heartbeat_after_finalize
+                                        and recent_heartbeat)
+            else:
+                # On TCP, an initiator that accepted FINALIZE_ACK closes the
+                # stream and the ordinary disconnect callback wins this race.
+                # The last-seen check is a fallback for lightweight transports.
+                peer_still_alive = (peer is not None
+                                    and getattr(peer, "connected", False)
+                                    and latest_last_seen > baseline_last_seen + 1.0)
+            if peer_still_alive:
+                current["phase"] = "committed"
+                current["expires_at"] = time.monotonic() + 20.0
+                current["finalize_timer"] = None
+                abort = True
+            else:
+                self._topology_remote_prunes.pop(nonce, None)
+                abort = False
+        if peer is None:
+            return
+        if abort:
+            self._clear_topology_prune_cooldown(str(getattr(peer, "peer_id", "") or ""))
+            self._schedule_remote_prune_expiry(nonce, current, 20.0)
+            log.warning("[TopologyPolicy] prune finalization aborted because peer traffic continued peer=%s",
+                        str(getattr(peer, "peer_id", "") or "")[:12])
+            return
+        self._finalize_topology_pruned_peer(peer, reason="remote_topology_prune")
+        log.info("[TopologyPolicy] bilateral prune completed for peer=%s",
+                 str(getattr(peer, "peer_id", "") or "")[:12])
+
     def _handle_topology_prune_proposal(self, peer, msg: dict) -> None:
-        """Acknowledge only if both endpoints independently see the same safe edge."""
+        """Prepare a valid pruning transaction; do not close on proposal/ACK."""
+        self._ensure_topology_state()
         nonce = str(msg.get("nonce", "") or "")
         edge = msg.get("edge", [])
         view_hash = str(msg.get("view_hash", "") or "")
         allow = False
         try:
             target = self._desired_peer_target()
-            # A dedicated seed remains exempt from initiating prunes by default,
-            # but it can ACK a safe client-initiated removal of the seed edge.
-            # The seed's inbound admission capacity remains unlimited.
+            # Dedicated seeds may ACK a client-initiated removal without
+            # changing their discovery role.
             if target is None and self._is_seed_node_mode():
                 target = max(2, int(getattr(Config, "TOPOLOGY_TARGET_PEERS", 3)))
             issued_at = int(msg.get("issued_at", 0))
             requested_target = int(msg.get("target_degree", -1))
             valid_nonce = (len(nonce) == 32
                            and all(ch in "0123456789abcdef" for ch in nonce.lower()))
+            # Version 2 requires COMMIT and FINALIZE. Never ACK a legacy proposal,
+            # because a pre-v2 initiator may close only its own local peer entry.
+            valid_protocol = msg.get("prune_protocol") == 2
             expected_edge = sorted((str(peer.peer_id), str(self.node_id)))
             valid_edge = (isinstance(edge, list) and len(edge) == 2
                           and edge == expected_edge
                           and str(peer.peer_id) != str(self.node_id))
             fresh = abs(time.time() - issued_at) <= 15
-            if (valid_nonce and valid_edge and len(view_hash) == 64
+            if (valid_protocol and valid_nonce and valid_edge and len(view_hash) == 64
                     and fresh and target is not None
                     and requested_target == int(target)
                     and getattr(peer, "connected", False)):
-                preconditions, reason = self._topology_prune_preconditions_detail(
-                    str(peer.peer_id), int(target), expected_view_hash=view_hash)
-                allow = preconditions is not None
-                if not allow:
-                    log.info("[TopologyPolicy] prune proposal denied: edge=%s<->%s reason=%s",
-                             min(str(peer.peer_id), str(self.node_id))[:12],
-                             max(str(peer.peer_id), str(self.node_id))[:12], reason)
-            else:
-                log.info("[TopologyPolicy] prune proposal denied: peer=%s reason=invalid_or_stale_proposal",
-                         str(getattr(peer, "peer_id", "") or "")[:12])
+                # Expire old incomplete transactions before checking nonce reuse.
+                now_mono = time.monotonic()
+                with self._topology_lock:
+                    for old_nonce, old_state in list(self._topology_remote_prunes.items()):
+                        if (old_state.get("phase") != "finalizing"
+                                and float(old_state.get("expires_at", 0.0) or 0.0) <= now_mono):
+                            self._topology_remote_prunes.pop(old_nonce, None)
+                    existing = self._topology_remote_prunes.get(nonce)
+                if existing is not None:
+                    allow = (str(existing.get("peer_id", "")) == str(peer.peer_id)
+                             and str(existing.get("view_hash", "")) == view_hash
+                             and existing.get("peer") is peer
+                             and existing.get("phase") in {"prepared", "committed", "finalizing"})
+                else:
+                    with self._topology_lock:
+                        conflicting = any(
+                            other_nonce != nonce
+                            and str(other.get("peer_id", "")) == str(peer.peer_id)
+                            and other.get("phase") in {"prepared", "committed", "finalizing"}
+                            and float(other.get("expires_at", 0.0) or 0.0) > time.monotonic()
+                            for other_nonce, other in self._topology_remote_prunes.items())
+                    if conflicting:
+                        allow = False
+                        preconditions, reason = None, "another_prune_for_peer_pending"
+                    else:
+                        preconditions, reason = self._topology_prune_preconditions_detail(
+                            str(peer.peer_id), int(target), expected_view_hash=view_hash)
+                        allow = preconditions is not None
+                    if not allow:
+                        log.info("[TopologyPolicy] prune proposal denied: edge=%s<->%s reason=%s",
+                                 min(str(peer.peer_id), str(self.node_id))[:12],
+                                 max(str(peer.peer_id), str(self.node_id))[:12], reason)
+                    else:
+                        state = {
+                            "peer_id": str(peer.peer_id), "peer": peer,
+                            "view_hash": view_hash, "edge": list(expected_edge),
+                            "phase": "prepared", "expires_at": now_mono + 20.0,
+                            "finalize_generation": 0, "expiry_timer": None,
+                        }
+                        with self._topology_lock:
+                            # Another concurrent handler may have claimed this nonce.
+                            current = self._topology_remote_prunes.get(nonce)
+                            if current is None:
+                                self._topology_remote_prunes[nonce] = state
+                                allow = True
+                            else:
+                                allow = (str(current.get("peer_id", "")) == str(peer.peer_id)
+                                         and str(current.get("view_hash", "")) == view_hash
+                                         and current.get("peer") is peer)
+                        if allow:
+                            self._schedule_remote_prune_expiry(nonce, state, 20.0)
         except (TypeError, ValueError, OverflowError) as exc:
             allow = False
             log.info("[TopologyPolicy] prune proposal denied: peer=%s reason=invalid_fields error=%s",
@@ -2685,6 +2918,155 @@ class P2PNetwork:
                     or str(pending.get("view_hash", "")) != str(msg.get("view_hash", ""))):
                 return
             pending["allow"] = (msg.get("allow") is True)
+            pending["event"].set()
+
+    def _handle_topology_prune_commit(self, peer, msg: dict) -> None:
+        """Accept COMMIT only for a previously approved, matching proposal."""
+        self._ensure_topology_state()
+        nonce = str(msg.get("nonce", "") or "")
+        view_hash = str(msg.get("view_hash", "") or "")
+        with self._topology_lock:
+            state = self._topology_remote_prunes.get(nonce)
+            valid = bool(state
+                         and str(state.get("peer_id", "")) == str(getattr(peer, "peer_id", ""))
+                         and state.get("peer") is peer
+                         and str(state.get("view_hash", "")) == view_hash
+                         and state.get("phase") in {"prepared", "committed"}
+                         and float(state.get("expires_at", 0.0) or 0.0) > time.monotonic()
+                         and getattr(peer, "connected", False))
+            if valid and state.get("phase") == "prepared":
+                state["phase"] = "committed"
+                state["expires_at"] = time.monotonic() + 20.0
+        if not valid:
+            log.info("[TopologyPolicy] rejected unmatched prune commit peer=%s",
+                     str(getattr(peer, "peer_id", "") or "")[:12])
+            return
+        try:
+            sent = bool(peer.send({"type": MSG_TOPOLOGY_PRUNE_COMMIT_ACK,
+                                   "nonce": nonce, "view_hash": view_hash}))
+        except Exception:
+            sent = False
+        if sent:
+            self._schedule_remote_prune_expiry(nonce, state, 20.0)
+
+    def _handle_topology_prune_commit_ack(self, peer, msg: dict) -> None:
+        """Signal COMMIT_ACK only to the matching active local transaction."""
+        self._ensure_topology_state()
+        nonce = str(msg.get("nonce", "") or "")
+        with self._topology_lock:
+            pending = self._topology_pending_commits.get(nonce)
+            if (not pending
+                    or str(pending.get("peer_id", "")) != str(getattr(peer, "peer_id", ""))
+                    or str(pending.get("view_hash", "")) != str(msg.get("view_hash", ""))):
+                return
+            pending["event"].set()
+
+    def _handle_topology_prune_finalize(self, peer, msg: dict) -> None:
+        """Finalize the receiver half without mistaking FINALIZE for a heartbeat.
+
+        Duplicate FINALIZE messages are idempotent: resend the ACK but preserve
+        the original heartbeat baseline and timer. Resetting either on a retry
+        can indefinitely postpone cleanup or hide that the initiator is alive.
+        """
+        self._ensure_topology_state()
+        nonce = str(msg.get("nonce", "") or "")
+        view_hash = str(msg.get("view_hash", "") or "")
+        start_finalize = False
+        with self._topology_lock:
+            state = self._topology_remote_prunes.get(nonce)
+            valid = bool(state
+                         and str(state.get("peer_id", "")) == str(getattr(peer, "peer_id", ""))
+                         and state.get("peer") is peer
+                         and str(state.get("view_hash", "")) == view_hash
+                         and state.get("phase") in {"committed", "finalizing"}
+                         and float(state.get("expires_at", 0.0) or 0.0) > time.monotonic()
+                         and getattr(peer, "connected", False))
+            if valid:
+                if state.get("phase") != "finalizing":
+                    state["phase"] = "finalizing"
+                    state["expires_at"] = time.monotonic() + 60.0
+                    state["finalize_generation"] = int(state.get("finalize_generation", 0)) + 1
+                    session = getattr(peer, "_session", None)
+                    if session is not None:
+                        # _last_hb_recv also changes on normal control/data packets.
+                        # This separate timestamp changes only for actual _F_HB frames.
+                        state["finalize_hb_recv_baseline"] = float(
+                            getattr(session, "_last_hb_packet_recv", 0.0) or 0.0)
+                    state["finalize_last_seen"] = float(
+                        getattr(peer, "last_seen", time.time()) or time.time())
+                    start_finalize = True
+                generation = int(state.get("finalize_generation", 0))
+                # Same RLock as _register_peer's cooldown check: eliminate the
+                # race in which a replacement session registers during finalization.
+                self._mark_topology_prune_cooldown(str(peer.peer_id))
+        if not valid:
+            log.info("[TopologyPolicy] rejected unmatched prune finalize peer=%s",
+                     str(getattr(peer, "peer_id", "") or "")[:12])
+            return
+        # The tombstone was installed before ACKing, so a reconnect cannot register
+        # a replacement session while this prune is being finalized.
+        try:
+            sent = bool(peer.send({"type": MSG_TOPOLOGY_PRUNE_FINALIZE_ACK,
+                                   "nonce": nonce, "view_hash": view_hash}))
+        except Exception:
+            sent = False
+        if not sent:
+            # If this was a duplicate and an earlier ACK already started the timer,
+            # keep that transaction intact; only the first failed send can revert it.
+            if start_finalize:
+                with self._topology_lock:
+                    if self._topology_remote_prunes.get(nonce) is state:
+                        state["phase"] = "committed"
+                        state["expires_at"] = time.monotonic() + 20.0
+                        old_timer = state.get("finalize_timer")
+                        state["finalize_timer"] = None
+                    else:
+                        old_timer = None
+                if old_timer is not None:
+                    try:
+                        old_timer.cancel()
+                    except Exception:
+                        pass
+                self._clear_topology_prune_cooldown(str(peer.peer_id))
+                self._schedule_remote_prune_expiry(nonce, state, 20.0)
+            return
+        if not start_finalize:
+            # Idempotent duplicate: ACK again, but do not restart the grace timer
+            # or move the heartbeat baseline forward.
+            return
+        # UDP heartbeat is sent every _UDP_HB_INTERVAL. The former 15-second grace
+        # always treated the FINALIZE packet itself (which refreshes _last_hb_recv)
+        # as recent traffic and aborted. Wait >2 full heartbeat periods, then only
+        # abort if a *new, recent heartbeat frame* arrived after FINALIZE.
+        if getattr(peer, "_session", None) is not None:
+            try:
+                from visold.network.udp.wire import _UDP_HB_INTERVAL
+                grace = max(8.0, 2.0 * float(_UDP_HB_INTERVAL) + 3.0)
+            except Exception:
+                grace = 33.0
+        else:
+            grace = max(0.5, min(3.0, float(
+                getattr(Config, "TOPOLOGY_PRUNE_CLOSE_GRACE_SECONDS", 1.0))))
+        timer = threading.Timer(grace, self._finish_remote_topology_prune,
+                                args=(nonce, state, generation))
+        timer.daemon = True
+        with self._topology_lock:
+            if self._topology_remote_prunes.get(nonce) is not state:
+                return
+            old_timer = state.get("finalize_timer")
+            state["finalize_timer"] = timer
+        timer.start()
+
+    def _handle_topology_prune_finalize_ack(self, peer, msg: dict) -> None:
+        """Signal FINALIZE_ACK only to the matching active local transaction."""
+        self._ensure_topology_state()
+        nonce = str(msg.get("nonce", "") or "")
+        with self._topology_lock:
+            pending = self._topology_pending_finalizes.get(nonce)
+            if (not pending
+                    or str(pending.get("peer_id", "")) != str(getattr(peer, "peer_id", ""))
+                    or str(pending.get("view_hash", "")) != str(msg.get("view_hash", ""))):
+                return
             pending["event"].set()
 
     def _maybe_prune_topology_edge(self) -> bool:
@@ -2799,8 +3181,9 @@ class P2PNetwork:
             waiter = threading.Event()
             with self._topology_lock:
                 # Never permit overlapping proposals from this node.
-                if any(not isinstance(item, dict) or not item.get("done", False)
-                       for item in self._topology_pending_prunes.values()):
+                if (self._topology_pending_commits or self._topology_pending_finalizes
+                        or any(not isinstance(item, dict) or not item.get("done", False)
+                               for item in self._topology_pending_prunes.values())):
                     log.info("[TopologyPolicy] candidate skipped: edge=%s<->%s reason=proposal_already_pending",
                              edge[0][:12], edge[1][:12])
                     return False
@@ -2812,6 +3195,7 @@ class P2PNetwork:
                 try:
                     sent = bool(peer.send({
                         "type": MSG_TOPOLOGY_PRUNE_PROPOSE,
+                        "prune_protocol": 2,
                         "nonce": nonce,
                         "edge": [edge[0], edge[1]],
                         "view_hash": view_hash,
@@ -2841,24 +3225,95 @@ class P2PNetwork:
                 with self._topology_lock:
                     self._topology_pending_prunes.pop(nonce, None)
 
+            # The proposal ACK is only a prepare vote. Revalidate the graph before
+            # entering the bilateral commit protocol; neither endpoint disconnects
+            # on proposal or commit ACK alone.
             final_check, final_reason = self._topology_prune_preconditions_detail(
                 peer_id, int(target), expected_view_hash=view_hash)
             if not final_check or not getattr(peer, "connected", False):
                 log.info("[TopologyPolicy] candidate skipped: edge=%s<->%s reason=final_recheck_%s",
                          edge[0][:12], edge[1][:12], final_reason)
                 return False
-            log.info("[TopologyPolicy] pruning redundant stable edge %s <-> %s "
-                     "(degree %s/%s, target %s; both endpoints agreed on graph view)",
+
+            commit_event = threading.Event()
+            with self._topology_lock:
+                self._topology_pending_commits[nonce] = {
+                    "peer_id": peer_id, "view_hash": view_hash,
+                    "event": commit_event,
+                }
+            commit_acknowledged = False
+            try:
+                # App-level retries make commit idempotent and protect against a
+                # delayed ACK. The receiver keeps the connection open until FINALIZE.
+                for _attempt in range(4):
+                    if not getattr(peer, "connected", False):
+                        break
+                    try:
+                        commit_sent = bool(peer.send({
+                            "type": MSG_TOPOLOGY_PRUNE_COMMIT,
+                            "nonce": nonce,
+                            "view_hash": view_hash,
+                        }))
+                    except Exception:
+                        commit_sent = False
+                    if not commit_sent:
+                        time.sleep(0.1)
+                        continue
+                    if commit_event.wait(timeout=1.0):
+                        commit_acknowledged = True
+                        break
+                if not commit_acknowledged:
+                    log.info("[TopologyPolicy] prune commit did not complete; keeping edge active peer=%s",
+                             peer_id[:12])
+                    return False
+            finally:
+                with self._topology_lock:
+                    self._topology_pending_commits.pop(nonce, None)
+
+            # Only after the remote confirms COMMIT do we ask it to finalize.
+            # The receiver closes after FINALIZE_ACK has had time to traverse the
+            # transport, avoiding UDP's one-sided close-without-EOF failure mode.
+            finalize_event = threading.Event()
+            with self._topology_lock:
+                self._topology_pending_finalizes[nonce] = {
+                    "peer_id": peer_id, "view_hash": view_hash,
+                    "event": finalize_event,
+                }
+            finalize_acknowledged = False
+            try:
+                for _attempt in range(6):
+                    if not getattr(peer, "connected", False):
+                        break
+                    try:
+                        finalize_sent = bool(peer.send({
+                            "type": MSG_TOPOLOGY_PRUNE_FINALIZE,
+                            "nonce": nonce,
+                            "view_hash": view_hash,
+                        }))
+                    except Exception:
+                        finalize_sent = False
+                    if not finalize_sent:
+                        time.sleep(0.1)
+                        continue
+                    if finalize_event.wait(timeout=1.0):
+                        finalize_acknowledged = True
+                        break
+                if not finalize_acknowledged:
+                    # Do not close unilaterally when FINALIZE_ACK is missing. The
+                    # remote may still have the edge; leaving this connection up
+                    # is safer than recreating the original asymmetric state.
+                    log.warning("[TopologyPolicy] prune finalization unconfirmed; preserving edge peer=%s",
+                                peer_id[:12])
+                    return False
+            finally:
+                with self._topology_lock:
+                    self._topology_pending_finalizes.pop(nonce, None)
+
+            log.info("[TopologyPolicy] bilateral prune finalized edge %s <-> %s "
+                     "(degree %s/%s, target %s)",
                      edge[0][:12], edge[1][:12],
                      final_check.get("degree_a"), final_check.get("degree_b"), target)
-            try:
-                peer.close()
-            except Exception as exc:
-                log.warning("[TopologyPolicy] close failed for %s: %s", peer_id[:12], exc)
-                return False
-            with self._lock:
-                self.peers.pop(peer_id, None)
-                self._eager_peers.discard(peer_id)
+            self._finalize_topology_pruned_peer(peer, reason="local_topology_prune")
             return True
         log.info("[TopologyPolicy] prune deferred: reason=all_candidates_failed attempted=%s",
                  len(candidates))
@@ -3751,6 +4206,17 @@ class P2PNetwork:
             peer._topology_connected_since = time.monotonic()
         except Exception:
             pass
+
+        if peer_id != self.node_id and self._topology_prune_cooldown_active(peer_id):
+            log.info("[TopologyPolicy] rejecting reconnect during prune cooldown peer=%s",
+                     str(peer_id)[:12])
+            try:
+                peer.connected = False
+                peer.close()
+            except Exception:
+                pass
+            self._release_peer_admission(admission_token)
+            return
 
         if peer_id == self.node_id:
             log.warning(
@@ -5637,6 +6103,10 @@ class P2PNetwork:
             MSG_GET_PEERS,
             MSG_TOPOLOGY_PRUNE_PROPOSE,
             MSG_TOPOLOGY_PRUNE_ACK,
+            MSG_TOPOLOGY_PRUNE_COMMIT,
+            MSG_TOPOLOGY_PRUNE_COMMIT_ACK,
+            MSG_TOPOLOGY_PRUNE_FINALIZE,
+            MSG_TOPOLOGY_PRUNE_FINALIZE_ACK,
             MSG_GET_BLOCK,
             MSG_RESOLVE,
             MSG_CAPABILITY_QUERY,
@@ -5944,6 +6414,18 @@ class P2PNetwork:
 
         elif mtype == MSG_TOPOLOGY_PRUNE_ACK:
             self._handle_topology_prune_ack(peer, msg)
+
+        elif mtype == MSG_TOPOLOGY_PRUNE_COMMIT:
+            self._handle_topology_prune_commit(peer, msg)
+
+        elif mtype == MSG_TOPOLOGY_PRUNE_COMMIT_ACK:
+            self._handle_topology_prune_commit_ack(peer, msg)
+
+        elif mtype == MSG_TOPOLOGY_PRUNE_FINALIZE:
+            self._handle_topology_prune_finalize(peer, msg)
+
+        elif mtype == MSG_TOPOLOGY_PRUNE_FINALIZE_ACK:
+            self._handle_topology_prune_finalize_ack(peer, msg)
 
         elif mtype == MSG_GET_PEERS:
             # PEX is a paginated gossip directory, not merely the current direct
@@ -7563,7 +8045,8 @@ class P2PNetwork:
                 f"is still registered; skipping identity-level disconnect "
                 f"bookkeeping.")
             return
-        self.storage.mark_peer_fail(peer.peer_id)
+        if not bool(getattr(peer, "_intentional_topology_prune", False)):
+            self.storage.mark_peer_fail(peer.peer_id)
         self.router.remove(peer.peer_id)
         # ── NEW: Remove capability records for disconnected peer ──────────────
         if hasattr(self, "_capability_router"):
@@ -7702,6 +8185,14 @@ class P2PNetwork:
                             and record.get("peer_id")):
                         peer_id = str(record["peer_id"])
                         break
+
+        # A known pruned edge is temporarily excluded from manual and automatic
+        # redials. _register_peer() repeats this check after authenticated identity
+        # exchange when callers only know an endpoint/IP at dial time.
+        if peer_id and self._topology_prune_cooldown_active(peer_id):
+            log.debug("[TopologyPolicy] dial suppressed during prune cooldown peer=%s",
+                      peer_id[:12])
+            return False
 
         # ── Soft Ban: skip outbound connections to currently-banned IPs ───────
         if self._is_ip_banned(ip):

@@ -232,6 +232,7 @@ def test_seed_can_ack_client_initiated_seed_edge_prune_without_changing_role(mon
     sent = []
     peer = SimpleNamespace(peer_id="a-client", connected=True, send=lambda msg: sent.append(msg) or True)
     network._handle_topology_prune_proposal(peer, {
+        "prune_protocol": 2,
         "nonce": "a" * 32,
         "edge": ["a-client", "z-seed"],
         "view_hash": "b" * 64,
@@ -283,6 +284,7 @@ def test_seed_ack_accepts_sorted_edge_when_seed_id_is_lower(monkeypatch):
     sent = []
     peer = SimpleNamespace(peer_id="z-client", connected=True, send=lambda msg: sent.append(msg) or True)
     network._handle_topology_prune_proposal(peer, {
+        "prune_protocol": 2,
         "nonce": "f" * 32,
         "edge": ["a-seed", "z-client"],
         "view_hash": "e" * 64,
@@ -459,9 +461,17 @@ def test_prune_tries_next_locally_initiated_edge_when_preferred_is_not_ready(mon
 
     def send_ack(peer_obj, message):
         nonce = message["nonce"]
-        pending = network._topology_pending_prunes[nonce]
-        pending["allow"] = True
-        pending["event"].set()
+        kind = message.get("type")
+        if kind == "TOPOLOGY_PRUNE_PROPOSE":
+            pending = network._topology_pending_prunes[nonce]
+            pending["allow"] = True
+            pending["event"].set()
+        elif kind == "TOPOLOGY_PRUNE_COMMIT":
+            pending = network._topology_pending_commits[nonce]
+            pending["event"].set()
+        elif kind == "TOPOLOGY_PRUNE_FINALIZE":
+            pending = network._topology_pending_finalizes[nonce]
+            pending["event"].set()
         return True
 
     fallback_peer_id = fallback_edge[1] if fallback_edge[0] == local_id else fallback_edge[0]
@@ -510,3 +520,369 @@ def test_asymmetric_edge_is_quarantined_but_reciprocal_component_can_prune():
         assert right in adjacency[left] and left in adjacency[right]
         assert len(adjacency[left] & component) > 3
         assert len(adjacency[right] & component) > 3
+
+
+
+def test_remote_prune_is_not_removed_until_commit_and_finalize_are_received(monkeypatch):
+    """The receiving node must explicitly participate in bilateral edge removal."""
+    import threading
+    from types import SimpleNamespace
+
+    network = object.__new__(P2PNetwork)
+    network.node_id = "node-41"
+    network._lock = threading.RLock()
+    network._eager_peers = set()
+    network.peers = {}
+    network._ensure_topology_state()
+    nonce = "1" * 32
+    view_hash = "2" * 64
+    messages = []
+    peer = SimpleNamespace(peer_id="node-38", connected=True, last_seen=time.time(),
+                           send=lambda message: messages.append(message) or True,
+                           close=lambda: setattr(peer, "connected", False))
+    network.peers[peer.peer_id] = peer
+    state = {
+        "peer_id": peer.peer_id, "peer": peer, "view_hash": view_hash,
+        "edge": ["node-38", "node-41"], "phase": "prepared",
+        "expires_at": time.monotonic() + 20.0,
+        "finalize_generation": 0, "expiry_timer": None,
+    }
+    network._topology_remote_prunes[nonce] = state
+    cooldowns = []
+    network._mark_topology_prune_cooldown = lambda peer_id: cooldowns.append(peer_id)
+    removed = []
+
+    def fake_finalize(peer_obj, reason="topology_prune"):
+        peer_obj.connected = False
+        peer_obj.close()
+        with network._lock:
+            if network.peers.get(peer_obj.peer_id) is peer_obj:
+                network.peers.pop(peer_obj.peer_id, None)
+            network._eager_peers.discard(peer_obj.peer_id)
+        removed.append((peer_obj.peer_id, reason))
+
+    network._finalize_topology_pruned_peer = fake_finalize
+
+    network._handle_topology_prune_commit(peer, {
+        "nonce": nonce, "view_hash": view_hash,
+    })
+    assert messages[-1]["type"] == "TOPOLOGY_PRUNE_COMMIT_ACK"
+    assert peer.peer_id in network.peers
+    assert state["phase"] == "committed"
+
+    network._handle_topology_prune_finalize(peer, {
+        "nonce": nonce, "view_hash": view_hash,
+    })
+    assert messages[-1]["type"] == "TOPOLOGY_PRUNE_FINALIZE_ACK"
+    assert peer.peer_id in network.peers  # kept alive so ACK delivery can finish
+    assert state["phase"] == "finalizing"
+    assert cooldowns == [peer.peer_id]
+
+    timer = state["finalize_timer"]
+    timer.cancel()
+    network._finish_remote_topology_prune(
+        nonce, state, state["finalize_generation"])
+    assert peer.peer_id not in network.peers
+    assert removed == [(peer.peer_id, "remote_topology_prune")]
+
+
+def test_pruned_peer_identity_is_suppressed_during_cooldown():
+    import threading
+
+    network = object.__new__(P2PNetwork)
+    network._topology_lock = threading.RLock()
+    network._topology_prune_cooldowns = {"node-41": time.monotonic() + 30.0}
+    assert network._topology_prune_cooldown_active("node-41") is True
+    # The outbound dial path must be blocked before it attempts network I/O.
+    assert network._try_add_peer_impl("192.0.2.41", 8338, "node-41") is False
+    network._topology_prune_cooldowns["node-41"] = time.monotonic() - 1.0
+    assert network._topology_prune_cooldown_active("node-41") is False
+
+
+def test_bilateral_prune_handshake_removes_peer_from_both_endpoints():
+    """Exercise the actual prune handlers through a two-ended fake message link."""
+    import threading
+    from types import SimpleNamespace
+
+    node38 = object.__new__(P2PNetwork)
+    node41 = object.__new__(P2PNetwork)
+    node38.node_id = "node-38"
+    node41.node_id = "node-41"
+    for network in (node38, node41):
+        network._lock = threading.RLock()
+        network._eager_peers = set()
+        network.peers = {}
+        network._ensure_topology_state()
+        network._desired_peer_target = lambda: 3
+        network._is_seed_node_mode = lambda: False
+        network._topology_prune_preconditions_detail = (
+            lambda peer_id, target, expected_view_hash="":
+            ({"edge": tuple(sorted((peer_id, "node-38" if peer_id == "node-41" else "node-41"))),
+              "view_hash": expected_view_hash}, "ok"))
+
+    messages_38 = []
+    messages_41 = []
+    peer38 = SimpleNamespace(peer_id="node-41", connected=True, last_seen=time.time())
+    peer41 = SimpleNamespace(peer_id="node-38", connected=True, last_seen=time.time())
+    peer38.close = lambda: setattr(peer38, "connected", False)
+    peer41.close = lambda: setattr(peer41, "connected", False)
+    node38.peers[peer38.peer_id] = peer38
+    node41.peers[peer41.peer_id] = peer41
+
+    def send_from_38(message):
+        messages_38.append(message)
+        kind = message["type"]
+        if kind == "TOPOLOGY_PRUNE_PROPOSE":
+            node41._handle_topology_prune_proposal(peer41, message)
+        elif kind == "TOPOLOGY_PRUNE_COMMIT":
+            node41._handle_topology_prune_commit(peer41, message)
+        elif kind == "TOPOLOGY_PRUNE_FINALIZE":
+            node41._handle_topology_prune_finalize(peer41, message)
+        return True
+
+    def send_from_41(message):
+        messages_41.append(message)
+        kind = message["type"]
+        if kind == "TOPOLOGY_PRUNE_ACK":
+            node38._handle_topology_prune_ack(peer38, message)
+        elif kind == "TOPOLOGY_PRUNE_COMMIT_ACK":
+            node38._handle_topology_prune_commit_ack(peer38, message)
+        elif kind == "TOPOLOGY_PRUNE_FINALIZE_ACK":
+            node38._handle_topology_prune_finalize_ack(peer38, message)
+        return True
+
+    peer38.send = send_from_38
+    peer41.send = send_from_41
+    nonce, view_hash = "a" * 32, "b" * 64
+    propose_event = threading.Event()
+    commit_event = threading.Event()
+    finalize_event = threading.Event()
+    node38._topology_pending_prunes[nonce] = {
+        "peer_id": "node-41", "view_hash": view_hash,
+        "event": propose_event, "allow": False,
+    }
+    node38._topology_pending_commits[nonce] = {
+        "peer_id": "node-41", "view_hash": view_hash, "event": commit_event,
+    }
+    node38._topology_pending_finalizes[nonce] = {
+        "peer_id": "node-41", "view_hash": view_hash, "event": finalize_event,
+    }
+    proposal = {"type": "TOPOLOGY_PRUNE_PROPOSE", "prune_protocol": 2, "nonce": nonce,
+                "edge": ["node-38", "node-41"], "view_hash": view_hash,
+                "target_degree": 3, "issued_at": int(time.time())}
+    assert peer38.send(proposal) is True
+    assert propose_event.is_set()
+    assert node38._topology_pending_prunes[nonce]["allow"] is True
+    assert "node-41" in node38.peers and "node-38" in node41.peers
+
+    assert peer38.send({"type": "TOPOLOGY_PRUNE_COMMIT", "nonce": nonce,
+                        "view_hash": view_hash}) is True
+    assert commit_event.is_set()
+    assert "node-41" in node38.peers and "node-38" in node41.peers
+
+    assert peer38.send({"type": "TOPOLOGY_PRUNE_FINALIZE", "nonce": nonce,
+                        "view_hash": view_hash}) is True
+    assert finalize_event.is_set()
+    assert messages_41[-1]["type"] == "TOPOLOGY_PRUNE_FINALIZE_ACK"
+    # Initiator removes itself only after FINALIZE_ACK.
+    node38._finalize_topology_pruned_peer(peer38, reason="test_local_prune")
+    assert "node-41" not in node38.peers
+    # Receiver retains the transport briefly, then completes its normal cleanup.
+    state = node41._topology_remote_prunes[nonce]
+    state["finalize_timer"].cancel()
+    if state.get("expiry_timer") is not None:
+        state["expiry_timer"].cancel()
+    node41._finish_remote_topology_prune(nonce, state, state["finalize_generation"])
+    assert "node-38" not in node41.peers
+    assert node38._topology_prune_cooldown_active("node-41") is True
+    assert node41._topology_prune_cooldown_active("node-38") is True
+
+
+def _make_remote_udp_prune_test_state(*, heartbeat_baseline, latest_heartbeat,
+                                      any_packet_seen=None):
+    import threading
+    from types import SimpleNamespace
+
+    network = object.__new__(P2PNetwork)
+    network.node_id = "node-41"
+    network._topology_lock = threading.RLock()
+    network._topology_remote_prunes = {}
+    network._topology_prune_cooldowns = {"node-38": time.monotonic() + 180.0}
+    session = SimpleNamespace(
+        # Generic liveness moves on FINALIZE itself; the real heartbeat signal
+        # moves only when an actual UDP _F_HB packet arrives.
+        _last_hb_recv=(time.monotonic() if any_packet_seen is None else any_packet_seen),
+        _last_hb_packet_recv=latest_heartbeat,
+    )
+    peer = SimpleNamespace(peer_id="node-38", connected=True, _session=session,
+                           last_seen=time.time())
+    state = {"peer_id": "node-38", "peer": peer, "view_hash": "f" * 64,
+             "phase": "finalizing", "expires_at": time.monotonic() + 60.0,
+             "finalize_generation": 1, "finalize_last_seen": peer.last_seen,
+             "finalize_hb_recv_baseline": heartbeat_baseline,
+             "finalize_timer": None, "expiry_timer": None}
+    network._topology_remote_prunes["e" * 32] = state
+    finalized = []
+    network._finalize_topology_pruned_peer = lambda *args, **kwargs: finalized.append(args)
+    return network, peer, session, state, finalized
+
+
+def test_udp_remote_prune_aborts_if_initiator_keeps_sending_heartbeats():
+    """A true post-FINALIZE heartbeat means the initiator may have missed the ACK."""
+    now = time.monotonic()
+    network, peer, session, state, finalized = _make_remote_udp_prune_test_state(
+        heartbeat_baseline=now - 2.0,
+        latest_heartbeat=now,
+        any_packet_seen=now)
+    network._finish_remote_topology_prune("e" * 32, state, 1)
+    assert peer.connected is True
+    assert network._topology_remote_prunes["e" * 32]["phase"] == "committed"
+    assert network._topology_prune_cooldown_active("node-38") is False
+    assert not finalized
+    timer = state.get("expiry_timer")
+    if timer is not None:
+        timer.cancel()
+
+
+def test_udp_remote_prune_does_not_treat_finalize_packet_as_heartbeat():
+    """FINALIZE refreshes generic activity but must not cause guaranteed abort."""
+    now = time.monotonic()
+    network, peer, session, state, finalized = _make_remote_udp_prune_test_state(
+        heartbeat_baseline=now,
+        latest_heartbeat=now,
+        any_packet_seen=now)
+    network._finish_remote_topology_prune("e" * 32, state, 1)
+    # The finalize packet updated _last_hb_recv, but no actual heartbeat frame
+    # arrived after the baseline, so receiver-side cleanup must complete.
+    assert finalized == [(peer,)]
+    assert "e" * 32 not in network._topology_remote_prunes
+
+
+def test_udp_session_tracks_heartbeat_frames_separately_from_other_packets():
+    """Control/data packet activity cannot masquerade as a keepalive heartbeat."""
+    import threading
+    from types import SimpleNamespace
+    from visold.network.udp.session import UDPSession
+    from visold.network.udp.wire import _F_ACK, _F_HB
+
+    session = object.__new__(UDPSession)
+    session._liveness_lock = threading.Lock()
+    session._liveness_expired = False
+    session._last_hb_recv = 0.0
+    session._last_hb_packet_recv = 0.0
+    session._window = SimpleNamespace(on_ack=lambda seq: None)
+    session.send_ack = lambda seq: None
+
+    UDPSession.on_packet(session, _F_ACK, 1, 0, 0, b"")
+    any_packet_time = session._last_hb_recv
+    assert any_packet_time > 0.0
+    assert session._last_hb_packet_recv == 0.0
+
+    UDPSession.on_packet(session, _F_HB, 2, 0, 0, b"")
+    assert session._last_hb_recv >= any_packet_time
+    assert session._last_hb_packet_recv >= any_packet_time
+
+
+def test_duplicate_udp_finalize_does_not_reset_heartbeat_baseline_or_timer():
+    """A retransmitted FINALIZE must be idempotent and preserve timeout evidence."""
+    import threading
+    from types import SimpleNamespace
+
+    network = object.__new__(P2PNetwork)
+    network.node_id = "node-41"
+    network._topology_lock = threading.RLock()
+    network._ensure_topology_state()
+    baseline = time.monotonic() - 1.0
+    session = SimpleNamespace(_last_hb_recv=baseline, _last_hb_packet_recv=baseline)
+    sent = []
+    peer = SimpleNamespace(peer_id="node-38", connected=True, _session=session,
+                           last_seen=time.time(),
+                           send=lambda message: sent.append(message) or True)
+    nonce, view_hash = "c" * 32, "d" * 64
+    state = {"peer_id": "node-38", "peer": peer, "view_hash": view_hash,
+             "phase": "committed", "expires_at": time.monotonic() + 20.0,
+             "finalize_generation": 0, "finalize_timer": None, "expiry_timer": None}
+    network._topology_remote_prunes[nonce] = state
+
+    message = {"type": "TOPOLOGY_PRUNE_FINALIZE", "nonce": nonce,
+               "view_hash": view_hash}
+    network._handle_topology_prune_finalize(peer, message)
+    timer = state["finalize_timer"]
+    first_generation = state["finalize_generation"]
+    first_baseline = state["finalize_hb_recv_baseline"]
+
+    session._last_hb_packet_recv = time.monotonic()
+    network._handle_topology_prune_finalize(peer, message)
+    try:
+        assert len(sent) == 2
+        assert all(item["type"] == "TOPOLOGY_PRUNE_FINALIZE_ACK" for item in sent)
+        assert state["finalize_timer"] is timer
+        assert state["finalize_generation"] == first_generation
+        assert state["finalize_hb_recv_baseline"] == first_baseline
+    finally:
+        timer.cancel()
+        expiry_timer = state.get("expiry_timer")
+        if expiry_timer is not None:
+            expiry_timer.cancel()
+
+
+def test_legacy_unilateral_prune_proposal_is_denied_for_protocol_safety(monkeypatch):
+    """Old nodes may close locally on ACK, so v2 must not ACK a legacy proposal."""
+    from types import SimpleNamespace
+
+    network = object.__new__(P2PNetwork)
+    network.node_id = "node-41"
+    network._ensure_topology_state()
+    network._desired_peer_target = lambda: 3
+    network._is_seed_node_mode = lambda: False
+    network._topology_prune_preconditions_detail = lambda *args, **kwargs: (
+        {"view_hash": "b" * 64}, "ok")
+    sent = []
+    peer = SimpleNamespace(peer_id="node-38", connected=True,
+                           send=lambda message: sent.append(message) or True)
+    # Deliberately omit prune_protocol: an old implementation would expect ACK
+    # then close locally, so the new implementation must reject without preparing.
+    network._handle_topology_prune_proposal(peer, {
+        "nonce": "a" * 32, "edge": ["node-38", "node-41"],
+        "view_hash": "b" * 64, "target_degree": 3, "issued_at": int(time.time()),
+    })
+    assert sent[-1]["type"] == "TOPOLOGY_PRUNE_ACK"
+    assert sent[-1]["allow"] is False
+    assert network._topology_remote_prunes == {}
+
+
+def test_intentional_topology_prune_runs_disconnect_cleanup_without_peer_failure_penalty():
+    import threading
+    from types import SimpleNamespace
+
+    network = object.__new__(P2PNetwork)
+    network.node_id = "node-local"
+    network._lock = threading.RLock()
+    network._eager_peers = {"node-remote"}
+    network._untrusted_rate_lock = threading.RLock()
+    network._untrusted_rate = {"node-remote": 3}
+    network._compact_stash_lock = threading.RLock()
+    network._compact_stash = {"waiting": {"source_peer": "node-remote"}}
+    calls = {"peer_fail": 0, "router_remove": [], "capability_remove": []}
+    network.storage = SimpleNamespace(mark_peer_fail=lambda peer_id: calls.__setitem__(
+        "peer_fail", calls["peer_fail"] + 1))
+    network.router = SimpleNamespace(remove=lambda peer_id: calls["router_remove"].append(peer_id))
+    network._capability_router = SimpleNamespace(remove_peer=lambda peer_id:
+        calls["capability_remove"].append(peer_id))
+    network._clear_msg_rate = lambda peer_id: None
+    peer = SimpleNamespace(peer_id="node-remote", ip="192.0.2.41", port=8338,
+                           connected=True, _fork_sync_buffer=[],
+                           _fork_sync_buffer_bytes=0, _fork_sync_target_height=-1,
+                           close=lambda: None, _intentional_topology_prune=True)
+    network.peers = {peer.peer_id: peer}
+
+    network._on_peer_disconnect(peer)
+
+    assert peer.connected is False
+    assert peer.peer_id not in network.peers
+    assert peer.peer_id not in network._eager_peers
+    assert calls["peer_fail"] == 0
+    assert calls["router_remove"] == [peer.peer_id]
+    assert calls["capability_remove"] == [peer.peer_id]
+    assert network._untrusted_rate == {}
+    assert network._compact_stash == {}

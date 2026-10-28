@@ -49,10 +49,17 @@ MSG_GET_PEERS   = "GET_PEERS"
 
 MSG_PEERS       = "PEERS"
 
-# Adaptive topology pruning is a two-phase, connection-local proposal/ack.
-# It is advisory only; no consensus or transaction rules depend on these messages.
+# Adaptive topology pruning uses a connection-local prepare/commit/finalize
+# handshake so both endpoints can clean their peer state. It is advisory only;
+# no consensus or transaction rules depend on these messages.
 MSG_TOPOLOGY_PRUNE_PROPOSE = "TOPOLOGY_PRUNE_PROPOSE"
 MSG_TOPOLOGY_PRUNE_ACK = "TOPOLOGY_PRUNE_ACK"
+# Bilateral topology-prune commit handshake. A peer remains connected until
+# the initiator receives FINALIZE_ACK; this prevents one-sided UDP teardown.
+MSG_TOPOLOGY_PRUNE_COMMIT = "TOPOLOGY_PRUNE_COMMIT"
+MSG_TOPOLOGY_PRUNE_COMMIT_ACK = "TOPOLOGY_PRUNE_COMMIT_ACK"
+MSG_TOPOLOGY_PRUNE_FINALIZE = "TOPOLOGY_PRUNE_FINALIZE"
+MSG_TOPOLOGY_PRUNE_FINALIZE_ACK = "TOPOLOGY_PRUNE_FINALIZE_ACK"
 
 
 MSG_TX          = "TX"

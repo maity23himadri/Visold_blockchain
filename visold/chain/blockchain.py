@@ -122,6 +122,11 @@ class Blockchain:
         # _init_highest_finalized_height() below, which seeds it correctly
         # for a node restarting against an existing chain.
         self._highest_finalized_height = -1
+        # Missing historical validator snapshots can be encountered for a run
+        # of legacy blocks imported from older peers. Keep consensus fail-closed,
+        # but report one warning per contiguous missing-snapshot episode rather
+        # than emitting a yellow warning for every block/retry.
+        self._missing_validator_snapshot_episode = None
         # Reorg replacement blocks are tentative until the complete branch has
         # validated.  apply_block(..., defer_finality=True) suppresses finality
         # side effects while that tentative branch (or a rollback restoration)
@@ -4459,6 +4464,67 @@ class Blockchain:
                 getattr(block, "index", "?"), exc)
             return None
 
+    def _report_missing_validator_snapshot(self, block: Block, message: str) -> None:
+        """Warn once while historical validator snapshots remain unavailable.
+
+        A legacy sync can leave a contiguous range of old blocks without
+        per-height validator snapshots.  Repeated finalization/vote retries
+        must remain fail-closed, but warning once per block (and sometimes
+        twice from separate call sites) is noisy and does not improve safety.
+        The first warning identifies the failure; additional missing heights
+        are counted silently until a trustworthy snapshot is available again.
+        This method changes logging only, never consensus state or decisions.
+        """
+        try:
+            height = int(getattr(block, "index", -1))
+        except (TypeError, ValueError):
+            height = -1
+        with self._lock:
+            episode = self._missing_validator_snapshot_episode
+            if episode is None:
+                episode = {"heights": set(), "first_height": height,
+                           "last_height": height}
+                self._missing_validator_snapshot_episode = episode
+                episode["heights"].add(height)
+                log.warning(
+                    "%s; suppressing repeated warnings until a trustworthy "
+                    "validator snapshot is available",
+                    message,
+                )
+                return
+            episode["heights"].add(height)
+            if height >= 0:
+                valid_heights = [h for h in episode["heights"] if h >= 0]
+                if valid_heights:
+                    episode["first_height"] = min(valid_heights)
+                    episode["last_height"] = max(valid_heights)
+
+    def _note_validator_snapshot_available(self, block: Block) -> None:
+        """End a missing-snapshot warning episode after forward recovery."""
+        try:
+            height = int(getattr(block, "index", -1))
+        except (TypeError, ValueError):
+            height = -1
+        with self._lock:
+            episode = self._missing_validator_snapshot_episode
+            if episode is None:
+                return
+            # Looking up an older block during replay must not clear an episode
+            # caused by a later missing height.
+            if height < 0 or height < int(episode.get("last_height", -1)):
+                return
+            heights = episode.get("heights", set())
+            count = len(heights)
+            first = episode.get("first_height", height)
+            last = episode.get("last_height", height)
+            self._missing_validator_snapshot_episode = None
+            log.info(
+                "Historical validator snapshots available again at block #%s; "
+                "suppressed repeated missing-snapshot warnings for %s block "
+                "height(s) (%s..%s)",
+                height, count, first, last,
+            )
+
     def get_validator_set_for_block(self, block: Block) -> Optional[List[dict]]:
         """Return the validators eligible for this exact block height/hash.
 
@@ -4473,8 +4539,12 @@ class Blockchain:
         except Exception:
             snapshot = None
         if snapshot is not None:
+            self._note_validator_snapshot_available(block)
             return snapshot
-        return self._reconstruct_legacy_validator_snapshot(block)
+        reconstructed = self._reconstruct_legacy_validator_snapshot(block)
+        if reconstructed is not None:
+            self._note_validator_snapshot_available(block)
+        return reconstructed
 
     def _authenticated_block_votes(self, block: Block,
                                    eligible_validators: List[dict]) -> List[dict]:
@@ -4596,9 +4666,11 @@ class Blockchain:
         if eligible_validators is None:
             eligible_validators = self.get_validator_set_for_block(block)
         if eligible_validators is None:
-            log.warning(
-                "BFT finality deferred for block #%s: eligible validator snapshot unavailable",
-                getattr(block, "index", "?"))
+            self._report_missing_validator_snapshot(
+                block,
+                "BFT finality deferred for block #%s: eligible validator snapshot unavailable"
+                % getattr(block, "index", "?"),
+            )
             return
 
         eligible = sorted(
@@ -6720,9 +6792,11 @@ class Blockchain:
         idx = int(target_block.index)
         eligible = self.get_validator_set_for_block(target_block)
         if eligible is None:
-            log.warning(
-                "Validator vote rejected for block #%d: eligible validator snapshot unavailable",
-                idx)
+            self._report_missing_validator_snapshot(
+                target_block,
+                "Validator vote rejected for block #%d: eligible validator snapshot unavailable"
+                % idx,
+            )
             return False
         eligible_by_addr = {
             str(item["address"]): int(item["stake_sat"])
