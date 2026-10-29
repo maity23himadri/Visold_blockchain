@@ -1,0 +1,20 @@
+You are continuing the Visold V4 46-finding repair project from the attached Batch-8 fixed codebase and progress reports.
+
+Current verified status: 43/46 findings fixed. Remaining: BUG-12, BUG-18, BUG-24.
+
+Mandatory rules remain unchanged: verify before modifying; no test-only/garbage fixes; preserve deterministic consensus; targeted regression must fail on untouched Batch-8 behavior where applicable; rerun previous batch regressions; never call a timeout a pass.
+
+Start by re-reading the final audit and all Batch 1-8 progress reports, then re-audit these three findings in current source:
+
+1. BUG-12 — emergency-disable quorum cannot be reached through RPC.
+   Do NOT lower quorum to 1. Trace governance identity, proposal/vote authentication, P2P message support, persistence and replay protection. Decide whether the smallest safe implementation is signed cross-node vote gossip/aggregation. If a correct authenticated implementation cannot be completed safely in this batch, record a design-blocked disposition rather than a fake fix.
+
+2. BUG-18 — legacy state-root hash fallback.
+   The network will restart from scratch, so old-chain compatibility is not required. Verify block version/format handling and every integrity-check caller. If there is no need to accept legacy blocks in the new network, remove or tightly gate the fallback so state_root is always cryptographically committed. Add integrity/apply tests proving state_root mutation changes/rejects block hash. Do not accidentally break genesis/new-format block creation.
+
+3. BUG-24 — CALLCODE semantics.
+   Determine the intended VVM spec from comments/docs/tests and all callers. Do not silently preserve DELEGATECALL aliasing. If CALLCODE is intended to be supported, implement correct CALLCODE semantics (callee code, caller storage/address context, CALLER and CALLVALUE behavior, value operand handling, rollback/gas). If not intended, deterministically reject CALLCODE as unsupported and document/test that protocol choice. Prefer standards-compatible semantics if the existing VM advertises EVM-like CALLCODE behavior.
+
+For each: root cause/evidence, smallest complete fix or justified design-blocked status, baseline-failing regression, adjacent tests, exact commands/results.
+
+After resolving all three, run all Batch 1-9 regression files plus relevant governance/block-integrity/VVM suites in manageable groups. Produce a final BUG-1..46 disposition table and final patched archive only if all findings have a recorded disposition. Keep any unresolved design issue explicit; do not claim 46/46 fixed unless it truly is.

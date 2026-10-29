@@ -172,15 +172,25 @@ class _UDPReassembler:
         Both conditions return False (drop); the session is not torn down.
         """
         if frag_off < 0 or frag_off >= _UDP_FRAG_MAX_PER_GROUP:
-            return False   # out-of-bounds offset — drop silently
+            return False   # out-of-bounds offset — caller must not ACK it
+        if self.last_off is not None and frag_off > self.last_off:
+            return False   # data beyond the declared LAST cannot belong here
         if frag_off in self.frags:
             return False
         if len(self.frags) >= _UDP_FRAG_MAX_PER_GROUP:
-            return False   # group size cap exceeded — drop silently
+            return False   # group size cap exceeded
+        if len(payload) > _UDP_PAYLOAD_MAX:
+            return False
         self.frags[frag_off] = payload
         if is_last:
             self.last_off = frag_off
+            # Reordering can deliver a bogus/high offset before LAST.  Once LAST
+            # is known, those entries are outside the message and must not affect
+            # completion or block the legitimate group (BUG-41).
+            for off in [off for off in self.frags if off > frag_off]:
+                del self.frags[off]
         return True
+
 
     def add_fec(self, payload: bytes, group_end_off: int) -> bool:
         """Record a bounded FEC repair symbol.
@@ -214,6 +224,10 @@ class _UDPReassembler:
         """True if all fragments have been received."""
         if self.last_off is None:
             return False
+        # add_data() enforces unique non-negative offsets and, once LAST is
+        # known, rejects/prunes every offset above last_off.  Under that invariant
+        # count equality is equivalent to exact containment, but remains O(1) for
+        # large (~24k-fragment) messages instead of rescanning the whole range.
         return len(self.frags) == self.last_off + 1
 
     def try_fec_recover(self) -> bool:

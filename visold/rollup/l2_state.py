@@ -34,6 +34,8 @@ from visold.crypto.hashing import sha256
 from visold.kernel.config import Config
 from visold.kernel.logging_setup import log
 from visold.kernel.metrics import metrics
+from visold.kernel.units import VSD_GLOBAL_MARKET
+from visold.ledger.addressing import is_valid_protocol_address
 from visold.rollup.compact_codec import l2_sig_expand
 
 if TYPE_CHECKING:  # annotation-only references (no runtime import, no cycle)
@@ -85,7 +87,10 @@ class L2Transaction:
         self.timestamp  = int(timestamp) if timestamp else int(time.time())
         self.sig        = sig
         self.pub        = pub
-        self.l2_tx_id   = l2_tx_id or self._compute_id()
+        canonical_id = self._compute_id()
+        if l2_tx_id and l2_tx_id != canonical_id:
+            raise ValueError("l2_tx_id does not match canonical transaction content")
+        self.l2_tx_id = canonical_id
 
     def signing_bytes(self) -> bytes:
         """Canonical bytes signed by the sender.  Includes CHAIN_ID + a fixed
@@ -104,6 +109,15 @@ class L2Transaction:
         job of Layer2State.apply()."""
         if not self.sender or not self.receiver:
             return False, "missing sender/receiver"
+        # L2 uses the same canonical receiver namespace as L1.  Sentinels are
+        # explicit protocol addresses; arbitrary strings must never become
+        # spendable L2 accounts.
+        if not is_valid_protocol_address(
+                self.receiver,
+                specials=(L2_BRIDGE_ADDRESS, L2_WITHDRAW_ADDRESS,
+                          Config.BURN_ADDRESS, VSD_GLOBAL_MARKET),
+                allow_contract=True):
+            return False, "invalid receiver address"
         if self.sender == self.receiver:
             return False, "self-send forbidden on L2"
         if self.amount_sat <= 0:

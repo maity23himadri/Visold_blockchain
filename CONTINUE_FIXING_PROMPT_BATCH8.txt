@@ -1,0 +1,20 @@
+Continue fixing the Visold V4 audit findings from the attached Batch-7 patched source. Treat `Visold_V4_Batch7_Fixed.zip` as the only code baseline and read `VISOLD_V4_BUGFIX_PROGRESS_2026-10-29_BATCH7.md` before editing.
+
+Already verified fixed in the current line:
+BUG-1,2,3,4,5,6,7,8,9,10,11,13,14,15,16,17,19,20,21,22,23,25,26,27,28,29,30,31,32,33,34,35,36,37,38,45.
+
+Still pending:
+BUG-12, BUG-18, BUG-24, BUG-39, BUG-40, BUG-41, BUG-42, BUG-43, BUG-44, BUG-46.
+
+For the next batch, prioritize BUG-39, BUG-40, BUG-41, BUG-42, and BUG-43. If and only if they are fully verified and stable, continue with BUG-44 and BUG-46. Leave BUG-12, BUG-18, and BUG-24 for explicit protocol/design treatment unless the current source provides enough evidence to resolve them safely.
+
+Mandatory workflow:
+1. Re-audit the current source before patching each finding. Classify as confirmed, conditional, false positive, intentional, or already fixed.
+2. Re-run cumulative prior regression tests before and after changes. Do not assume prior fixes are correct; inspect for overbroad or test-only patches.
+3. For every new finding, write a regression that fails on an untouched copy of Batch 7 and passes on the patched tree. A test that passes on the buggy baseline is not evidence.
+4. Use the smallest root-cause fix. Check all duplicate callers/paths (VM dry-run/apply/rollback, network send/receive, storage persistence, reorg, RPC) where relevant.
+5. Never weaken or delete an existing test to obtain green results. If an old assertion encodes intentionally superseded behavior, update only that assertion and explain why the new invariant is stronger.
+6. Run focused tests first; split slow suites. A timeout is not a pass. Record exact commands, counts, timeouts, and isolated reruns.
+7. Preserve all Batch-1 through Batch-7 fixes unless a re-audit proves one incomplete or wrong; if so, correct it first and document the prior claim as incomplete.
+8. Do not make arbitrary consensus/protocol changes. The network can restart from genesis, but determinism, signatures, state roots, balances, fees, supply, finality, and rollback must stay coherent.
+9. Maintain/update the persistent progress report and package the full patched codebase plus a Batch-9 continuation prompt.

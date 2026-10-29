@@ -145,11 +145,12 @@ def _verify_shbs_validator_signature(storage_ref, validator_addr: str,
     """
     try:
         validators = storage_ref.get_validators() or []
-        if not any(v.get("address") == validator_addr
-                   and not v.get("slashed", False)
-                   for v in validators):
-            return False, "not_validator"
-    except Exception:
+    except Exception as exc:
+        log.critical("SHBS validator snapshot unavailable: %s", exc)
+        return False, "validator_set_unavailable"
+    if not any(v.get("address") == validator_addr
+               and not v.get("slashed", False)
+               for v in validators):
         return False, "not_validator"
 
     try:
@@ -262,8 +263,13 @@ class GovernanceRollbackVote:
             active_validators = [v for v in validators
                                  if not v.get("slashed", False)]
             n_validators = len(active_validators)
-        except Exception:
-            n_validators = 1
+        except Exception as exc:
+            log.critical("SHBS validator snapshot unavailable: %s", exc)
+            return {"reached": False, "fast_track": False,
+                    "approve_count": 0, "reject_count": 0,
+                    "required": None, "total_validators": None,
+                    "auto_approve": False,
+                    "error": "validator_set_unavailable"}
 
         if n_validators == 0:
             # No validators — auto-approve (solo node scenario)

@@ -1,0 +1,25 @@
+Continue fixing the Visold V4 audit findings from the attached Batch-4 patched codebase.
+
+Treat `Visold_V4_Batch4_Fixed.zip` as the only implementation baseline. Read `VISOLD_V4_BUGFIX_PROGRESS_2026-10-29_BATCH4.md` first.
+
+Important correction from Batch 4: do not trust a previous "fixed" label merely because a regression test passes. Batch 4 found that the earlier BUG-5 and BUG-11 patches were incomplete and corrected them. For every new session, re-check adjacent invariants and existing patches touched by the same code paths. Do not add cosmetic/test-only/garbage fixes.
+
+Already verified fixed in the current line:
+BUG-1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 19, 20, 21, 22, 45.
+
+Pending:
+BUG-12, 18, 23-44 except 45, and BUG-46.
+
+Suggested next focused batch: BUG-23, BUG-25, BUG-26, BUG-27, BUG-28. These are high-value state/VM/self-healing defects that can be fixed independently with targeted tests. Only include BUG-24 if its intended CALLCODE semantics can be established from the code/spec; do not guess. Defer BUG-12 unless implementing authenticated cross-node signed vote aggregation, and defer BUG-18 unless the legacy compatibility boundary is established.
+
+Mandatory workflow for each finding:
+1. Verify against current Batch-4 source before editing; classify confirmed/conditional/false-positive/intentional.
+2. Reproduce on the real class/path when feasible.
+3. Trace all callers and duplicate implementations.
+4. Make the smallest complete root-cause fix.
+5. Add a regression test that fails on an untouched Batch-4 baseline and passes on the patched tree.
+6. Run previous Batch 1-4 regression files to ensure no regression.
+7. Run relevant existing adjacent suites independently with explicit timeouts. A timeout is not a pass.
+8. Keep a persistent report with exact commands/results, root cause, side effects, and unresolved risks.
+9. Never weaken/delete tests to get green. If an old assertion represents obsolete unsafe behavior, preserve the safety invariant and explain precisely why the expected stage/reason changed.
+10. Package the complete patched source, tests, report, and another continuation prompt.

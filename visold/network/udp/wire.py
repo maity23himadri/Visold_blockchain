@@ -23,6 +23,8 @@ Original section: SECTION UDP-TRANSPORT: Resilient UDP Transport Layer for VSD P
 Origin: visold_vsd_.py L1914-1930, L1939-1940, L1943-1948, L1952-1956, L1959-1973, L1976-1982, L2430-2433, L2436-2448, L2677-2686
 """
 
+from visold.kernel.config import Config
+
 import struct
 import zlib
 
@@ -143,7 +145,25 @@ _UDP_FRAG_MAX          = 512    # max concurrent in-flight fragment groups per p
 # one honest message ever needs in practice under the 200-block page cap).
 # Any group that exceeds this limit is silently dropped; the peer's retransmit
 # logic will eventually time-out and the session stays intact.
-_UDP_FRAG_MAX_PER_GROUP = 2048  # max fragments within one reassembly group
+# The 16-bit wire offset can represent 65,536 fragments.  Bound honest
+# reassembly to the configured maximum P2P message size rather than an arbitrary
+# 2,048-fragment ceiling, which previously made valid >2.84 MB UDP messages
+# impossible to receive (BUG-42).
+# zlib's worst-case compressed size can be slightly larger than the source for
+# incompressible data.  Use the documented compressBound-style formula so UDP
+# can carry every message accepted by Config.MAX_MESSAGE_SIZE, not merely every
+# message whose *compressed* size happens to stay below that raw limit.
+_UDP_MAX_COMPRESSED_BYTES = (
+    int(Config.MAX_MESSAGE_SIZE)
+    + (int(Config.MAX_MESSAGE_SIZE) >> 12)
+    + (int(Config.MAX_MESSAGE_SIZE) >> 14)
+    + (int(Config.MAX_MESSAGE_SIZE) >> 25)
+    + 13
+)
+_UDP_FRAG_MAX_PER_GROUP = min(
+    1 << 16,
+    max(1, (_UDP_MAX_COMPRESSED_BYTES + _UDP_PAYLOAD_MAX - 1) // _UDP_PAYLOAD_MAX),
+)
 
 # At most one XOR repair symbol is retained for each complete data-fragment
 # group.  This is derived from the bounded per-group fragment count rather

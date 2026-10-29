@@ -67,6 +67,7 @@ class SupplyConservationMonitor:
         self._storage = storage_ref
         self._blockchain = blockchain_ref
         self._last_checked_supply: Optional[int] = None
+        self._last_checked_height: Optional[int] = None
         self._check_count = 0
 
     def check(self, block, ade: AnomalyDetectionEngine) -> None:
@@ -76,21 +77,35 @@ class SupplyConservationMonitor:
         self._check_count += 1
         try:
             current_supply = self._storage.get_total_supply_sat()
-            if self._last_checked_supply is not None:
-                # Supply can only increase by block_rewards and decrease by burn
-                # A sudden large jump or decrease is a conservation violation
+            # A rollback/reorg can move the sampled height backwards.  A supply
+            # sample from the abandoned branch must never be compared against
+            # the replacement branch; establish a fresh baseline instead.
+            reset_for_reorg = (
+                self._last_checked_height is not None and
+                height <= self._last_checked_height
+            )
+            if reset_for_reorg:
+                self._last_checked_supply = current_supply
+                self._last_checked_height = height
+            elif self._last_checked_supply is not None:
+                # The balance-table total normally changes only through protocol
+                # issuance. Burns are represented by credits to BURN_ADDRESS, so
+                # a large negative jump is also a conservation violation.
                 delta_sat = current_supply - self._last_checked_supply
                 expected_max_delta = (
                     # 50 blocks × ~10 VSD reward × 1e8 sat/VSD × 1.05 tolerance
                     self.SAMPLE_INTERVAL * 10 * 100_000_000 * 1.05
                 )
-                if delta_sat > expected_max_delta:
-                    # Inflate anomaly — inject directly
+                if abs(delta_sat) > expected_max_delta:
+                    # Large positive or negative conservation anomaly.  Visold
+                    # represents burns as balances at BURN_ADDRESS, so ordinary
+                    # burns, fees, L2 escrow transfers and account transfers do
+                    # not reduce sum(all balances).
                     report = AnomalyReport(
                         kind=AnomalyKind.SUPPLY_INFLATION,
                         detected_at=time.time(),
                         description=(
-                            f"Supply jumped {delta_sat/1e8:.4f} VSD in "
+                            f"Supply changed {delta_sat/1e8:.4f} VSD in "
                             f"{self.SAMPLE_INTERVAL} blocks "
                             f"(expected max {expected_max_delta/1e8:.4f} VSD)"
                         ),
@@ -113,6 +128,7 @@ class SupplyConservationMonitor:
                         f"[SUPPLY] Conservation invariant VIOLATED: "
                         f"delta={delta_sat/1e8:.4f} VSD")
             self._last_checked_supply = current_supply
+            self._last_checked_height = height
         except Exception as exc:
             log.debug(f"SupplyConservationMonitor: {exc}")
 

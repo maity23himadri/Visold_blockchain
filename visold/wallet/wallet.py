@@ -34,6 +34,7 @@ from visold.crypto.ecc import (
     G,
     ecdsa_keygen,
     ecdsa_sign,
+    ecdsa_sign_digest,
     pub_from_hex,
     pub_to_address,
     pub_to_hex,
@@ -99,6 +100,16 @@ class Wallet:
     def sign(self, data: bytes) -> Tuple[int,int]:
         h = hashlib.sha256(data).digest()
         return ecdsa_sign(self.priv, h, self._native_private_key, self._crypto_private_key)
+
+    def sign_digest(self, digest: bytes) -> Tuple[int, int]:
+        """Sign an already-finalized 32-byte digest without re-hashing it.
+
+        Use this for VVM state-channel CLOSE/DISPUTE digests.  Ordinary
+        transaction and network signing must continue to use ``sign`` /
+        ``ecdsa_sign`` so their historical signature convention is unchanged.
+        """
+        return ecdsa_sign_digest(
+            self.priv, digest, self._native_private_key, self._crypto_private_key)
 
     # ── v7.5.0-OPT L2 TRANSACTION SIGNING ────────────────────────────────
     def sign_l2_tx(self, receiver: str, amount_sat: int, nonce: int,

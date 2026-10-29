@@ -136,6 +136,7 @@ from visold.kernel.messages import (
     MSG_TOPOLOGY_PRUNE_COMMIT_ACK,
     MSG_TOPOLOGY_PRUNE_FINALIZE,
     MSG_TOPOLOGY_PRUNE_FINALIZE_ACK,
+    MSG_EMERGENCY_VOTE,
     MSG_VALIDATOR_SIG,
     MSG_VERIFY,
 )
@@ -269,6 +270,7 @@ class P2PNetwork:
         # means bursts are buffered behind consensus traffic, not racing.
         "L2TX":             600,
         "VALIDATOR_SIG":     50,
+        "EMERGENCY_VOTE":    20,
         "IDENTITY":          30,
         "ALERT":             10,
         "GET_BLOCK_MANIFEST": 10,
@@ -4987,9 +4989,25 @@ class P2PNetwork:
                                 peer.connected = False
                                 _loop_exit_reason = "peer_invalid_utf8_frame"
                                 break
-                            msg = json.loads(
-                                decoded_text,
-                                parse_constant=_reject_nonfinite_json_constant)
+                            try:
+                                msg = json.loads(
+                                    decoded_text,
+                                    parse_constant=_reject_nonfinite_json_constant)
+                            except (json.JSONDecodeError, ValueError):
+                                # Includes NaN/Infinity rejected by
+                                # _reject_nonfinite_json_constant. Treat these as
+                                # malformed peer input, not an unexpected loop
+                                # exception.
+                                self.storage.add_ban_score(
+                                    peer.peer_id, Config.PEER_SCORE_INVALID_MSG)
+                                _loop_exit_reason = "peer_invalid_json_frame"
+                                continue
+                            if not isinstance(msg, dict):
+                                self.storage.add_ban_score(
+                                    peer.peer_id, Config.PEER_SCORE_INVALID_MSG)
+                                peer.connected = False
+                                _loop_exit_reason = "peer_non_object_json_frame"
+                                break
                             # v7.1.7: inbound P2P message logging (no-op
                             # unless enabled).  Size is the on-wire byte
                             # count (pre-decompression) for symmetry with
@@ -5554,9 +5572,10 @@ class P2PNetwork:
                     # or continue its own retry from the new tip (flag
                     # clear = no pagination thread running).
                     peer._pagination_active.set()
-                    _sent_ok = bool(self._sync_request(
+                    _sent_req_id = self._sync_request(
                         peer, next_page_from, next_page_from + 199,
-                        kind="pagination", force=True))
+                        kind="pagination", force=True)
+                    _sent_ok = bool(_sent_req_id)
                     if _sent_ok:
                         log.debug(
                             f"[ChainSync] Pagination: requested "
@@ -5572,11 +5591,34 @@ class P2PNetwork:
                             _from   = next_page_from,
                             _p      = peer,
                             _h_base = _height_after_apply,
+                            _req    = _sent_req_id,
                         ):
                             time.sleep(Config.CHAIN_SYNC_TIMEOUT_SECS)
                             # ── Success path ─────────────────────────
                             if self.blockchain.height() >= _from:
                                 _p._pagination_active.clear()
+                                return
+                            # ── Answered path: not a zombie ──────────
+                            # The watchdog exists to catch a peer that stays
+                            # silent. A prompt reply to this request (accepted
+                            # or rejected) was already handled by
+                            # _on_chain_sync_result(), which owns the rejection
+                            # recovery. Height not advancing does not mean the
+                            # peer went quiet, so do not penalise or close it,
+                            # and leave _pagination_active to whichever flight
+                            # is current. A reply still being processed by the
+                            # StateEngine is also not silence.
+                            with _p._sync_state_lock:
+                                _last = getattr(_p, "_sync_last_result", None)
+                                _answered = (
+                                    isinstance(_last, dict)
+                                    and _last.get("request_id") == _req)
+                                _pending = _p._sync_pending
+                                _processing = (
+                                    isinstance(_pending, dict)
+                                    and _pending.get("id") == _req
+                                    and _pending.get("status") == "processing")
+                            if _answered or _processing:
                                 return
                             # ── Failure path: peer is zombie ──────────
                             _p._pagination_active.clear()
@@ -6198,7 +6240,23 @@ class P2PNetwork:
                     return
                 # do NOT put() yet — deferred until reconstruction succeeds
             else:
-                msg_hash = sha256(json.dumps(msg, sort_keys=True).encode())
+                # BUG-14: dedup must be based on canonical payload identity,
+                # not mutable/ignored gossip-envelope fields. TTL changes on
+                # every hop and arbitrary top-level extras are ignored by the
+                # L2 handler, so including them turns one payload into unlimited
+                # apparent messages.
+                if mtype == MSG_L2TX and isinstance(msg.get("l2_tx"), dict):
+                    _l2 = msg["l2_tx"]
+                    _dedup_obj = {
+                        "type": MSG_L2TX,
+                        "l2_tx": {k: _l2.get(k) for k in (
+                            "sender", "receiver", "amount_sat", "nonce",
+                            "timestamp", "sig", "pub")},
+                    }
+                else:
+                    _dedup_obj = {k: v for k, v in msg.items() if k != "ttl"}
+                msg_hash = sha256(json.dumps(
+                    _dedup_obj, sort_keys=True, separators=(",", ":")).encode())
                 if self._seen_msgs.get(msg_hash):
                     # Plumtree demotion is only safe on networks with
                     # redundant paths (5+ peers). On tiny 2-3 peer nets,
@@ -6549,16 +6607,21 @@ class P2PNetwork:
                 # If a sequencer is plugged in, enqueue.  Failure is non-
                 # fatal; the L2 tx may simply be duplicate / out of nonce.
                 sequencer = getattr(self, "_sequencer", None)
+                _relay = True
                 if sequencer is not None and getattr(sequencer, "_running", False):
                     try:
-                        sequencer.add_l2_tx(l2_tx)
+                        _accepted, _reason = sequencer.add_l2_tx(l2_tx)
+                        # If our longer-lived sequencer dedup already knows this
+                        # canonical tx (for example after the P2P seen cache was
+                        # evicted), do not amplify it again. Other local admission
+                        # failures such as a full pool must not suppress relay to
+                        # sequencers elsewhere in the network.
+                        if not _accepted and _reason == "duplicate l2_tx_id":
+                            _relay = False
                     except Exception as e:
                         log.debug(f"sequencer.add_l2_tx raised: {e}")
-                # Always relay — other peers may host sequencers we don't
-                # know about, and the DA / mempool semantics require wide
-                # propagation of L2 traffic.  Dedup at _seen_msgs keeps
-                # this from amplifying exponentially.
-                self._gossip(msg, exclude=peer.peer_id)
+                if _relay:
+                    self._gossip(msg, exclude=peer.peer_id)
             except Exception as e:
                 log.debug(f"L2TX handler error: {e}")
 
@@ -7341,14 +7404,18 @@ class P2PNetwork:
                     response["blocks"].append(block_dict)
                     response_size += added_size
                 peer.send(response)
+                served_count = len(response["blocks"])
                 try:
                     log.info(
                         f"[ChainServe] Peer {peer.peer_id[:12]} requested blocks "
-                        f"{from_idx}-{to_idx}; served {len(chain)} block(s) "
+                        f"{from_idx}-{to_idx}; served {served_count} block(s) "
                         f"(chain tip={server_height})"
                     )
+                except Exception:
+                    pass
+                try:
                     _push_sync_request_notif(
-                        peer.peer_id, from_idx, to_idx, len(chain)
+                        peer.peer_id, from_idx, to_idx, served_count
                     )
                 except Exception:
                     pass
@@ -7706,6 +7773,26 @@ class P2PNetwork:
         elif mtype == MSG_RECEIPT_ACK:
             self._handle_receipt_ack(peer, msg)
 
+        elif mtype == MSG_EMERGENCY_VOTE:
+            # BUG-12: signed emergency-disable vote.  Verified and counted on the
+            # StateEngine thread, and relayed there only when it was new and valid.
+            if self._state_engine is not None:
+                evt = Event(
+                    EventType.EMERGENCY_VOTE,
+                    {
+                        "version":      msg.get("version"),
+                        "operator":     msg.get("operator", ""),
+                        "pub_hex":      msg.get("pub_hex", ""),
+                        "sig":          msg.get("sig", ""),
+                        "ts":           msg.get("ts"),
+                        "nonce":        msg.get("nonce", ""),
+                        "genesis_hash": msg.get("genesis_hash", ""),
+                    },
+                    source_peer_id=peer.peer_id,
+                )
+                if not self._state_engine.post(evt, timeout=2.0):
+                    log.warning("[EMERGENCY-VOTE] StateEngine queue full; vote dropped "
+                                "(operators may re-broadcast)")
         elif mtype == MSG_VALIDATOR_SIG:
             # ── Route through StateEngine (single-writer) ─────────────────────
             if self._state_engine is not None:
@@ -7803,8 +7890,21 @@ class P2PNetwork:
             uid    = msg.get("user_id","")
             uid    = uid.strip().casefold() if isinstance(uid, str) else ""
             result = msg.get("result")
-            if uid and result:
-                self._id_cache.put(uid, result)
+            if uid and isinstance(result, dict):
+                # BUG-30: peer directory answers are not ownership proofs.  A
+                # payment destination is accepted only when this node already
+                # has the canonical on-chain name claim and the peer result
+                # matches that claim.  Remote multiaddrs may refresh liveness
+                # metadata, but wallet/pubkey ownership always comes from the
+                # local canonical index.
+                canonical = self.storage.resolve_identity(uid)
+                if (canonical
+                        and str(result.get("wallet_addr", "")) == str(canonical.get("wallet_addr", ""))
+                        and str(result.get("pub_hex", "")) == str(canonical.get("pub_hex", ""))):
+                    merged = dict(canonical)
+                    if isinstance(result.get("multiaddrs"), list):
+                        merged["multiaddrs"] = list(result["multiaddrs"])
+                    self._id_cache.put(uid, merged)
 
         # ── NEW: DiscV5 Capability Discovery ──────────────────────────────────
         elif mtype == MSG_CAPABILITY_ADV:
@@ -8435,7 +8535,8 @@ class P2PNetwork:
         """
         if ttl is None:
             ttl = msg.get("ttl", Config.GOSSIP_TTL)
-        if ttl <= 0: return
+        if ttl <= 0:
+            return 0
         msg = dict(msg)
         msg["ttl"] = ttl - 1
         _mtype = msg.get("type")
@@ -8472,6 +8573,7 @@ class P2PNetwork:
         # Peer.send() is already thread-safe via its own send_lock.
         # [v7.0.0.2 fix]
         if len(targets) <= 1:
+            sent = 0
             for p in targets:
                 try:
                     # Use prioritized queue for consensus-critical messages;
@@ -8480,8 +8582,10 @@ class P2PNetwork:
                         p.send_priority(msg, _pri)
                     else:
                         p.send(msg)
+                    sent += 1
                 except Exception:
                     pass
+            return sent
         else:
             def _fanout_send(_p, _msg, _p_pri):
                 try:
@@ -8496,6 +8600,9 @@ class P2PNetwork:
                 threading.Thread(
                     target=_fanout_send, args=(p, msg, _pri), daemon=True
                 ).start()
+            # For parallel fanout this is the number of connected peers for
+            # which delivery was scheduled, not an end-to-end delivery ACK.
+            return len(targets)
 
     # ── VARR authenticated temporary receipt mailbox ─────────────────────
     def _receipt_distance(self, node_id: str, route_key: str) -> int:
@@ -8816,7 +8923,7 @@ class P2PNetwork:
         """
         msg = {"type": MSG_L2TX, "l2_tx": l2_tx.to_dict(),
                "ttl": Config.GOSSIP_TTL}
-        self._gossip(msg)
+        return int(self._gossip(msg) or 0)
 
     def broadcast_block(self, block: Block, exclude: Optional[str] = None):
         """
@@ -8926,6 +9033,10 @@ class P2PNetwork:
             "ttl": Config.GOSSIP_TTL,
         }
         self._gossip(msg)
+
+    def broadcast_emergency_vote(self, vote: dict):
+        """Gossip a locally signed emergency-disable vote (BUG-12)."""
+        self._gossip(dict(vote, type=MSG_EMERGENCY_VOTE, ttl=Config.GOSSIP_TTL))
 
     def broadcast_identity(self, user_id: str, multiaddrs: List[str]):
         msg = {

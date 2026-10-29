@@ -298,6 +298,22 @@ class ConsensusEngine:
                     log.warning(
                         f"build_candidate_block: excluding {dropped} transaction(s) from "
                         f"sender {victim_sender[:12]}: {rejected.reason}")
+                    # BUG-19: a REGISTER that is no longer affordable cannot
+                    # become mineable without the sender's balance changing.
+                    # Leaving it resident makes every future candidate reject
+                    # the same nonce and blocks later transactions. Evict only
+                    # that rejected REGISTER; BUG-13 keeps the freed nonce open
+                    # for resubmission while preserving later pending entries.
+                    _victim = current[pos]
+                    if (_victim.tx_type == Transaction.TYPE_REGISTER
+                            and "insufficient spendable balance for REGISTER fee"
+                            in rejected.reason):
+                        try:
+                            self.blockchain.mempool.remove(_victim.tx_id)
+                        except Exception as _evict_exc:
+                            log.warning(
+                                "build_candidate_block: failed to evict unaffordable "
+                                "REGISTER %s: %s", _victim.tx_id[:12], _evict_exc)
                     current = (current[:pos]
                                + [t for t in current[pos:] if t.sender != victim_sender])
 

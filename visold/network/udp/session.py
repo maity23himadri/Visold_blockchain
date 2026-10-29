@@ -39,6 +39,7 @@ from visold.network.udp.wire import (
     _F_NACK,
     _UDP_FEC_GROUP,
     _UDP_FRAG_MAX,
+    _UDP_FRAG_MAX_PER_GROUP,
     _UDP_HB_INTERVAL,
     _UDP_HB_TIMEOUT,
     _UDP_PAYLOAD_MAX,
@@ -149,6 +150,10 @@ class UDPSession:
         chunks   = [data[i:i + _UDP_PAYLOAD_MAX]
                     for i in range(0, max(len(data), 1), _UDP_PAYLOAD_MAX)]
         n_frags  = len(chunks)
+        if n_frags > _UDP_FRAG_MAX_PER_GROUP:
+            raise ValueError(
+                f"UDP message requires {n_frags} fragments; maximum is "
+                f"{_UDP_FRAG_MAX_PER_GROUP}")
         fec_acc  = b''           # running XOR accumulator for FEC group
         fec_grp  = 0             # count within current FEC group
 
@@ -216,15 +221,27 @@ class UDPSession:
             return
 
         # ── Data / FEC ────────────────────────────────────────────────────
-        # ACK the seq unconditionally (stop-and-wait-style per packet)
-        self.send_ack(seq)
+        # A fragment that cannot be represented by this receiver must not be
+        # ACKed: ACK would make the sender drop its retransmit copy and turn the
+        # receiver-side rejection into silent permanent message loss (BUG-42).
+        if frag_off < 0 or frag_off >= _UDP_FRAG_MAX_PER_GROUP:
+            return
 
         if flags & _F_FEC:
             self._handle_fec(frag_id, frag_off, payload)
+            self.send_ack(seq)
             return
 
         is_last = bool(flags & _F_LAST)
-        self._handle_data(frag_id, frag_off, is_last, payload)
+        r = self._get_or_create_reassembler(frag_id)
+        if r.last_off is not None and frag_off > r.last_off:
+            return
+        if frag_off not in r.frags:
+            if not r.add_data(frag_off, is_last, payload):
+                return
+        # Duplicates are ACKed so ordinary retransmission can terminate.
+        self.send_ack(seq)
+        self._try_deliver(frag_id, r)
 
     def _get_or_create_reassembler(self, frag_id: int) -> '_UDPReassembler':
         with self._rassem_lock:

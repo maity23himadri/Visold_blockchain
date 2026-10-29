@@ -49,7 +49,7 @@ from visold.ledger.transaction import Transaction
 from visold.mempool.pool import Mempool
 from visold.rollup.batches import RollupSubmission
 from visold.rollup.l2_state import L2_BRIDGE_ADDRESS, L2_WITHDRAW_ADDRESS, Layer2State
-from visold.rollup.ledger_sync import sync_local_ledger
+from visold.rollup.ledger_sync import sync_local_ledger, invalidate_local_ledger_block
 from visold.state.batch_proxy import _StorageBatchProxy
 from visold.storage.rolling_window_pruner import RollingWindowPruner
 from visold.storage.snapshot import StateSnapshotEngine
@@ -704,6 +704,8 @@ class Blockchain:
                     f"Pruned block #{getattr(block, 'index', '?')} has no transaction body; "
                     "full block validation/application is not possible"
                 )
+            if not isinstance(getattr(block, "miner_address", None), str) or not block.miner_address.strip():
+                return False, "Block miner_address must be non-empty"
             # Consensus fields must never accept IEEE-754 non-finite values.
             # NaN makes ordinary comparisons false and can otherwise bypass
             # timestamp and difficulty validation.
@@ -870,6 +872,17 @@ class Blockchain:
             # neither an under-claim nor an over-claim is valid.
             expected_subsidy_sat = self.compute_reward_sat(block.index)
             cb_tx      = block.transactions[0]
+            # BUG-8: reject non-finite or storage-unrepresentable coinbase
+            # amounts before to_satoshi() can raise. SQLite INTEGER and all
+            # consensus balance counters are signed 64-bit satoshi values.
+            try:
+                _cb_value = float(cb_tx.amount)
+                _cb_scaled = _cb_value * Config.SATOSHI_PER_VSD
+                if (not math.isfinite(_cb_value) or not math.isfinite(_cb_scaled)
+                        or abs(_cb_scaled) > (2**63 - 1)):
+                    return False, "Invalid coinbase amount: out of consensus range"
+            except (TypeError, ValueError, OverflowError):
+                return False, "Invalid coinbase amount: must be a finite number"
             cb_amt_sat = to_satoshi(cb_tx.amount)
             if cb_amt_sat != expected_subsidy_sat:
                 return False, (f"Coinbase amount {cb_tx.amount} does not match "
@@ -1119,8 +1132,10 @@ class Blockchain:
                         return False, f"Insufficient balance for {tx.sender[:12]}"
                     pending_debits[tx.sender] = already_spent + required_sat
                 else:
-                    # Standard transfer balance check (satoshi)
-                    required_sat = to_satoshi(tx.amount) + tx.compute_fee_sat()
+                    # L2 withdrawal value is released from bridge escrow; it
+                    # does not require the wallet to pre-fund amount+fee on L1.
+                    required_sat = (0 if tx.receiver == L2_WITHDRAW_ADDRESS
+                                    else to_satoshi(tx.amount) + tx.compute_fee_sat())
                     if available_sat < required_sat:
                         return False, f"Insufficient balance for {tx.sender[:12]}"
                     pending_debits[tx.sender] = already_spent + required_sat
@@ -1405,7 +1420,8 @@ class Blockchain:
                     raise CandidateTxRejected(
                         pos, tx, "insufficient spendable balance for REGISTER fee")
             else:
-                required = to_satoshi(tx.amount) + tx.compute_fee_sat()
+                required = (0 if tx.receiver == L2_WITHDRAW_ADDRESS
+                            else to_satoshi(tx.amount) + tx.compute_fee_sat())
                 if available < required:
                     raise CandidateTxRejected(
                         pos, tx,
@@ -1480,13 +1496,18 @@ class Blockchain:
         Returns the hex state_root string (or sha256("empty_state") for an
         empty chain).  Raises only on truly catastrophic storage failure.
         """
+        # BUG-6 / BUG-1: candidate simulation must never run with an invalid
+        # miner address.  Reject locally before reward simulation so the dry run
+        # remains side-effect-free even for direct/internal callers.
+        if not isinstance(miner_address, str) or not miner_address.strip():
+            raise ValueError("dry_run_state_root requires a non-empty miner_address")
+
         # Build the touched-account set the same way apply_block does.
         touched: Set[str] = set()
         for tx in transactions:
             if tx.sender:   touched.add(tx.sender)
             if tx.receiver: touched.add(tx.receiver)
-        if miner_address:
-            touched.add(miner_address)
+        touched.add(miner_address)
         for v in self.storage.get_all_by_role("investor"):
             touched.add(v["address"])
         for m in self.storage.get_all_by_role("miner"):
@@ -1973,6 +1994,35 @@ class Blockchain:
                 # ── Standard transfer ─────────────────────────────────────────
                 fee_sat = tx.compute_fee_sat()
                 amount_sat = to_satoshi(tx.amount)
+
+                # A withdrawal is settled from L2 bridge escrow, not from the
+                # wallet's pre-existing L1 balance.  Mirror only the L1 side
+                # here; Layer2State itself is intentionally not mutated by a
+                # dry run.
+                if tx.receiver == L2_WITHDRAW_ADDRESS and amount_sat > 0:
+                    layer2 = getattr(self, "layer2", None)
+                    if layer2 is None:
+                        raise CandidateTxRejected(_tx_idx, tx, "L2 subsystem not initialised")
+                    if fee_sat < 0 or fee_sat > amount_sat:
+                        raise CandidateTxRejected(_tx_idx, tx, "invalid L2 withdrawal fee")
+                    l2_bal = layer2.get_balance_sat(tx.sender) - _l2_spent.get(tx.sender, 0)
+                    bridge_bal = self.storage.get_balance_sat(L2_BRIDGE_ADDRESS)
+                    if l2_bal < amount_sat:
+                        raise CandidateTxRejected(_tx_idx, tx, "insufficient L2 balance for withdrawal")
+                    if bridge_bal < amount_sat:
+                        raise CandidateTxRejected(_tx_idx, tx, "insufficient L2 bridge escrow for withdrawal")
+                    _l2_spent[tx.sender] = _l2_spent.get(tx.sender, 0) + amount_sat
+                    if not self.storage.debit_sat(L2_BRIDGE_ADDRESS, amount_sat):
+                        raise CandidateTxRejected(_tx_idx, tx, "L2 bridge escrow debit failed")
+                    payout_sat = amount_sat - fee_sat
+                    if payout_sat > 0:
+                        self.storage.credit_sat(tx.sender, payout_sat)
+                    touched.add(L2_BRIDGE_ADDRESS)
+                    fee_pool_sat += fee_sat
+                    cur_nonce = self.storage.get_nonce(tx.sender)
+                    self.storage.set_nonce(tx.sender, max(cur_nonce, tx.nonce + 1))
+                    continue
+
                 if not self.storage.debit_sat(tx.sender, fee_sat + amount_sat):
                     # Same balance check that apply_block does — if it would
                     # fail there, it fails here, and the candidate-builder
@@ -2002,34 +2052,6 @@ class Blockchain:
                 # be included — which the credit_sat above already covers.
                 # No additional action needed for deposits beyond what the
                 # standard credit_sat already did.
-                # ── L2 WITHDRAWAL HOOK (mirror of apply_block) ────────────
-                # When receiver == L2_WITHDRAW_ADDRESS, apply_block debits
-                # L2_BRIDGE_ADDRESS and credits tx.sender on L1.  We must
-                # mirror those exact storage mutations here so the dry-run
-                # state_root matches the post-apply state_root.
-                # L2 tree mutations (L2_withdraw) are NOT in storage and do
-                # NOT affect compute_state_root() — only the L1 balance
-                # changes matter here.
-                if tx.receiver == L2_WITHDRAW_ADDRESS and amount_sat > 0:
-                    # VSA-01: a withdrawal apply_block() would reject must reject the candidate
-                    # transaction here as well.  Earlier withdrawals in this list count against
-                    # the sender's L2 balance (_l2_spent).
-                    layer2 = getattr(self, "layer2", None)
-                    if layer2 is None:
-                        raise CandidateTxRejected(_tx_idx, tx, "L2 subsystem not initialised")
-                    l2_bal = layer2.get_balance_sat(tx.sender) - _l2_spent.get(tx.sender, 0)
-                    bridge_bal = self.storage.get_balance_sat(L2_BRIDGE_ADDRESS)
-                    if l2_bal < amount_sat:
-                        raise CandidateTxRejected(_tx_idx, tx, "insufficient L2 balance for withdrawal")
-                    if bridge_bal < amount_sat:
-                        raise CandidateTxRejected(_tx_idx, tx, "insufficient L2 bridge escrow for withdrawal")
-                    _l2_spent[tx.sender] = _l2_spent.get(tx.sender, 0) + amount_sat
-                    # Mirror the escrow debit and sender credit that apply_block() executes.
-                    # The L2 tree itself is not touched: dry_run must stay side-effect-free on
-                    # Layer2State (the finally block restores only storage accounts).
-                    self.storage.debit_sat(L2_BRIDGE_ADDRESS, amount_sat)
-                    self.storage.credit_sat(tx.sender, amount_sat)
-                    touched.add(L2_BRIDGE_ADDRESS)
                 fee_pool_sat += fee_sat
                 cur_nonce = self.storage.get_nonce(tx.sender)
                 self.storage.set_nonce(tx.sender, max(cur_nonce, tx.nonce + 1))
@@ -2330,6 +2352,22 @@ class Blockchain:
                     "Target height ({}) must be below "
                     "current tip ({}).".format(target_height, current))
 
+            # Full transaction bodies below this watermark are not guaranteed
+            # to exist after rolling pruning. This cheap, metadata-only guard
+            # must run before the finality scan: an unrecoverable target is
+            # invalid regardless of finality and must not trigger historical
+            # block reads that may themselves be unavailable after pruning.
+            try:
+                _pruned_until = int(self._rolling_pruner.get_pruned_watermark())
+            except Exception:
+                _pruned_until = 0
+            if _pruned_until and target_height < _pruned_until:
+                return False, (
+                    f"Rollback rejected: target height {target_height} is below "
+                    f"the rolling-prune watermark {_pruned_until}. Full block "
+                    "transaction data required for an exact rollback is no "
+                    "longer guaranteed to be available.")
+
             # Manual rollback follows the same irreversible-finality rule as
             # reorg(). Rebuild the fence from the actual canonical chain before
             # any mutation; this also repairs a stale in-memory fence left by an
@@ -2345,20 +2383,6 @@ class Blockchain:
                     f"Rollback rejected: target height {target_height} would delete "
                     f"finalized block #{highest_finalized}. Finalized history is "
                     "irreversible; rollback only to the finalized height or above.")
-
-            # Full transaction bodies below this watermark are not guaranteed
-            # to exist after rolling pruning. Exact rollback therefore cannot be
-            # performed safely; fail closed before touching any persistent state.
-            try:
-                _pruned_until = int(self._rolling_pruner.get_pruned_watermark())
-            except Exception:
-                _pruned_until = 0
-            if _pruned_until and target_height < _pruned_until:
-                return False, (
-                    f"Rollback rejected: target height {target_height} is below "
-                    f"the rolling-prune watermark {_pruned_until}. Full block "
-                    "transaction data required for an exact rollback is no "
-                    "longer guaranteed to be available.")
 
             # A legacy/prior-version node may already have pruned to an
             # arbitrary rolling-window cutoff (for example watermark 890 with
@@ -3147,6 +3171,75 @@ class Blockchain:
                     # ── Standard transfer (satoshi integer arithmetic) ─────────────
                     fee_sat = tx.compute_fee_sat()
                     amount_sat = to_satoshi(tx.amount)
+
+                    # L2 withdrawals settle against bridge escrow.  The gross
+                    # amount leaves L2 and escrow; the user receives amount-fee
+                    # on L1, and the fee joins the ordinary fee pool.  No value
+                    # is ever credited to the unspendable routing sentinel.
+                    if tx.receiver == L2_WITHDRAW_ADDRESS and amount_sat > 0:
+                        layer2 = getattr(self, "layer2", None)
+                        if layer2 is None:
+                            self.storage = _real_storage
+                            self.storage.restore_accounts(snap)
+                            self.storage.restore_roles(role_snap)
+                            if _l2 is not None:
+                                _l2.restore_full(l2_snap)
+                            self._undo_vvm_block_effects(
+                                _vvm_undo_log, restore_state_channel_accounts=False)
+                            _restore_cumulative_issued_apply()
+                            return False, "L2 withdrawal rejected: L2 subsystem not initialised"
+                        if fee_sat < 0 or fee_sat > amount_sat:
+                            self.storage = _real_storage
+                            self.storage.restore_accounts(snap)
+                            self.storage.restore_roles(role_snap)
+                            if _l2 is not None:
+                                _l2.restore_full(l2_snap)
+                            self._undo_vvm_block_effects(
+                                _vvm_undo_log, restore_state_channel_accounts=False)
+                            _restore_cumulative_issued_apply()
+                            return False, "L2 withdrawal rejected: invalid withdrawal fee"
+                        ok_w, msg_w = layer2.L2_withdraw(
+                            tx.sender, amount_sat,
+                            l1_height=block.index,
+                            l1_block_hash=block.block_hash)
+                        if not ok_w:
+                            self.storage = _real_storage
+                            self.storage.restore_accounts(snap)
+                            self.storage.restore_roles(role_snap)
+                            if _l2 is not None:
+                                _l2.restore_full(l2_snap)
+                            self._undo_vvm_block_effects(
+                                _vvm_undo_log, restore_state_channel_accounts=False)
+                            _restore_cumulative_issued_apply()
+                            return False, (f"L2 withdrawal rejected for "
+                                           f"{tx.sender[:12]}: {msg_w}")
+                        if not self.storage.debit_sat(L2_BRIDGE_ADDRESS, amount_sat):
+                            self.storage = _real_storage
+                            self.storage.restore_accounts(snap)
+                            self.storage.restore_roles(role_snap)
+                            if _l2 is not None:
+                                _l2.restore_full(l2_snap)
+                            self._undo_vvm_block_effects(
+                                _vvm_undo_log, restore_state_channel_accounts=False)
+                            _restore_cumulative_issued_apply()
+                            return False, "L2 withdrawal rejected: bridge escrow debit failed"
+                        payout_sat = amount_sat - fee_sat
+                        if payout_sat > 0:
+                            self.storage.credit_sat(tx.sender, payout_sat)
+                        fee_pool_sat += fee_sat
+                        self.storage.update_ht_volume(tx.sender, tx.amount)
+                        if tx.sender != "COINBASE":
+                            current_nonce = self.storage.get_nonce(tx.sender)
+                            self.storage.set_nonce(
+                                tx.sender, max(current_nonce, tx.nonce + 1))
+                        try:
+                            metrics.inc("l2_withdrawals_l1")
+                            metrics.set_gauge("l2_total_supply_sat",
+                                              layer2.total_supply_sat())
+                        except Exception:
+                            pass
+                        continue
+
                     total_debit_sat = amount_sat + fee_sat
                     if not self.storage.debit_sat(tx.sender, total_debit_sat):
                         # CRIT fix: roll back everything this block touched
@@ -3229,96 +3322,6 @@ class Blockchain:
                                 _restore_cumulative_issued_apply()
                                 return False, (
                                     f"L2 deposit rejected: {_l2_err}")
-                    # ── L2 → L1 WITHDRAWAL HOOK ───────────────────────────
-                    # If this transfer targets L2_WITHDRAW_ADDRESS the user
-                    # is requesting a forced-exit from L2.  The L1 transfer
-                    # already debited tx.sender and credited L2_WITHDRAW_ADDRESS
-                    # (which acts as a burn sink for the routing amount).
-                    # We now:
-                    #   1. Debit tx.sender's L2 tree balance.
-                    #   2. Debit L2_BRIDGE_ADDRESS escrow by amount_sat
-                    #      and credit tx.sender's L1 wallet — net effect:
-                    #      sender gets their money back on L1, and the
-                    #      L2_WITHDRAW_ADDRESS acts as a routing/burn address
-                    #      for the L1 routing amount (which came from sender).
-                    # Because this runs inside apply_block the L2 root
-                    # mutation is part of the same atomic block application
-                    # and will be captured in the next RollupSubmission's
-                    # previous_l2_root — no state-root mismatch is possible.
-                    # Failure is FATAL for this tx (block is rejected) to
-                    # prevent partial state where L1 credits without L2 debit.
-                    elif tx.receiver == L2_WITHDRAW_ADDRESS and amount_sat > 0:
-                        try:
-                            layer2 = getattr(self, "layer2", None)
-                            if layer2 is None:
-                                # L2 not active — refund sender, reject block.
-                                self.storage = _real_storage
-                                self.storage.restore_accounts(snap)
-                                self.storage.restore_roles(role_snap)
-                                if _l2 is not None: _l2.restore_full(l2_snap)
-                                # AUDIT-FIX-3: undo any VVM contract-storage
-                                # effects from transactions that succeeded
-                                # earlier in this block before this failure.
-                                self._undo_vvm_block_effects(
-                                    _vvm_undo_log, restore_state_channel_accounts=False)
-                                _restore_cumulative_issued_apply()
-                                return False, "L2 withdrawal rejected: L2 subsystem not initialised"
-                            # Step 1: debit L2 tree.
-                            ok_w, msg_w = layer2.L2_withdraw(tx.sender, amount_sat,
-                                                           l1_height=block.index,
-                                                           l1_block_hash=block.block_hash)
-                            if not ok_w:
-                                self.storage = _real_storage
-                                self.storage.restore_accounts(snap)
-                                self.storage.restore_roles(role_snap)
-                                if _l2 is not None: _l2.restore_full(l2_snap)
-                                # AUDIT-FIX-3: undo any VVM contract-storage
-                                # effects from transactions that succeeded
-                                # earlier in this block before this failure.
-                                self._undo_vvm_block_effects(
-                                    _vvm_undo_log, restore_state_channel_accounts=False)
-                                _restore_cumulative_issued_apply()
-                                return False, (f"L2 withdrawal rejected for "
-                                               f"{tx.sender[:12]}: {msg_w}")
-                            # Step 2: debit bridge escrow, credit sender on L1.
-                            if not self.storage.debit_sat(L2_BRIDGE_ADDRESS, amount_sat):
-                                # Roll back L2 debit.
-                                layer2.L2_deposit(tx.sender, amount_sat)
-                                self.storage = _real_storage
-                                self.storage.restore_accounts(snap)
-                                self.storage.restore_roles(role_snap)
-                                if _l2 is not None: _l2.restore_full(l2_snap)
-                                # AUDIT-FIX-3: undo any VVM contract-storage
-                                # effects from transactions that succeeded
-                                # earlier in this block before this failure.
-                                self._undo_vvm_block_effects(
-                                    _vvm_undo_log, restore_state_channel_accounts=False)
-                                _restore_cumulative_issued_apply()
-                                return False, (f"L2 withdrawal rejected: bridge "
-                                               f"escrow debit failed for "
-                                               f"{tx.sender[:12]}")
-                            self.storage.credit_sat(tx.sender, amount_sat)
-                            log.info(f"[L2-BRIDGE] L2→L1 withdrawal confirmed: "
-                                     f"{tx.sender[:12]} {amount_sat:,} sat")
-                            try:
-                                metrics.inc("l2_withdrawals_l1")
-                                metrics.set_gauge("l2_total_supply_sat",
-                                                  layer2.total_supply_sat())
-                            except Exception:
-                                pass
-                        except Exception as _wdraw_e:
-                            log.error(f"[L2-BRIDGE] withdrawal hook raised: {_wdraw_e}")
-                            self.storage = _real_storage
-                            self.storage.restore_accounts(snap)
-                            self.storage.restore_roles(role_snap)
-                            if _l2 is not None: _l2.restore_full(l2_snap)
-                            # AUDIT-FIX-3: undo any VVM contract-storage
-                            # effects from transactions that succeeded
-                            # earlier in this block before this failure.
-                            self._undo_vvm_block_effects(
-                                _vvm_undo_log, restore_state_channel_accounts=False)
-                            _restore_cumulative_issued_apply()
-                            return False, f"L2 withdrawal hook exception: {_wdraw_e}"
                     fee_pool_sat += fee_sat
                     self.storage.update_ht_volume(tx.sender, tx.amount)
                     # Advance per-account nonce on confirmation
@@ -4972,7 +4975,7 @@ class Blockchain:
         burn_sat       = total_sat - total_credited
 
         # 3. Reverse proposer credit (20%)
-        if creator_sat > 0 and block.miner_address:
+        if creator_sat > 0:
             self.storage.debit_sat(block.miner_address, creator_sat)
 
         # 4. Reverse rounding-dust burn
@@ -4994,7 +4997,7 @@ class Blockchain:
                             self.storage.debit_sat(m["address"], share_sat)
                         remainder_sat -= share_sat
                 # Remainder was credited to block proposer in _distribute_rewards
-                if remainder_sat > 0 and block.miner_address:
+                if remainder_sat > 0:
                     self.storage.debit_sat(block.miner_address, remainder_sat)
             else:
                 # No registered miners → entire pool was credited to proposer.
@@ -5026,6 +5029,11 @@ class Blockchain:
         re-mined in the new canonical chain.
         VVM transactions are rolled back using the storage_delta from their receipt.
         """
+        # BUG-44: the personal ledger mirrors canonical history.  Invalidate
+        # this exact block before any asynchronous writer can preserve its
+        # transactions as confirmed local history.
+        invalidate_local_ledger_block(block)
+
         # Mempool.restore() deliberately refuses a tx that is still present in
         # the confirmed transaction indexes. Queue orphaned transactions and
         # restore them only after storage.delete_block() has removed the block,
@@ -5591,40 +5599,29 @@ class Blockchain:
             amount_sat = to_satoshi(tx.amount)
             total_debit_sat = amount_sat + fee_sat
             # ── L2 → L1 WITHDRAWAL ROLLBACK ───────────────────────────────────
-            # apply_block's withdrawal hook performed THREE extra mutations
-            # beyond the standard debit/credit:
-            #   a) credited L2_WITHDRAW_ADDRESS (standard path — reversed below)
-            #   b) debited L2_BRIDGE_ADDRESS escrow
-            #   c) credited tx.sender from escrow
-            # We must reverse (b) and (c) here, and restore the L2 tree balance.
-            # The standard rollback below reverses (a) via debit_sat(receiver).
+            # Post-fix apply debits L2+escrow and credits only amount-fee to
+            # the user's L1 wallet.  Reverse those mutations exactly; reward
+            # rollback handles the fee recipients separately.
             if tx.receiver == L2_WITHDRAW_ADDRESS and amount_sat > 0:
-                layer2 = getattr(self, "layer2", None)
-                # Reverse (c): debit the amount that was credited to sender
-                # by the hook (standard rollback credit_sat below will
-                # restore the original tx debit — we only undo the hook extra).
-                if not self.storage.debit_sat(tx.sender, amount_sat):
+                payout_sat = amount_sat - fee_sat
+                if payout_sat > 0 and not self.storage.debit_sat(tx.sender, payout_sat):
                     log.warning(
-                        f"[ROLLBACK] L2-withdrawal hook reversal: "
-                        f"cannot debit sender {tx.sender[:12]} for hook credit")
-                # Reverse (b): credit bridge escrow back.
+                        f"[ROLLBACK] L2 withdrawal payout debit failed for "
+                        f"{tx.sender[:12]}")
                 self.storage.credit_sat(L2_BRIDGE_ADDRESS, amount_sat)
-                # Restore L2 tree: re-credit the sender's L2 balance that
-                # was debited by the hook.
+                layer2 = getattr(self, "layer2", None)
                 if layer2 is not None:
                     try:
                         ok_rb, msg_rb = layer2.L2_deposit(tx.sender, amount_sat)
                         if not ok_rb:
                             log.error(
-                                f"[ROLLBACK] L2_deposit rollback failed for "
+                                f"[ROLLBACK] L2 withdrawal restore failed for "
                                 f"{tx.sender[:12]}: {msg_rb}")
-                        else:
-                            log.info(
-                                f"[ROLLBACK] L2 balance restored: "
-                                f"{tx.sender[:12]} +{amount_sat:,} sat")
                     except Exception as _l2rb_e:
                         log.error(
-                            f"[ROLLBACK] L2_deposit rollback raised: {_l2rb_e}")
+                            f"[ROLLBACK] L2 withdrawal restore raised: {_l2rb_e}")
+                _queue_mempool_restore(tx)
+                continue
             # ── L1 → L2 DEPOSIT ROLLBACK ──────────────────────────────────────
             # apply_block's deposit hook (receiver == L2_BRIDGE_ADDRESS) called
             # layer2.L2_deposit(sender, amount_sat), crediting the sender's L2
@@ -6052,7 +6049,14 @@ class Blockchain:
                 # Do not allow a not-yet-fully-validated replacement branch to
                 # advance finality. If a later replacement block fails, this
                 # branch is discarded and must leave no finality side effects.
-                ok, msg = self.apply_block(b, defer_finality=True)
+                try:
+                    ok, msg = self.apply_block(b, defer_finality=True)
+                except BaseException as _apply_exc:
+                    # BUG-7: an exception must take the exact same recovery path
+                    # as an ordinary rejected replacement block.  Otherwise the
+                    # already-applied replacement prefix and rolled-back honest
+                    # suffix remain canonical/absent respectively.
+                    ok, msg = False, f"exception: {_apply_exc}"
                 if not ok:
                     log.error(
                         f"Reorg apply failed at block {b.index}: {msg} — "
@@ -6477,6 +6481,85 @@ class Blockchain:
             f"Hard-reset: rolled back to height {keep_height} "
             f"to adopt peer's higher-work chain")
 
+    def _preflight_peer_branch(self, common_height: int, candidates: List[Block],
+                               *, label: str = "Fork") -> Tuple[bool, str]:
+        """State-independent branch validation before any destructive reorg.
+
+        Recomputes the DAA over a read-only overlay consisting of the canonical
+        history through ``common_height`` plus already-preflighted peer blocks.
+        This is deliberately stricter than checking PoW against the peer's
+        claimed difficulty: otherwise an attacker can claim an arbitrarily easy
+        difficulty, do cheap work, trigger rollback, and only fail later when
+        ``validate_block`` recomputes the real difficulty.
+        """
+        if common_height < 0:
+            return False, f"{label} preflight requires a canonical anchor"
+
+        outer = self
+        overlay = {}
+
+        class _DifficultyView:
+            def get_block(self, height):
+                h = int(height)
+                if h in overlay:
+                    return overlay[h]
+                if h <= common_height:
+                    return outer.storage.get_block(h)
+                return None
+
+            def get_block_consensus_window(self, start_height, end_height):
+                rows = []
+                for h in range(int(start_height), int(end_height) + 1):
+                    blk = self.get_block(h)
+                    if blk is not None:
+                        rows.append((int(blk.timestamp), float(blk.difficulty)))
+                return rows
+
+        view = _DifficultyView()
+        anchor = self.storage.get_block(common_height)
+        if anchor is None:
+            return False, f"Missing common ancestor block {common_height}"
+        prev_hash = anchor.block_hash
+
+        for candidate in candidates:
+            if candidate.index != common_height + len(overlay) + 1:
+                return False, (f"{label} index mismatch at block {candidate.index}")
+            if candidate.prev_hash != prev_hash:
+                return False, f"{label} linkage mismatch at block {candidate.index}"
+            try:
+                d = float(candidate.difficulty)
+                t = float(candidate.timestamp)
+                if not math.isfinite(d) or not math.isfinite(t):
+                    return False, f"Invalid {label.lower()} numeric field at block {candidate.index}"
+            except (TypeError, ValueError, OverflowError):
+                return False, f"Invalid {label.lower()} numeric field at block {candidate.index}"
+
+            ok_int, msg_int = candidate.integrity_check(mempool=self.mempool)
+            if not ok_int:
+                return False, f"{label} block {candidate.index}: {msg_int}"
+
+            expected_diff = DifficultyEngine._compute_uncached(view, candidate.index - 1)
+            if abs(d - float(expected_diff)) > 1e-9:
+                return False, (f"{label} block {candidate.index}: difficulty mismatch: "
+                               f"got {candidate.difficulty}, expected {expected_diff}")
+            if not candidate.validate_pow():
+                return False, f"{label} block {candidate.index}: Invalid PoW"
+            if candidate.size() > int(Config.MAX_BLOCK_SIZE):
+                return False, f"{label} block {candidate.index}: block too large"
+
+            ts_start = max(0, candidate.index - int(Config.DIFF_MTP_WINDOW))
+            recent = [row[0] for row in view.get_block_consensus_window(
+                ts_start, candidate.index - 1)]
+            ok_ts, msg_ts = DifficultyEngine.validate_timestamp(
+                candidate.timestamp, recent, network_clock.network_time())
+            if not ok_ts:
+                return False, f"{label} block {candidate.index}: {msg_ts}"
+
+            overlay[candidate.index] = candidate
+            prev_hash = candidate.block_hash
+
+        return True, "OK"
+
     def accept_chain(self, blocks: List[Block]) -> Tuple[bool, str]:
         """
         Accept a sequence of blocks from a peer.
@@ -6697,6 +6780,14 @@ class Blockchain:
                         f"Incoming tip {new_blocks[-1].index} below our tip "
                         f"{current_tip}")
 
+                # BUG-5: verify linkage, canonical expected difficulty, PoW,
+                # timestamp and integrity against a read-only fork overlay before
+                # any canonical rollback occurs.
+                _pf_ok, _pf_msg = self._preflight_peer_branch(
+                    common_height, new_blocks, label="Fork")
+                if not _pf_ok:
+                    return False, _pf_msg
+
                 # Check finality fence
                 # AUDIT-FIX (Batch D): this used to be a second copy of the
                 # exact same bounded scan (min(current_tip, fork_start + 50))
@@ -6755,6 +6846,13 @@ class Blockchain:
                     return False, f"Missing local block {idx} while computing fork work"
                 our_suffix.append(blk)
 
+            # BUG-5 deep-fork twin: rank work only after the peer suffix has
+            # passed the same canonical DAA/PoW preflight.
+            _pf_ok, _pf_msg = self._preflight_peer_branch(
+                common_height, peer_suffix, label="Deep fork")
+            if not _pf_ok:
+                return False, _pf_msg
+
             our_work = self._cumulative_difficulty(our_suffix)
             peer_work = self._cumulative_difficulty(peer_suffix)
             if peer_work < our_work:
@@ -6777,6 +6875,27 @@ class Blockchain:
             )
 
     # ── BFT finality + slashing ───────────────────────────────────────────────
+    def emergency_operator_eligible(self, address: str) -> bool:
+        """BUG-12: may ``address`` cast an emergency-disable vote?
+
+        Authority is the validator set at the chain tip, with stake above zero.
+        An unavailable snapshot means no one is eligible (fail-closed).
+        """
+        if not isinstance(address, str) or not address:
+            return False
+        tip = self.latest_block()
+        if tip is None:
+            return False
+        snapshot = self.get_validator_set_for_block(tip)
+        if snapshot is None:
+            return False
+        for item in snapshot:
+            if (isinstance(item, dict)
+                    and str(item.get("address", "")) == address
+                    and int(item.get("stake_sat", 0)) > 0):
+                return True
+        return False
+
     def add_validator_sig(self, block_hash: str, validator_address: str,
                           sig_hex: str, pub_hex: str) -> bool:
         """Authenticate and record a vote for a validator-eligible block.

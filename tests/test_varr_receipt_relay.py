@@ -70,7 +70,16 @@ def test_receipt_survives_body_pruning_and_preserves_sender(tmp_path, monkeypatc
             mgr = ReceiptRelayManager(bc, st, target, "target")
             receipt = mgr.build_receipt(b8, tx)
             assert receipt is not None
-            # Build the proof before pruning, then remove the full body exactly as production does.
+            # Build the proof before pruning.  This test is about receipt
+            # survival after body removal, not snapshot/prune-boundary policy.
+            # Current production pruning is aligned to a committed servable
+            # snapshot, so a tiny height-20 fixture may legitimately have no
+            # eligible production cutoff.  Inject the deterministic raw-window
+            # cutoff here to isolate the receipt behavior; dedicated pruning
+            # recoverability tests cover snapshot-aligned cutoff selection.
+            bc._rolling_pruner._recoverability_aligned_cutoff = (
+                lambda height: max(0, int(height) - int(Config.ROLLING_PRUNE_WINDOW))
+            )
             bc._rolling_pruner._last_height = -1
             bc._rolling_pruner.maybe_prune(bc.height())
             assert bc.height() == 20

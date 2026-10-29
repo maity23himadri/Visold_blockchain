@@ -38,6 +38,7 @@ from visold.kernel.units import VSD_GLOBAL_MARKET, from_satoshi, gas_fee_to_sat,
 from visold.ledger.transaction import Transaction
 from visold.mempool.mev import check_reveal, is_protected_reveal
 from visold.rollup.batches import RollupSubmission
+from visold.rollup.l2_state import L2_WITHDRAW_ADDRESS
 from visold.storage.storage import Storage
 
 if TYPE_CHECKING:  # annotation-only references (no runtime import, no cycle)
@@ -337,6 +338,28 @@ class Mempool:
                         "Insufficient balance for identity claim fee: "
                         f"need {from_satoshi(tx.compute_fee_sat()):.8f} VSD")
 
+            # BUG-19: role REGISTER transactions lock their stake and debit a
+            # fee.  Admission must reserve both, otherwise an unmineable tx can
+            # occupy the sender's nonce until expiry.
+            if (tx.tx_type == Transaction.TYPE_REGISTER
+                    and not Transaction.is_identity_claim(tx)
+                    and str(tx.memo or "").strip().lower() in ("miner", "investor")):
+                existing = self.storage.get_role(tx.sender)
+                current_stake_sat = 0
+                if existing and existing.get("role") in ("miner", "investor"):
+                    current_stake_sat = to_satoshi(float(existing.get("stake", 0.0)))
+                pending_reg_sat, pending_xfer_sat, pending_fee_sat = \
+                    self.pending_outflow_sat(tx.sender)
+                free_sat = (self.storage.get_balance_sat(tx.sender)
+                            - current_stake_sat - pending_reg_sat
+                            - pending_xfer_sat - pending_fee_sat)
+                required_sat = to_satoshi(tx.amount) + tx.compute_fee_sat()
+                if free_sat < required_sat:
+                    return False, (
+                        "Insufficient spendable balance for REGISTER stake+fee: "
+                        f"need {from_satoshi(required_sat):.8f} VSD, "
+                        f"have {from_satoshi(max(0, free_sat)):.8f} VSD")
+
             # ── MEV protected transfers (see visold/mempool/mev.py) ───────────────
             # A reveal is admitted only when its commitment is on-chain, from the same
             # sender, and COMMIT_REVEAL_DELAY_BLOCKS..MEV_COMMIT_MAX_AGE_BLOCKS blocks old
@@ -499,9 +522,16 @@ class Mempool:
 
             # ── Nonce enforcement (non-coinbase only) ─────────────────────────
             if tx.sender != "COINBASE" and tx.receiver != VSD_GLOBAL_MARKET:
-                chain_nonce   = self.storage.get_nonce(tx.sender)
-                pending_count = len(self._pending_nonces[tx.sender])
-                expected_nonce = chain_nonce + pending_count
+                chain_nonce = self.storage.get_nonce(tx.sender)
+                pending_set = self._pending_nonces[tx.sender]
+                pending_count = len(pending_set)
+                # BUG-13: pending entries need not be contiguous after expiry,
+                # candidate eviction, or another targeted removal.  The next
+                # admissible nonce is the first free slot starting at the
+                # on-chain nonce, not chain_nonce + number_of_pending_entries.
+                expected_nonce = chain_nonce
+                while expected_nonce in pending_set:
+                    expected_nonce += 1
                 # VSD-M06 FIX: reject transactions with a nonce gap > MAX_NONCE_GAP
                 # to prevent mempool griefing via permanently-stuck high-nonce txs.
                 MAX_NONCE_GAP = 16
@@ -859,7 +889,13 @@ class Mempool:
                         tx_fee_sat = tx.compute_fee_sat()
                     except Exception:
                         tx_fee_sat = to_satoshi(getattr(tx, "fee", 0.0) or 0.0)
-                fee_sat += int(tx_fee_sat)
+                is_l2_withdraw = (
+                    tx.tx_type == Transaction.TYPE_TRANSFER
+                    and tx.receiver == L2_WITHDRAW_ADDRESS)
+                # Withdrawal fee is deducted from the released bridge escrow,
+                # not from the sender's pre-existing L1 balance.
+                if not is_l2_withdraw:
+                    fee_sat += int(tx_fee_sat)
                 if tx.tx_type == Transaction.TYPE_REGISTER:
                     # REGISTER txs don't debit the stake at apply time, but they
                     # DO lock that amount — a second stake of the same coins
@@ -870,8 +906,10 @@ class Mempool:
                     # VVM txs debit amount + max_gas upfront
                     xfer_sat += to_satoshi(getattr(tx, "amount", 0.0) or 0.0)
                 else:
-                    # Standard transfer: amount leaves the account at apply time
-                    xfer_sat += to_satoshi(getattr(tx, "amount", 0.0) or 0.0)
+                    # Standard transfer amount leaves the L1 account.  L2
+                    # withdrawals are released from bridge escrow instead.
+                    if not is_l2_withdraw:
+                        xfer_sat += to_satoshi(getattr(tx, "amount", 0.0) or 0.0)
         except Exception as _e:
             # Never fail a preflight because the mempool scan hiccuped
             log.debug(f"pending_outflow_sat scan failed: {_e}")

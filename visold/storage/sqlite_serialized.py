@@ -169,7 +169,18 @@ class _SerializedSQLiteConnection:
                 raise RuntimeError("SQLite atomic transaction is not active")
             try:
                 self._conn.commit()
-            finally:
+            except BaseException:
+                # A failed COMMIT can leave SQLite's transaction active.  Roll
+                # it back before relinquishing Storage's atomic ownership; if
+                # rollback itself fails, keep the original commit exception as
+                # the primary failure while leaving the raw connection state
+                # observable to the caller/startup checks.
+                try:
+                    self._conn.rollback()
+                finally:
+                    self._atomic = False
+                raise
+            else:
                 self._atomic = False
 
     def rollback_atomic(self):

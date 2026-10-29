@@ -25,7 +25,9 @@ Origin: visold_vsd_.py L9823-10320
 """
 
 import hashlib
+import math
 import threading
+from collections import OrderedDict
 import time
 from typing import Dict, List, Optional, TYPE_CHECKING, Tuple
 
@@ -139,7 +141,7 @@ class RateDefectionAuditor:
 
         # Cache of recently-received-and-verified evidence to dedup
         # incoming messages from multiple peers.
-        self._seen_evidence:    set = set()
+        self._seen_evidence: OrderedDict[str, None] = OrderedDict()
 
         # Permanent-ban list — populated when a miner exceeds the slash
         # schedule.  Persisted via storage if available.
@@ -392,6 +394,8 @@ class RateDefectionAuditor:
         except (KeyError, ValueError, TypeError) as exc:
             return False, f"Malformed evidence: {exc}"
 
+        if not math.isfinite(claimed_ratio):
+            return False, "Claimed ratio must be finite"
         if window_end <= window_start:
             return False, "Invalid window range"
         if window_end - window_start + 1 != int(Config.RATE_AUDIT_WINDOW):
@@ -429,17 +433,14 @@ class RateDefectionAuditor:
                     f"[{_p_start}..{_p_end}] does not independently "
                     f"confirm a violation")
 
-        # Dedup by content hash
+        # Fast duplicate check.  Do NOT mark the window seen until all
+        # independent verification succeeds: an invalid packet must never poison
+        # the canonical (miner, window_start, window_end) identity and suppress a
+        # later genuine evidence packet for the same window.
         ev_id = self._evidence_id(ev)
         with self._lock:
             if ev_id in self._seen_evidence:
                 return True, "Duplicate (already processed)"
-            self._seen_evidence.add(ev_id)
-            # Cap the dedup set to avoid unbounded growth
-            if len(self._seen_evidence) > 4096:
-                # Drop oldest half (set ordering is insertion-order in py3.7+)
-                self._seen_evidence = set(
-                    list(self._seen_evidence)[-2048:])
 
         # Independent recomputation
         local_actual = 0
@@ -473,9 +474,16 @@ class RateDefectionAuditor:
         if local_ratio <= float(Config.RATE_AUDIT_THRESHOLD):
             return False, "Local ratio does not exceed threshold"
 
-        # All checks pass — record the offense
+        # All checks pass.  Atomically re-check dedup, remember this verified
+        # window, and record exactly one offense.  The re-check closes the race
+        # between two peer threads verifying the same evidence concurrently.
         offense_block = window_end
         with self._lock:
+            if ev_id in self._seen_evidence:
+                return True, "Duplicate (already processed)"
+            self._seen_evidence[ev_id] = None
+            while len(self._seen_evidence) > 4096:
+                self._seen_evidence.popitem(last=False)
             prev_count = self._offense_counts.get(miner, 0)
             self._offense_counts[miner] = prev_count + 1
             self._last_offense_block[miner] = offense_block
@@ -573,15 +581,15 @@ class RateDefectionAuditor:
 
     @staticmethod
     def _evidence_id(ev: dict) -> str:
-        """Stable ID for dedup — hash of the canonical fields."""
+        """Stable ID for one independently-verifiable miner/window claim."""
         try:
             payload = (f"{ev.get('miner','')}|"
                        f"{ev.get('window_start',0)}|"
-                       f"{ev.get('window_end',0)}|"
-                       f"{ev.get('actual_wins',0)}")
+                       f"{ev.get('window_end',0)}")
             return hashlib.sha256(payload.encode()).hexdigest()
         except Exception:
-            return str(ev)
+            return str((ev.get("miner"), ev.get("window_start"),
+                        ev.get("window_end")))
 
     def is_banned(self, miner: str) -> bool:
         with self._lock:

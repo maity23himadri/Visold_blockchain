@@ -385,8 +385,9 @@ class ValidatorMonitor:
         # Fetch all registered validators
         try:
             validators = self._storage.get_validators() or []
-        except Exception:
-            validators = []
+        except Exception as exc:
+            log.critical("SHBS validator snapshot unavailable: %s", exc)
+            raise
 
         validator_addrs = {
             v.get("address", "") for v in validators

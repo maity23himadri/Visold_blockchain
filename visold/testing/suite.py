@@ -369,10 +369,22 @@ class TestSuite:
                 self._check("Governance: new version accepted after ACTIVE",
                             ok_new)
 
-            # Emergency kill-switch
-            # v7.5.0 requires quorum of 2 operators
-            gov.emergency_disable(2, operator_id="op1")
-            ok_dis, _ = gov.emergency_disable(2, operator_id="op2")
+            # Emergency kill-switch (BUG-12): quorum is two distinct validator
+            # operators, each casting a signed vote.  A repeated vote never counts.
+            from visold.wallet.wallet import Wallet as _EmergencyWallet
+            st_gov.set_meta("genesis_hash", "ab" * 32)
+            op1 = _EmergencyWallet.generate()
+            op2 = _EmergencyWallet.generate()
+            _eligible = {op1.address, op2.address}
+            _is_eligible = lambda addr: addr in _eligible
+            _acc1, _dis1, _ = gov.record_emergency_vote(
+                gov.sign_emergency_vote(op1, 2), is_eligible=_is_eligible)
+            _acc1b, _dis1b, _ = gov.record_emergency_vote(
+                gov.sign_emergency_vote(op1, 2), is_eligible=_is_eligible)
+            self._check("Governance: repeated operator vote does not disable",
+                        not _dis1 and not _dis1b)
+            _acc2, ok_dis, _ = gov.record_emergency_vote(
+                gov.sign_emergency_vote(op2, 2), is_eligible=_is_eligible)
             self._check("Governance: emergency disable succeeds", ok_dis)
             self._check("Governance: disabled proposal is FAILED",
                         gov.get_proposal(2).phase == UpgradePhase.FAILED)

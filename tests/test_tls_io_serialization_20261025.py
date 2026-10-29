@@ -207,9 +207,28 @@ def test_tls_recv_timeout_and_eof_semantics_are_preserved():
     started = time.monotonic()
     _raises(socket.timeout, tls_recv, server_sock, 1024, 0.4)
     assert 0.3 <= time.monotonic() - started < 2.0
-    client_sock.close()
+    # Exercise a *graceful TLS EOF*.  SSLSocket.close() may tear down the
+    # underlying TCP connection without a TLS close_notify on some Python/
+    # OpenSSL combinations, where the peer correctly observes ECONNRESET
+    # instead of b"".  unwrap() sends close_notify; run it concurrently because
+    # it waits for the peer's reciprocal close_notify.
+    shutdown_errors = []
+
+    def clean_client_shutdown():
+        try:
+            raw = client_sock.unwrap()
+            raw.close()
+        except Exception as exc:
+            shutdown_errors.append(exc)
+
+    shutdown = threading.Thread(target=clean_client_shutdown, daemon=True)
+    shutdown.start()
     assert tls_recv(server_sock, 1024, 5.0) == b""
-    server_sock.close()
+    raw_server = server_sock.unwrap()
+    raw_server.close()
+    shutdown.join(5.0)
+    assert not shutdown.is_alive()
+    assert shutdown_errors == []
 
 
 def test_tls_recv_on_closed_socket_raises_oserror():

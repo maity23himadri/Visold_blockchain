@@ -729,11 +729,12 @@ class Config:
     ROLE_STAKE_MIN_ACTIVATION_HEIGHT: int = 0
     VVM_BLOCK_GAS_LIMIT_ACTIVATION_HEIGHT: int = 0
 
-    # VSA-03: legacy empty state_root window.  A block whose declared state_root
-    # is "" (pre-v7.1.9 candidate form) is accepted only when its index is below
-    # this height.  Fresh chains keep 0, so no empty-root block after genesis is
-    # accepted.  A live chain that still contains pre-v7.1.9 blocks must set this
-    # to a coordinated upgrade height BEFORE upgrading, or it will reject them.
+    # VSA-03: empty state_root window (apply-time only).  A block whose declared
+    # state_root is "" is accepted only when its index is below this height.
+    # Fresh chains keep 0, so no empty-root block after genesis is accepted.
+    # BUG-18 (Batch 9): Block.integrity_check no longer accepts the pre-v7.1.9
+    # hash form, so this window cannot re-admit a block whose state_root was
+    # populated after PoW. It must stay 0 on the restarted network.
     EMPTY_STATE_ROOT_LEGACY_END_HEIGHT: int = 0
 
     # VSA-18: inbound TLS handshake bound and concurrency cap.  A handshake that

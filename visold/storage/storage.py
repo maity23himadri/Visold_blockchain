@@ -2886,19 +2886,62 @@ class Storage:
             "SELECT * FROM roles ORDER BY address ASC").fetchall()
         return [dict(row) for row in rows]
 
-    def slash(self, address: str):
-        r = self.get_role(address)
-        if not r: return
-        new_stake = max(0.0, r["stake"] * (1 - Config.SLASH_RATE))
+    def slash(self, address: str) -> bool:
+        """Atomically slash one currently-unslashed validator exactly once."""
+        factor = max(0.0, 1.0 - float(Config.SLASH_RATE))
         if self._pgx_enabled:
-            self._pg_exec(
-                "UPDATE validators SET slashed=TRUE, stake_sat=$2 WHERE address=$1",
-                address, to_satoshi(new_stake))
-            return
-        self._conn().execute(
-            "UPDATE roles SET slashed=1, stake=? WHERE address=?",
-            (new_stake, address))
+            status = self._pg_exec(
+                """UPDATE validators
+                      SET slashed=TRUE,
+                          stake_sat=FLOOR(stake_sat * $2)::BIGINT
+                    WHERE address=$1 AND slashed=FALSE""",
+                address, factor)
+            try:
+                return int(str(status).rsplit(" ", 1)[-1]) == 1
+            except Exception:
+                return False
+        cur = self._conn().execute(
+            """UPDATE roles
+                  SET slashed=1, stake=stake * ?
+                WHERE address=? AND slashed=0""",
+            (factor, address))
         self._conn().commit()
+        return int(getattr(cur, "rowcount", 0) or 0) == 1
+
+    def get_validators(self) -> List[dict]:
+        """Return the exact validator snapshot for the canonical tip.
+
+        Self-healing governance must use the same immutable per-block voter
+        snapshot as consensus, never today's live role table.  Missing or
+        malformed snapshot data is a safety failure and therefore raises;
+        callers must not silently substitute an empty/default validator set.
+        """
+        if self._pgx_enabled:
+            height = int(self._pgx_canonical_tip)
+        else:
+            row = self._conn().execute(
+                "SELECT MAX(idx) AS h FROM blocks").fetchone()
+            height = int(row["h"]) if row and row["h"] is not None else -1
+        if height < 0:
+            return []
+        block_hash = self.get_block_hash(height)
+        if not block_hash:
+            raise RuntimeError(
+                f"canonical tip hash unavailable at height {height}")
+        snapshot = self.get_block_validator_snapshot(height, block_hash)
+        if snapshot is None:
+            raise RuntimeError(
+                f"validator snapshot unavailable at canonical tip {height}")
+        out = []
+        for item in snapshot:
+            address = str(item["address"])
+            role = self.get_role(address)
+            out.append({
+                "address": address,
+                "stake_sat": int(item.get("stake_sat", 0)),
+                "slashed": bool(role and role.get("slashed", False)),
+            })
+        return out
 
     def update_stake(self, address: str, stake: float):
         if self._pgx_enabled:
@@ -4183,15 +4226,16 @@ class Storage:
         try:
             previous = self.get_channel(channel_id)
             c = self._conn()
-            c.execute(
+            cur = c.execute(
                 "UPDATE state_channels SET status='CLOSED', closed_height=? "
                 "WHERE channel_id=? AND status='OPEN'",
                 (closed_height, channel_id))
+            updated = int(cur.rowcount or 0) > 0
+            if updated:
+                self._record_state_channel_before(channel_id, previous)
             c.commit()
             self._maybe_checkpoint()
-            if c.rowcount > 0:
-                self._record_state_channel_before(channel_id, previous)
-            return c.rowcount > 0
+            return updated
         except Exception as exc:
             log.warning("close_channel failed: %s", exc)
             return False
@@ -4199,7 +4243,12 @@ class Storage:
     def raise_dispute(self, channel_id: str, seq_no: int,
                       bal_opener: int, bal_counter: int,
                       dispute_height: int) -> bool:
-        """Set channel to DISPUTED state with submitted state snapshot."""
+        """Raise or update a channel dispute with a strictly newer state.
+
+        OPEN channels accept the first valid state.  During the challenge
+        window a DISPUTED channel may be updated only by a strictly higher
+        sequence number; the conditional UPDATE makes that rule atomic.
+        """
         if self._pgx_enabled:
             previous = self.get_channel(channel_id)
             try:
@@ -4208,7 +4257,9 @@ class Storage:
                        SET status='DISPUTED',
                            dispute_seq=$1, dispute_bal_opener=$2,
                            dispute_bal_counter=$3, dispute_height=$4
-                       WHERE channel_id=$5 AND status='OPEN'
+                       WHERE channel_id=$5
+                         AND (status='OPEN' OR
+                              (status='DISPUTED' AND dispute_seq < $1))
                        RETURNING channel_id""",
                     seq_no, bal_opener, bal_counter,
                     dispute_height, channel_id)
@@ -4225,9 +4276,11 @@ class Storage:
                                SET status='DISPUTED',
                                    dispute_seq=?, dispute_bal_opener=?,
                                    dispute_bal_counter=?, dispute_height=?
-                               WHERE channel_id=? AND status='OPEN'""",
+                               WHERE channel_id=?
+                                 AND (status='OPEN' OR
+                                      (status='DISPUTED' AND dispute_seq < ?))""",
                             (seq_no, bal_opener, bal_counter,
-                             dispute_height, channel_id))
+                             dispute_height, channel_id, seq_no))
                         self._conn().commit()
                 except Exception:
                     pass
@@ -4235,19 +4288,22 @@ class Storage:
         try:
             previous = self.get_channel(channel_id)
             c = self._conn()
-            c.execute(
+            cur = c.execute(
                 """UPDATE state_channels
                    SET status='DISPUTED',
                        dispute_seq=?, dispute_bal_opener=?,
                        dispute_bal_counter=?, dispute_height=?
-                   WHERE channel_id=? AND status='OPEN'""",
+                   WHERE channel_id=?
+                     AND (status='OPEN' OR
+                          (status='DISPUTED' AND dispute_seq < ?))""",
                 (seq_no, bal_opener, bal_counter,
-                 dispute_height, channel_id))
+                 dispute_height, channel_id, seq_no))
+            updated = int(cur.rowcount or 0) > 0
+            if updated:
+                self._record_state_channel_before(channel_id, previous)
             c.commit()
             self._maybe_checkpoint()
-            if c.rowcount > 0:
-                self._record_state_channel_before(channel_id, previous)
-            return c.rowcount > 0
+            return updated
         except Exception as exc:
             log.warning("raise_dispute failed: %s", exc)
             return False
@@ -4281,15 +4337,16 @@ class Storage:
         try:
             previous = self.get_channel(channel_id)
             c = self._conn()
-            c.execute(
+            cur = c.execute(
                 "UPDATE state_channels SET status='FORCE_CLOSED', "
                 "closed_height=? WHERE channel_id=? AND status='DISPUTED'",
                 (closed_height, channel_id))
+            updated = int(cur.rowcount or 0) > 0
+            if updated:
+                self._record_state_channel_before(channel_id, previous)
             c.commit()
             self._maybe_checkpoint()
-            if c.rowcount > 0:
-                self._record_state_channel_before(channel_id, previous)
-            return c.rowcount > 0
+            return updated
         except Exception as exc:
             log.warning("force_close_channel failed: %s", exc)
             return False

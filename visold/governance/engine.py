@@ -24,6 +24,9 @@ Defines: UpgradePhase, UpgradeProposal, GovernanceEngine
 Origin: visold_vsd_.py L5983-5997, L6000-6078, L6081-6732
 """
 
+import hashlib
+import re
+import secrets
 import threading
 import time
 import enum as _enum
@@ -33,6 +36,9 @@ from typing import Dict, List, Optional, TYPE_CHECKING, Tuple
 from visold.kernel.config import Config
 from visold.kernel.logging_setup import log
 from visold.kernel.metrics import metrics
+from visold.crypto.ecc import (
+    ecdsa_verify, pub_from_hex, pub_to_address, sig_from_hex, sig_to_hex,
+)
 
 if TYPE_CHECKING:  # annotation-only references (no runtime import, no cycle)
     from visold.governance.versioning import ProtocolVersionManager
@@ -43,6 +49,32 @@ if TYPE_CHECKING:  # annotation-only references (no runtime import, no cycle)
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 1E2: GOVERNANCE ENGINE — Full Upgrade Lifecycle
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── BUG-12: emergency-vote preimage ────────────────────────────────────────
+_EMERGENCY_VOTE_DOMAIN = b"VSD/EMERGENCY-DISABLE/v1"
+_EMERGENCY_NONCE_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def emergency_vote_preimage(genesis_hash: str, version: int, operator: str,
+                            ts: int, nonce: str) -> bytes:
+    """Length-prefixed, domain-separated bytes that an emergency vote signs.
+
+    The signature is bound to this chain (genesis hash), one protocol
+    version, one signer address, one time, and one nonce, so it cannot be
+    reused for another version, chain, signer or moment.
+    """
+    parts = (_EMERGENCY_VOTE_DOMAIN,
+             str(genesis_hash).encode("utf-8"),
+             str(int(version)).encode("ascii"),
+             str(operator).encode("utf-8"),
+             str(int(ts)).encode("ascii"),
+             str(nonce).encode("ascii"))
+    out = bytearray()
+    for part in parts:
+        out += len(part).to_bytes(4, "big")
+        out += part
+    return bytes(out)
+
 
 class UpgradePhase(_enum.Enum):
     """
@@ -191,7 +223,8 @@ class GovernanceEngine:
 
     Safety
     ──────
-    emergency_disable(version) can be called by operators.  It immediately
+    emergency_disable: quorum of 2 distinct validators' signed votes (BUG-12).
+    Quorum completion immediately
     sets phase=FAILED and records a blacklist entry.  Shadow validation runs
     pre-activation to surface compatibility problems early.
 
@@ -586,64 +619,122 @@ class GovernanceEngine:
         # Priority 4: lowest hash (deterministic tie-break — no coordination needed)
         return tip_a if tip_a.block_hash <= tip_b.block_hash else tip_b
 
-    # VSD-M04 FIX: emergency_disable requires 2-of-N operator approvals.
-    # Each call registers one vote keyed by operator_id.  The disable only
-    # executes once EMERGENCY_DISABLE_QUORUM distinct operators have voted.
-    EMERGENCY_DISABLE_QUORUM = 2      # minimum distinct approvals required
-    # AUDIT-FIX-K4: _emergency_votes moved to a per-instance attribute,
-    # initialized in __init__ — see there for why. (It used to be declared
-    # here as a class-level dict, shared by every instance.)
-    _EMERGENCY_VOTE_TTL = 300         # votes expire after 5 minutes
+    # ── BUG-12: emergency-disable quorum over authenticated, gossiped votes ──
+    # Authority: an operator is any address in the consensus validator set at
+    # the chain tip (Blockchain.emergency_operator_eligible).  Each validator
+    # signs one vote per version.  Votes travel over MSG_EMERGENCY_VOTE and are
+    # counted on every node, so quorum can be reached across nodes.  Quorum is
+    # EMERGENCY_DISABLE_QUORUM distinct validators and is never lowered.
+    EMERGENCY_DISABLE_QUORUM = 2
+    # A vote is valid for this many seconds on either side of the signer's
+    # clock.  Votes are kept in memory only: a vote is meaningful only inside
+    # this window, so a restart needs fresh votes (fail-closed).
+    _EMERGENCY_VOTE_TTL = 300
 
-    def emergency_disable(self, version: int,
-                          operator_id: str = "default") -> Tuple[bool, str]:
-        """
-        Operator emergency kill-switch for a faulty upgrade version.
-        VSD-M04 FIX: Requires EMERGENCY_DISABLE_QUORUM distinct operator IDs
-        to call this method within EMERGENCY_VOTE_TTL seconds of each other.
+    def sign_emergency_vote(self, wallet, version: int, *,
+                            now: Optional[float] = None,
+                            nonce: Optional[str] = None) -> dict:
+        """Build this wallet's signed emergency-disable vote for ``version``."""
+        genesis_hash = self.storage.get_meta("genesis_hash")
+        if not genesis_hash:
+            raise RuntimeError("genesis is not initialised; cannot sign an emergency vote")
+        ts = int(time.time() if now is None else now)
+        nonce = nonce or secrets.token_hex(16)
+        preimage = emergency_vote_preimage(genesis_hash, version, wallet.address, ts, nonce)
+        sig = wallet.sign(preimage)
+        return {
+            "version":      int(version),
+            "operator":     wallet.address,
+            "pub_hex":      wallet.pub_hex,
+            "sig":          sig_to_hex(sig),
+            "ts":           ts,
+            "nonce":        nonce,
+            "genesis_hash": genesis_hash,
+        }
 
-        This does NOT reorg the chain — it only stops enforcing new-version
-        rules going forward.  Blocks already applied are unaffected.
+    def record_emergency_vote(self, vote: dict, *, is_eligible,
+                              now: Optional[float] = None) -> Tuple[bool, bool, str]:
+        """Verify one signed emergency vote and count it.
+
+        Returns ``(accepted, disabled, message)``.  ``accepted`` is True only for
+        a new, valid vote, which the caller may relay.  ``disabled`` is True when
+        this vote completed the quorum and the version was disabled.
+        ``is_eligible(address) -> bool`` decides who may vote.
         """
+        if not isinstance(vote, dict):
+            return False, False, "emergency vote must be an object"
+        version  = vote.get("version")
+        ts       = vote.get("ts")
+        operator = vote.get("operator")
+        pub_hex  = vote.get("pub_hex")
+        sig_hex  = vote.get("sig")
+        nonce    = vote.get("nonce")
+        genesis  = vote.get("genesis_hash")
+        if (type(version) is not int or type(ts) is not int
+                or not isinstance(operator, str) or not isinstance(pub_hex, str)
+                or not isinstance(sig_hex, str) or not isinstance(genesis, str)
+                or not isinstance(nonce, str) or not _EMERGENCY_NONCE_RE.fullmatch(nonce)):
+            return False, False, "malformed emergency vote"
+
+        t = time.time() if now is None else float(now)
+        if abs(t - ts) > self._EMERGENCY_VOTE_TTL:
+            return False, False, "stale or future-dated emergency vote"
+
+        # Eligibility and signature are checked before the governance lock is
+        # taken: eligibility reads the blockchain, which may hold its own lock
+        # while calling back into governance.
+        try:
+            if not is_eligible(operator):
+                return False, False, (
+                    f"{operator[:16]} is not a validator at the chain tip, "
+                    "so it cannot vote on emergency disables")
+            pub = pub_from_hex(pub_hex)
+            if pub_to_address(pub) != operator:
+                return False, False, "emergency vote public key does not match its operator"
+            preimage = emergency_vote_preimage(genesis, version, operator, ts, nonce)
+            if not ecdsa_verify(pub, hashlib.sha256(preimage).digest(),
+                                sig_from_hex(sig_hex)):
+                return False, False, "invalid emergency vote signature"
+        except Exception:  # noqa: BLE001 — any parse/verify failure is a rejection
+            return False, False, "unverifiable emergency vote"
+
         with self._lock:
-            if version not in self._proposals:
-                return False, f"No proposal for version {version}"
+            stored_genesis = self.storage.get_meta("genesis_hash")
+            if not stored_genesis or genesis != stored_genesis:
+                return False, False, "emergency vote is for a different chain"
+            proposal = self._proposals.get(version)
+            if proposal is None:
+                return False, False, f"No proposal for version {version}"
+            if proposal.disabled or version in self._blacklist:
+                return False, False, f"Version {version} is already disabled"
 
-            # Register this operator's vote
-            now = time.time()
-            if version not in self._emergency_votes:
-                self._emergency_votes[version] = {}
-            votes = self._emergency_votes[version]
-            # Expire stale votes
-            expired = [op for op, ts in votes.items() if now - ts > self._EMERGENCY_VOTE_TTL]
-            for op in expired:
-                del votes[op]
-            votes[operator_id] = now
+            votes = self._emergency_votes.setdefault(version, {})
+            for stale_op in [op for op, vts in votes.items()
+                             if t - vts > self._EMERGENCY_VOTE_TTL]:
+                del votes[stale_op]
+            if operator in votes:
+                # One vote per operator inside the window; repeats and replays
+                # neither count twice nor relay.
+                return False, False, "operator has already voted for this version"
+            votes[operator] = ts
 
             quorum = self.EMERGENCY_DISABLE_QUORUM
             if len(votes) < quorum:
                 log.warning(
-                    f"GOVERNANCE EMERGENCY DISABLE: Version {version} — "
-                    f"vote registered from '{operator_id}' "
-                    f"({len(votes)}/{quorum} approvals). "
-                    f"Waiting for {quorum - len(votes)} more operator(s).")
-                return False, (
-                    f"Vote registered ({len(votes)}/{quorum}). "
-                    f"Need {quorum - len(votes)} more operator approval(s) "
-                    f"within {self._EMERGENCY_VOTE_TTL}s.")
+                    f"GOVERNANCE EMERGENCY VOTE: version {version} — vote recorded "
+                    f"from {operator[:16]} ({len(votes)}/{quorum}).")
+                return True, False, f"Vote recorded ({len(votes)}/{quorum})."
 
-            # Quorum reached — execute disable
-            del self._emergency_votes[version]   # clear votes
-            proposal = self._proposals[version]
+            del self._emergency_votes[version]
             proposal.phase    = UpgradePhase.FAILED
             proposal.disabled = True
             self._blacklist.add(version)
             proposal._persist(self.storage)
             log.critical(
-                f"GOVERNANCE EMERGENCY DISABLE: Version {version} disabled "
-                f"by {quorum}-operator quorum.  Reverting to previous rules.")
+                f"GOVERNANCE EMERGENCY DISABLE: Version {version} disabled by a "
+                f"{quorum}-validator quorum.  Reverting to previous rules.")
             metrics.inc("governance_emergency_disables")
-            return True, f"Version {version} disabled — previous rules restored."
+            return True, True, f"Version {version} disabled — previous rules restored."
 
     def get_proposal(self, version: int) -> Optional[UpgradeProposal]:
         with self._lock:

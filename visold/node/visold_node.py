@@ -1124,22 +1124,12 @@ class VisoldNode:
         return self.state_engine.post_sync(evt)
 
     def withdraw_from_l2(self, amount_vsd: float) -> Tuple[bool, str]:
-        """L2 → L1 bridge withdrawal — routed through the mempool/block pipeline.
+        """Submit an L2→L1 withdrawal settlement transaction.
 
-        Sends a normal L1 transfer from the user's wallet to L2_WITHDRAW_ADDRESS.
-        apply_block detects this sentinel receiver and atomically:
-          1. Debits the sender's L2 tree balance.
-          2. Debits L2_BRIDGE_ADDRESS escrow and credits the sender's L1 wallet.
-
-        Because the mutation only happens inside apply_block (identical to the
-        deposit hook), the L2 state root changes only at block-confirmation time.
-        This means:
-          • No state-root mismatch on the next RollupSubmission.
-          • No reorg vulnerability (snapshots cover the change).
-          • Supply invariant is maintained at every settlement boundary.
-
-        The user pays the normal L1 tx fee for routing, just like a deposit.
-        Funds appear in the L1 wallet once the tx is mined into a block.
+        ``tx.amount`` is the gross amount removed from L2/bridge escrow.  The
+        normal transfer fee is deducted from those released funds, so mining
+        credits ``amount - fee`` to the user's L1 wallet.  The user therefore
+        does not need to pre-fund the withdrawal amount on L1.
         """
         if not math.isfinite(amount_vsd) or amount_vsd <= 0:
             return False, "amount must be a positive finite number"
@@ -1153,34 +1143,31 @@ class VisoldNode:
         layer2 = getattr(self.blockchain, "layer2", None)
         if layer2 is None:
             return False, "L2 subsystem not initialised on this node"
+        sender = self.wallet.address
+        if layer2.get_balance_sat(sender) < amount_sat:
+            return False, "Insufficient L2 balance for withdrawal"
+        if self.storage.get_balance_sat(L2_BRIDGE_ADDRESS) < amount_sat:
+            return False, "Bridge escrow too low; supply invariant violation"
 
-        addr = self.wallet.address
+        fee = round(amount_vsd * Config.TX_FEE_RATE, 8)
+        fee_sat = to_satoshi(fee)
+        if fee_sat > amount_sat:
+            return False, "withdrawal amount is too small to cover its fee"
 
-        # ── Pre-flight: check L2 balance before paying L1 fee ────────────
-        # This is an optimistic guard only — the definitive check runs
-        # inside apply_block.  We surface an early error so the user
-        # doesn't pay an L1 fee for a withdrawal that will definitely fail.
-        l2_bal = layer2.get_balance_sat(addr)
-        if l2_bal < amount_sat:
-            return False, (f"Insufficient L2 balance: {l2_bal:,} sat available, "
-                           f"{amount_sat:,} sat requested")
-
-        bridge_bal = self.storage.get_balance_sat(L2_BRIDGE_ADDRESS)
-        if bridge_bal < amount_sat:
-            return False, (f"Bridge escrow too low ({bridge_bal:,} sat) — "
-                           f"supply invariant violation; contact operator")
-
-        # ── Route through mempool exactly like a deposit ──────────────────
-        # send_transaction builds a signed L1 tx, validates L1 balance
-        # (sender must cover amount + fee), and hands it to StateEngine.
-        # apply_block's withdrawal hook fires when the tx is mined.
-        memo = "L2_WITHDRAW"
-        ok, msg = self.send_transaction(L2_WITHDRAW_ADDRESS, amount_vsd, memo)
+        chain_nonce = self.storage.get_nonce(sender)
+        pending_count = len(self.blockchain.mempool._pending_nonces.get(sender, set()))
+        nonce = chain_nonce + pending_count
+        tx = Transaction(
+            sender=sender, receiver=L2_WITHDRAW_ADDRESS,
+            amount=amount_vsd, fee=fee, memo="L2_WITHDRAW", nonce=nonce)
+        tx.sign(self.wallet)
+        ok, msg = self.state_engine.post_sync(
+            Event(EventType.NEW_TX, {"tx": tx.to_dict()}))
         if not ok:
             return False, msg
-        return True, (f"Withdrawal submitted: {amount_vsd:.8f} VSD "
-                      f"({amount_sat:,} sat) will be credited to your L1 "
-                      f"wallet once mined into a block.")
+        return True, (f"Withdrawal submitted: gross {amount_vsd:.8f} VSD; "
+                      f"{from_satoshi(amount_sat - fee_sat):.8f} VSD will be "
+                      f"credited to L1 after the {fee:.8f} VSD fee when mined.")
 
     def add_peer_manual(self, ip: str, port: int) -> Tuple[bool, str]:
         # ── Optional Port Override ────────────────────────────────────────────
@@ -1213,14 +1200,26 @@ class VisoldNode:
         )
 
     def emergency_disable_upgrade(self, version: int) -> Tuple[bool, str]:
+        """BUG-12: cast this node's signed emergency-disable vote and gossip it.
+
+        Only a validator wallet at the chain tip may vote.  The disable runs once
+        EMERGENCY_DISABLE_QUORUM distinct validators have voted, wherever their
+        votes were cast.
         """
-        Emergency kill-switch: immediately disable a faulty upgrade.
-        The node wallet address is the stable operator identity, so distinct
-        nodes contribute distinct quorum votes without trusting a caller-
-        supplied operator_id.
-        """
-        return self.blockchain._governance.emergency_disable(
-            version, operator_id=self.wallet.address)
+        if not self.blockchain.emergency_operator_eligible(self.wallet.address):
+            return False, ("This node's wallet is not a validator at the chain tip. "
+                           "Only validator operators can cast emergency-disable votes.")
+        gov = self.blockchain._governance
+        try:
+            vote = gov.sign_emergency_vote(self.wallet, version)
+        except RuntimeError as exc:
+            return False, str(exc)
+        accepted, disabled, msg = gov.record_emergency_vote(
+            vote, is_eligible=self.blockchain.emergency_operator_eligible)
+        network = getattr(self, "network", None)
+        if accepted and network is not None:
+            network.broadcast_emergency_vote(vote)
+        return disabled, msg
 
     def governance_status(self) -> List[dict]:
         """Return all upgrade proposals and their current phase."""

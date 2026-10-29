@@ -265,6 +265,32 @@ def ecdsa_sign(priv: int, msg_hash: bytes, _native_private_key=None, _crypto_pri
     return r, s
 
 
+def ecdsa_sign_digest(priv: int, digest: bytes, _native_private_key=None, _crypto_private_key=None) -> Tuple[int, int]:
+    """Sign an already-finalized 32-byte SHA-256 digest exactly once.
+
+    This API exists for protocols (notably VVM state channels) whose message
+    format already defines the digest that secp256k1 recovery consumes.  It is
+    intentionally separate from :func:`ecdsa_sign`, which preserves Visold's
+    historical double-SHA convention for transaction/network signatures.
+    """
+    if not isinstance(digest, (bytes, bytearray, memoryview)):
+        raise TypeError("digest must be bytes-like")
+    digest = bytes(digest)
+    if len(digest) != 32:
+        raise ValueError("digest must be exactly 32 bytes")
+    if _COINCURVE_SELFTEST_OK:
+        try:
+            key = _native_private_key
+            if key is None:
+                key = _CoincurvePrivateKey(int(priv).to_bytes(32, "big"))
+            return decode_dss_signature(key.sign(digest, hasher=None))
+        except Exception:
+            pass
+    priv_key = _crypto_private_key or _priv_int_to_crypto_key(priv)
+    sig_der = priv_key.sign(digest, _ec.ECDSA(Prehashed(_hashes.SHA256())))
+    return decode_dss_signature(sig_der)
+
+
 def ecdsa_verify(pub: ECPoint, msg_hash: bytes, sig: Tuple[int, int]) -> bool:
     r, s = sig
     N = ECPoint.N

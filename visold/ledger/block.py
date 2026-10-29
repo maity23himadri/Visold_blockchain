@@ -195,25 +195,13 @@ class Block:
         avoid verifying the exact same signature a second time without making
         signature verification optional for ordinary callers.
 
-        v7.1.10 LEGACY-BLOCK COMPATIBILITY
-        ───────────────────────────────────
-        Blocks mined under v7.1.7/v7.1.8 (BEFORE the state_root sealing
-        fix in v7.1.9) suffer from the well-known mutation bug:
-        ``state_root`` was populated AFTER the PoW had already committed
-        to a header containing ``state_root=""``.  These blocks live
-        forever on existing chains; a v7.1.9+ receiver would reject all
-        of them at the modern hash check, making cross-version sync
-        impossible.
-
-        Fix: try the modern hash first.  If it doesn't match, retry the
-        hash with ``state_root=""`` in the header (legacy-mode rule).
-        If THAT matches, the block is a genuine pre-v7.1.9 block whose
-        on-disk state_root was populated post-PoW; accept it with a
-        DEBUG-level note.  If neither matches, the block is genuinely
-        tampered/forged and is rejected.
-
-        Once your network has fully re-mined under v7.1.9+ you can
-        delete the legacy branch and tighten back to a single check.
+        BUG-18 (Batch 9): the v7.1.10 legacy fallback has been removed.
+        block_hash is the only commitment that binds state_root, and the
+        fallback recomputed the hash with state_root="" so that a relabelled
+        state_root was accepted at any height. The network restarts from
+        genesis, so no pre-v7.1.9 block has to validate. integrity_check now
+        requires block_hash == compute_hash() exactly. Genesis and new blocks
+        are unaffected: their hash is computed from the state_root they carry.
         """
         # A pruned record lacks the committed transaction body. It can be used
         # for authenticated header history only and must never enter normal
@@ -234,37 +222,20 @@ class Block:
                 f"Transactions may have been tampered with after block creation."
             )
 
-        # 2. Recompute block_hash from header (which includes merkle_root).
-        #    Try modern rule first (header includes the populated state_root).
+        # 2. Recompute block_hash from header (which includes merkle_root and
+        #    state_root). BUG-18: there is exactly one accepted header form.
+        #    The former fallback that recomputed the hash with state_root=""
+        #    has been removed, so state_root can no longer change without
+        #    changing block_hash.
         computed_hash = self.compute_hash()
         if self.block_hash != computed_hash:
-            # 2b. v7.1.10 legacy-block fallback: try with state_root="".
-            #     Pre-v7.1.9 miners committed to that empty-string value
-            #     in the PoW preimage, then mutated state_root post-seal.
-            saved = self.state_root
-            try:
-                object.__setattr__(self, "state_root", "")
-                legacy_hash = self.compute_hash()
-            finally:
-                object.__setattr__(self, "state_root", saved)
-            if self.block_hash == legacy_hash:
-                # Genuine legacy block.  Trace-level only — this is normal
-                # during the upgrade window; would be log-spam on every
-                # MSG_CHAIN page if escalated higher.
-                log.debug(
-                    f"[LEGACY-BLOCK] #{self.index} {self.block_hash[:12]}… "
-                    f"accepted via pre-v7.1.9 hash rule (state_root='')")
-                # Fall through to tx checks — the rest of integrity is
-                # unaffected by which header rule produced the hash.
-            else:
-                return False, (
-                    f"Block integrity failure: block_hash mismatch — "
-                    f"stored={self.block_hash[:16]}, "
-                    f"computed={computed_hash[:16]}, "
-                    f"legacy_computed={legacy_hash[:16]}. "
-                    f"Header fields tampered (neither modern nor legacy "
-                    f"PoW-preimage rule matches)."
-                )
+            return False, (
+                f"Block integrity failure: block_hash mismatch — "
+                f"stored={self.block_hash[:16]}, "
+                f"computed={computed_hash[:16]}. "
+                f"Header fields tampered (block_hash commits to merkle_root "
+                f"and state_root)."
+            )
 
         # 3. Verify each transaction's tx_id matches its content. New blocks
         #    use the canonical length-delimited encoding. For migration only,

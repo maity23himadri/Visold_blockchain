@@ -1,6 +1,6 @@
 {
   "algorithm": "visold-package-source-v1",
   "note": "Compatibility fingerprint for matching Visold source/bytecode-only deployments; not a signed authorization manifest.",
-  "package_source_sha256": "2b74de1b364779efd45986b31857fd7f1aadfc0e0c7c16e2d8041e3d5e9ea77a",
-  "source_file_count": 151
+  "package_source_sha256": "d9ece69cdeb48ece8b44ddc1e28b7c3149ac9c37fafb7c443d4bdf0b8be6f420",
+  "source_file_count": 152
 }

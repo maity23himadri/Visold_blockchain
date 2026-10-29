@@ -135,19 +135,23 @@ class RoleManager:
             self.blockchain.mempool.pending_outflow_sat(addr)
         spendable_sat = (balance_sat - current_stake_sat
                          - pending_reg_sat - pending_fee_sat)
-        if spendable_sat < stake_sat:
+        fee_sat = Transaction(sender=addr, receiver="", amount=float(stake),
+                              fee=0.0, memo="miner",
+                              tx_type=Transaction.TYPE_REGISTER).compute_fee_sat()
+        required_sat = stake_sat + fee_sat
+        if spendable_sat < required_sat:
             if pending_reg_sat > 0:
                 return False, (
                     f"Insufficient spendable balance: "
                     f"have {from_satoshi(max(0, spendable_sat)):.8f} VSD free, "
-                    f"need {from_satoshi(stake_sat):.8f} VSD "
+                    f"need {from_satoshi(required_sat):.8f} VSD including fee "
                     f"(you already have "
                     f"{from_satoshi(pending_reg_sat):.8f} VSD pending "
                     f"in a REGISTER tx — wait for it to be mined).")
             return False, (
                 f"Insufficient spendable balance: "
                 f"have {from_satoshi(max(0, spendable_sat)):.8f} VSD free, "
-                f"need {from_satoshi(stake_sat):.8f} VSD.")
+                f"need {from_satoshi(required_sat):.8f} VSD including fee.")
         if existing and existing.get("role") == "investor":
             return False, "Already registered as investor — unstake first."
 
@@ -192,19 +196,23 @@ class RoleManager:
             self.blockchain.mempool.pending_outflow_sat(addr)
         spendable_sat = (balance_sat - current_stake_sat
                          - pending_reg_sat - pending_fee_sat)
-        if spendable_sat < stake_sat:
+        fee_sat = Transaction(sender=addr, receiver="", amount=float(stake),
+                              fee=0.0, memo="investor",
+                              tx_type=Transaction.TYPE_REGISTER).compute_fee_sat()
+        required_sat = stake_sat + fee_sat
+        if spendable_sat < required_sat:
             if pending_reg_sat > 0:
                 return False, (
                     f"Insufficient spendable balance: "
                     f"have {from_satoshi(max(0, spendable_sat)):.8f} VSD free, "
-                    f"need {from_satoshi(stake_sat):.8f} VSD "
+                    f"need {from_satoshi(required_sat):.8f} VSD including fee "
                     f"(you already have "
                     f"{from_satoshi(pending_reg_sat):.8f} VSD pending "
                     f"in a REGISTER tx — wait for it to be mined).")
             return False, (
                 f"Insufficient spendable balance: "
                 f"have {from_satoshi(max(0, spendable_sat)):.8f} VSD free, "
-                f"need {from_satoshi(stake_sat):.8f} VSD.")
+                f"need {from_satoshi(required_sat):.8f} VSD including fee.")
 
         ok, msg = self._submit_register_tx("investor", stake)
         if not ok:

@@ -99,8 +99,10 @@ def _chan_recover_address(msg_hash_b: bytes,
         if not (1 <= r < N and 1 <= s < N):
             return ""
         recovery_id = v - 27
-        # Compute curve point R from r
-        x = r + recovery_id * N
+        # Ethereum-style v=27/28 carries only the Y-parity bit.  It does not
+        # select the rare x=r+N recovery branch (which would require recovery
+        # ids 2/3).  Therefore x is always r for the supported v domain.
+        x = r
         if x >= P:
             return ""
         y_sq = (pow(x, 3, P) + 7) % P
@@ -164,6 +166,7 @@ class VVMEngine:
     def deploy(self, *, sender: str, bytecode: bytes,
                call_value: int, gas_limit: int,
                block_ctx, tx,
+               origin: Optional[str] = None,
                parent_storage_writes: Optional[dict] = None,
                parent_storage_tags: Optional[dict] = None,
                parent_storage_tag_orig: Optional[dict] = None,
@@ -221,7 +224,7 @@ class VVMEngine:
             calldata      = b"",
             caller        = sender,
             address       = contract_addr,
-            origin        = sender,
+            origin        = origin if origin is not None else sender,
             call_value    = call_value,
             gas_limit     = gas_limit - base_gas,
             storage_ref   = self._storage,
@@ -229,6 +232,7 @@ class VVMEngine:
             depth         = 0,
             gas_price     = _gas_price_to_sat(tx.gas_price),
             block_ctx     = block_ctx,
+            execution_id  = getattr(tx, "tx_id", ""),
             reentrance_guard = guard,
         )
         frame._use_gas(0)  # base gas already deducted from limit above
@@ -369,6 +373,7 @@ class VVMEngine:
             depth         = 0,
             gas_price     = _gas_price_to_sat(tx.gas_price),
             block_ctx     = block_ctx,
+            execution_id  = getattr(tx, "tx_id", ""),
             reentrance_guard = guard,
         )
 
@@ -485,6 +490,7 @@ class VVMEngine:
             depth            = 0,
             gas_price        = 0,      # dry-run: no tx, no gas price
             block_ctx        = block_ctx,
+            execution_id     = "simulate",
             reentrance_guard = guard,
         )
         if call_value > 0:
@@ -552,7 +558,8 @@ class VVMEngine:
                        callee_addr: str, calldata: bytes,
                        call_value: int, gas: int,
                        is_static: bool = False,
-                       is_delegate: bool = False) -> Tuple[bool, bytes]:
+                       is_delegate: bool = False,
+                       is_callcode: bool = False) -> Tuple[bool, bytes]:
         """
         Spawn a child frame for contract-to-contract call.
         Returns (success, return_data).
@@ -591,6 +598,19 @@ class VVMEngine:
                 pending_balance_deltas.get(callee_addr, 0) + int(call_value)
             )
 
+        # BUG-24: CALLCODE (EVM semantics). The value operand must be covered by
+        # the calling contract's balance, otherwise the call fails without running
+        # the callee. The transfer is from the contract to itself, so no balance
+        # moves and pending_balance_deltas is left unchanged.
+        if is_callcode and call_value > 0:
+            source = caller_frame.address
+            effective = (self._storage.get_balance_sat(source) +
+                         int(pending_balance_deltas.get(source, 0)))
+            if effective < call_value:
+                if guard is not None:
+                    guard.exit(callee_addr)
+                return False, b""
+
         # ── Precompile dispatch ────────────────────────────────────────────────
         if VVMPrecompiles.is_precompile(callee_addr):
             child_gas = min(gas, caller_frame.gas_remaining)
@@ -606,8 +626,24 @@ class VVMEngine:
                 guard.exit(callee_addr)
             return ok, ret
 
+        # A contract created earlier in this top-level transaction is not yet
+        # persisted.  Overlay pending deployments on committed storage so CALL
+        # can see exactly the transaction-local code that will be committed if
+        # the top-level execution succeeds.
+        pending_rec = next(
+            (d for d in reversed(caller_frame.pending_deployments)
+             if d.get("address") == callee_addr),
+            None,
+        )
         contract_rec = self._storage.get_contract(callee_addr)
-        if not contract_rec:
+        if pending_rec is not None:
+            runtime_code = bytes(pending_rec.get("code_bytes") or b"")
+        elif contract_rec:
+            runtime_code = self._storage.get_contract_code(contract_rec["code_hash"])
+        else:
+            runtime_code = None
+
+        if pending_rec is None and not contract_rec:
             # Calling an EOA or non-existent address is a successful no-code
             # call.  Attached value still transfers to that address.
             caller_frame.balance_deltas = pending_balance_deltas
@@ -615,7 +651,6 @@ class VVMEngine:
                 guard.exit(callee_addr)
             return True, b""
 
-        runtime_code = self._storage.get_contract_code(contract_rec["code_hash"])
         if runtime_code is None:
             if guard is not None:
                 guard.exit(callee_addr)
@@ -627,7 +662,12 @@ class VVMEngine:
         # called the contract containing DELEGATECALL (caller_frame.caller), not
         # the intermediate contract (caller_frame.address).  This matches
         # Ethereum spec: msg.sender inside a delegated library == original caller.
-        exec_caller   = caller_frame.caller if is_delegate else caller_frame.address
+        # BUG-24: CALLCODE sets msg.sender to the calling contract (EVM spec).
+        # DELEGATECALL keeps the calling frame's msg.sender (SC-V73-FIX-7).
+        if is_delegate and not is_callcode:
+            exec_caller = caller_frame.caller
+        else:
+            exec_caller = caller_frame.address
 
         child = _VMFrame(
             code          = runtime_code,
@@ -636,13 +676,17 @@ class VVMEngine:
             address       = exec_address,
             origin        = caller_frame.origin,
             # SC-V73-FIX-7: DELEGATECALL also preserves msg.value (call_value)
-            call_value    = caller_frame.call_value if is_delegate else call_value,
+            # BUG-24: DELEGATECALL keeps the parent's msg.value; CALLCODE uses the
+            # value operand, as EVM does.
+            call_value    = (caller_frame.call_value
+                             if (is_delegate and not is_callcode) else call_value),
             gas_limit     = gas,
             storage_ref   = self._storage,
             is_static     = is_static or caller_frame.is_static,
             depth         = caller_frame.depth + 1,
             gas_price     = caller_frame.gas_price_wei,
             block_ctx     = caller_frame.block_ctx,
+            execution_id  = caller_frame.execution_id,
             return_buffer = caller_frame.return_buffer,
             reentrance_guard = guard,
         )
@@ -951,18 +995,28 @@ class VVMEngine:
             elif op == Op.EXTCODESIZE:
                 addr_int = f.pop()
                 addr_str = f._int_to_addr(addr_int)
-                c = self._storage.get_contract(addr_str)
-                if c:
-                    code = self._storage.get_contract_code(c["code_hash"]) or b""
-                    f.push(len(code) if code else 0)
+                pd = next((d for d in reversed(f.pending_deployments)
+                           if d.get("address") == addr_str), None)
+                if pd is not None:
+                    code = bytes(pd.get("code_bytes") or b"")
+                    f.push(len(code))
                 else:
-                    f.push(0)
+                    c = self._storage.get_contract(addr_str)
+                    if c:
+                        code = self._storage.get_contract_code(c["code_hash"]) or b""
+                        f.push(len(code) if code else 0)
+                    else:
+                        f.push(0)
             elif op == Op.EXTCODECOPY:
                 addr_int, dst, src, size = f.pop(), f.pop(), f.pop(), f.pop()
                 addr_str = f._int_to_addr(addr_int)
+                pd = next((d for d in reversed(f.pending_deployments)
+                           if d.get("address") == addr_str), None)
                 c = self._storage.get_contract(addr_str)
                 ext_code = b""
-                if c:
+                if pd is not None:
+                    ext_code = bytes(pd.get("code_bytes") or b"")
+                elif c:
                     ext_code = self._storage.get_contract_code(c["code_hash"]) or b""
                 dst  = dst  & f._UINT256_MAX_MEM
                 src  = src  & f._UINT256_MAX_MEM
@@ -1009,11 +1063,17 @@ class VVMEngine:
             elif op == Op.EXTCODEHASH:
                 addr_int = f.pop()
                 addr_str = f._int_to_addr(addr_int)
-                c = self._storage.get_contract(addr_str)
-                if c and c.get("code_hash"):
-                    f.push(int(c["code_hash"][:64], 16), Op.VTYPE_HASH)
+                pd = next((d for d in reversed(f.pending_deployments)
+                           if d.get("address") == addr_str), None)
+                if pd is not None:
+                    h = str(pd.get("code_hash") or sha256(bytes(pd.get("code_bytes") or b"")))
+                    f.push(int(h[:64], 16), Op.VTYPE_HASH)
                 else:
-                    f.push(0)  # EOA or non-existent — UINT (0 has no hash meaning)
+                    c = self._storage.get_contract(addr_str)
+                    if c and c.get("code_hash"):
+                        f.push(int(c["code_hash"][:64], 16), Op.VTYPE_HASH)
+                    else:
+                        f.push(0)  # EOA or non-existent — UINT (0 has no hash meaning)
 
                         
             # SC-FIX-3: BLOCKHASH was listed in gas table but had no dispatch —
@@ -1023,7 +1083,7 @@ class VVMEngine:
                 ctx = f.block_ctx
                 current_height = ctx.index if ctx else 0
                 # EVM spec: valid for the 256 most recent blocks (excluding current)
-                if n == 0 or n >= current_height or current_height - n > 256:
+                if n >= current_height or current_height - n > 256:
                     f.push(0)
                 else:
                     blk = self._storage.get_block(n)
@@ -1176,24 +1236,19 @@ class VVMEngine:
 
             # SC-FIX-10: New VSD-native opcodes
             elif op == Op.BLOCKFINALIZED:
-                # SC-V73-FIX-1: Only query finality for blocks STRICTLY BEFORE
-                # the current block being applied.  BFT finality propagates
-                # asynchronously — querying the current block or future blocks
-                # returns different values on different nodes depending on
-                # whether they have received the BFT certificate yet, splitting
-                # consensus.  Past blocks are already permanently canonical so
-                # their finality status is identical on every honest node.
-                target_height = f.pop()
-                current_height = f.block_ctx.index if f.block_ctx else 0
-                if target_height < current_height:
-                    blk = self._storage.get_block(target_height)
-                    f.push(1 if (blk and getattr(blk, "finalized", False)) else 0,
-                           Op.VTYPE_BOOL)
-                else:
-                    # Current or future block: deterministically return 0.
-                    # Contracts must not make finality-gated decisions based on
-                    # the block currently being processed.
-                    f.push(0, Op.VTYPE_BOOL)
+                # BUG-29: ``Block.finalized`` is mutable post-application
+                # metadata.  BFT vote gossip and depth-finality maintenance can
+                # change it after the block whose contract execution is being
+                # replayed, so consulting it here is not consensus-deterministic.
+                #
+                # Until finality is committed by consensus data that is itself
+                # part of the executed block/state transition, fail closed.
+                # Returning 0 is deterministic on every node and cannot cause a
+                # contract to act on finality that another honest node has not
+                # observed.  The operand is still consumed to preserve opcode
+                # stack semantics.
+                f.pop()
+                f.push(0, Op.VTYPE_BOOL)
 
             elif op == Op.TXSENDER:
                 # Push the origin EOA (top-level tx sender) as uint160
@@ -1213,9 +1268,9 @@ class VVMEngine:
                     raise RuntimeError("CREATE in static context forbidden")
                 value, offset, size = f.pop(), f.pop(), f.pop()
                 init_code = f.mslice(offset, size)
+                f._use_gas(32 * ((len(init_code) + 31) // 32))
                 child_gas = f.gas_remaining - f.gas_remaining // 64
                 f._use_gas(f.gas_remaining // 64)
-                f._use_gas(32 * ((len(init_code) + 31) // 32))
 
                 # CREATE is deterministic in Visold, but repeated execution of
                 # the same CREATE site must still produce distinct addresses.
@@ -1227,13 +1282,23 @@ class VVMEngine:
 
                 class _StubTx:
                     tx_id     = sha256(
-                        f"{init_code.hex()}:{f.address}:{f.pc}:{create_seq}".encode())
+                        f"{f.execution_id}:{init_code.hex()}:{f.address}:"
+                        f"{f.pc}:{create_seq}".encode())
                     gas_price = 0.0
 
                 create_addr = "VSDc" + sha256(
-                    f"{f.address}:{self._storage.get_nonce(f.address)}:"
+                    f"{f.address}:{f.execution_id}:"
                     f"{_StubTx.tx_id}:{create_seq}".encode()
                 )[:36]
+                occupied = (
+                    self._storage.get_contract(create_addr) is not None
+                    or self._storage.get_nonce(create_addr) > 0
+                    or any(d.get("address") == create_addr
+                           for d in f.pending_deployments)
+                )
+                if occupied:
+                    f.push(0)
+                    continue
                 pending_balance_deltas = dict(f.balance_deltas)
                 if value > 0:
                     effective = (self._storage.get_balance_sat(f.address) +
@@ -1259,6 +1324,7 @@ class VVMEngine:
                         gas_limit           = child_gas,
                         block_ctx           = f.block_ctx,
                         tx                  = _StubTx(),
+                        origin              = f.origin,
                         parent_storage_writes = dict(f.storage_writes),
                         parent_storage_tags   = dict(f._storage_tags),
                         parent_storage_tag_orig = dict(f._storage_tag_orig),
@@ -1296,9 +1362,8 @@ class VVMEngine:
                     gas_used_child = sub_result.gas_used
 
                 if f.gas_remaining < gas_used_child:
-                    f.gas_remaining = 0
-                else:
-                    f.gas_remaining -= gas_used_child
+                    raise RuntimeError("Out of gas")
+                f.gas_remaining -= gas_used_child
 
             # SC-FIX-5: CREATE2 — deterministic contract deployment via salt
             # SC-V73-FIX-2 + SC-V73-FIX-6: same deferred-deployment fix as CREATE.
@@ -1307,14 +1372,24 @@ class VVMEngine:
                     raise RuntimeError("CREATE2 in static context forbidden")
                 value, offset, size, salt = f.pop(), f.pop(), f.pop(), f.pop()
                 init_code = f.mslice(offset, size)
+                f._use_gas(6 * ((len(init_code) + 31) // 32))
                 child_gas = f.gas_remaining - f.gas_remaining // 64
                 f._use_gas(f.gas_remaining // 64)
-                f._use_gas(6 * ((len(init_code) + 31) // 32))
 
                 salt_bytes  = salt.to_bytes(32, 'big')
                 code_hash   = hashlib.sha256(init_code).hexdigest()
                 addr_input  = b"VSDc2" + f.address.encode() + salt_bytes + code_hash.encode()
                 contract2_addr = "VSDc" + hashlib.sha256(addr_input).hexdigest()[:36]
+
+                occupied2 = (
+                    self._storage.get_contract(contract2_addr) is not None
+                    or self._storage.get_nonce(contract2_addr) > 0
+                    or any(d.get("address") == contract2_addr
+                           for d in f.pending_deployments)
+                )
+                if occupied2:
+                    f.push(0)
+                    continue
 
                 class _StubTx2:
                     tx_id     = hashlib.sha256(addr_input).hexdigest()
@@ -1345,10 +1420,12 @@ class VVMEngine:
                         gas_limit           = child_gas,
                         block_ctx           = f.block_ctx,
                         tx                  = _StubTx2(),
+                        origin              = f.origin,
                         parent_storage_writes = dict(f.storage_writes),
                         parent_storage_tags   = dict(f._storage_tags),
                         parent_storage_tag_orig = dict(f._storage_tag_orig),
                         parent_balance_deltas = pending_balance_deltas2,
+                        parent_create_nonce_deltas = dict(f.create_nonce_deltas),
                         deployed_address      = contract2_addr,
                     )
                     if sub_result2.success and sub_result2.contract_addr:
@@ -1380,9 +1457,8 @@ class VVMEngine:
                     gas2_child = sub_result2.gas_used
 
                 if f.gas_remaining < gas2_child:
-                    f.gas_remaining = 0
-                else:
-                    f.gas_remaining -= gas2_child
+                    raise RuntimeError("Out of gas")
+                f.gas_remaining -= gas2_child
 
             elif op == Op.CALL or op == Op.CALLCODE:
                 gas_param = f.pop()
@@ -1396,7 +1472,11 @@ class VVMEngine:
                 child_gas = min(gas_param, f.gas_remaining - f.gas_remaining // 64)
                 f._use_gas(f.gas_remaining // 64)
                 callee = f._int_to_addr(addr_int)
-                is_delegate = (op == Op.CALLCODE)
+                is_callcode = (op == Op.CALLCODE)
+                # CALLCODE runs the callee's code in the caller's storage context,
+                # so it shares the is_delegate context path; the msg.sender,
+                # msg.value and value-check rules differ and are keyed on is_callcode.
+                is_delegate = is_callcode
                 ok, ret = self._internal_call(
                     caller_frame = f,
                     callee_addr  = callee,
@@ -1405,6 +1485,7 @@ class VVMEngine:
                     gas          = child_gas,
                     is_static    = f.is_static,
                     is_delegate  = is_delegate,
+                    is_callcode  = is_callcode,
                 )
                 # Write return data to output memory
                 if ret and out_size > 0:
@@ -1885,14 +1966,48 @@ class VVMEngine:
                     if caller_str not in (ch["opener"], ch["counterparty"]):
                         _chan_dispute_fail()
 
-                    # ── Force-close path (channel already DISPUTED) ───────
-                    elif ch["status"] == "DISPUTED":
+                    def _validate_and_raise_dispute():
+                        # Sequence must strictly advance the currently accepted
+                        # dispute state.  This is meaningful for both the first
+                        # OPEN->DISPUTED transition and later challenges.
+                        if seq_no <= int(ch.get("dispute_seq", 0) or 0):
+                            return False
+                        if bal_caller < 0 or bal_counter < 0:
+                            return False
+                        if bal_caller + bal_counter != ch["total_deposit_sat"]:
+                            return False
+                        if caller_str == ch["opener"]:
+                            signer_addr = ch["counterparty"]
+                            bal_opener = bal_caller
+                            bal_ctr = bal_counter
+                        else:
+                            signer_addr = ch["opener"]
+                            bal_opener = bal_counter
+                            bal_ctr = bal_caller
+                        msg_hash_b = _chan_state_msg(
+                            channel_id, seq_no, bal_opener, bal_ctr)
+                        recovered = ""
+                        for v_try in (27, 28):
+                            r = sig_r & _VMFrame.UINT256_MAX
+                            s = sig_s & _VMFrame.UINT256_MAX
+                            addr_try = _chan_recover_address(
+                                msg_hash_b, v_try, r, s)
+                            if addr_try == signer_addr:
+                                recovered = addr_try
+                                break
+                        if recovered != signer_addr:
+                            return False
+                        return self._storage.raise_dispute(
+                            channel_id, seq_no, bal_opener, bal_ctr, cur_h)
+
+                    if ch["status"] == "DISPUTED":
                         timeout_expired = (
                             cur_h >= ch["dispute_height"] + ch["timeout_blocks"])
-                        if not timeout_expired:
-                            _chan_dispute_fail()
-                        else:
-                            # Extra gas for force-close (settle balances)
+                        if timeout_expired:
+                            # Extra gas for force-close (settle balances).
+                            # Once timeout has elapsed, no later challenge is
+                            # accepted; settlement uses the latest state that
+                            # successfully advanced dispute_seq.
                             f._use_gas(2000)
                             ok = self._storage.force_close_channel(
                                 channel_id, cur_h)
@@ -1908,50 +2023,18 @@ class VVMEngine:
                                     ch["counterparty"],
                                     ch["dispute_bal_counter"])
                                 f.push(1, Op.VTYPE_BOOL)  # 1 = force-closed
-
-                    # ── Raise dispute path (channel OPEN) ─────────────────
-                    else:
-                        # seq_no must be strictly greater than existing dispute
-                        if seq_no <= ch["dispute_seq"] and ch["dispute_seq"] > 0:
-                            _chan_dispute_fail()
-                        # Balance conservation
-                        elif bal_caller < 0 or bal_counter < 0:
-                            _chan_dispute_fail()
-                        elif bal_caller + bal_counter != ch["total_deposit_sat"]:
-                            _chan_dispute_fail()
                         else:
-                            # Determine which party's sig we're verifying
-                            if caller_str == ch["opener"]:
-                                signer_addr = ch["counterparty"]
-                                bal_opener  = bal_caller
-                                bal_ctr     = bal_counter
+                            # Challenge window: a newer valid counterparty-
+                            # signed state supersedes the stale dispute.
+                            if _validate_and_raise_dispute():
+                                f.push(2, Op.VTYPE_BOOL)
                             else:
-                                signer_addr = ch["opener"]
-                                bal_opener  = bal_counter
-                                bal_ctr     = bal_caller
-                            # Build state-update message
-                            msg_hash_b = _chan_state_msg(
-                                channel_id, seq_no, bal_opener, bal_ctr)
-                            # Verify counterparty signature (try v=27,28)
-                            recovered = ""
-                            for v_try in (27, 28):
-                                r = sig_r & _VMFrame.UINT256_MAX
-                                s = sig_s & _VMFrame.UINT256_MAX
-                                addr_try = _chan_recover_address(
-                                    msg_hash_b, v_try, r, s)
-                                if addr_try == signer_addr:
-                                    recovered = addr_try
-                                    break
-                            if recovered != signer_addr:
                                 _chan_dispute_fail()
-                            else:
-                                raised = self._storage.raise_dispute(
-                                    channel_id, seq_no,
-                                    bal_opener, bal_ctr, cur_h)
-                                if not raised:
-                                    _chan_dispute_fail()
-                                else:
-                                    f.push(2, Op.VTYPE_BOOL)  # 2 = dispute raised
+                    else:
+                        if _validate_and_raise_dispute():
+                            f.push(2, Op.VTYPE_BOOL)
+                        else:
+                            _chan_dispute_fail()
 
             else:
                 raise RuntimeError(f"Unknown opcode 0x{op:02X}")

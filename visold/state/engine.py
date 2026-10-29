@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING, Tuple
 from visold.kernel.config import Config
 from visold.kernel.events import Event, EventType
 from visold.kernel.logging_setup import log
-from visold.kernel.messages import MSG_VALIDATOR_SIG
+from visold.kernel.messages import MSG_EMERGENCY_VOTE, MSG_VALIDATOR_SIG
 from visold.kernel.metrics import metrics
 from visold.kernel.notifications import _push_block_notif
 from visold.ledger.block import Block
@@ -339,7 +339,7 @@ class StateEngine:
         if self._circuit_breaker and self._circuit_breaker.is_open:
             write_events = {EventType.NEW_TX, EventType.NEW_BLOCK,
                             EventType.MINE_RESULT, EventType.VALIDATOR_SIG,
-                            EventType.CHAIN_SYNC}
+                            EventType.CHAIN_SYNC, EventType.EMERGENCY_VOTE}
             if et in write_events:
                 ok, reason = self._circuit_breaker.check_allows_write()
                 return False, reason
@@ -365,6 +365,9 @@ class StateEngine:
 
         elif et == EventType.VALIDATOR_SIG:
             return self._handle_validator_sig(pl, event.source_peer_id)
+
+        elif et == EventType.EMERGENCY_VOTE:
+            return self._handle_emergency_vote(pl, event.source_peer_id)
 
         elif et == EventType.CHAIN_SYNC:
             return self._handle_chain_sync(pl, event.source_peer_id)
@@ -811,26 +814,49 @@ class StateEngine:
                 return False, "Missing block in mine_result"
 
             _existing_at_height = self._storage.get_block(block.index)
+            _record_apply_result = True
             if (_existing_at_height is not None
                     and _existing_at_height.block_hash != block.block_hash):
                 if block.index < self._blockchain.height():
-                    ok, msg = True, "Stale conflicting mined block ignored; higher tip retained"
+                    ok, msg = False, (
+                        "Mined block not applied: stale conflicting candidate; "
+                        "higher canonical tip retained")
+                    # Do not poison block_apply:<height> for the canonical block
+                    # merely because a stale locally-mined candidate arrived.
+                    _record_apply_result = False
                 else:
                     _parent = self._storage.get_block(block.index - 1)
                     if _parent is not None and _parent.block_hash == block.prev_hash:
                         ok, msg = self._blockchain.accept_chain([_parent, block])
-                        if (not ok and not msg.startswith("Reorg apply block")):
-                            ok = True
+                        _canonical = self._storage.get_block(block.index)
+                        _candidate_canonical = bool(
+                            _canonical is not None
+                            and _canonical.block_hash == block.block_hash)
+                        if not _candidate_canonical:
+                            ok = False
                             msg = (
-                                "Fork candidate rejected by deterministic fork choice; "
-                                f"local chain retained ({msg})")
+                                "Mined block not applied: fork candidate rejected by "
+                                f"deterministic fork choice ({msg})")
+                            _record_apply_result = False
                     else:
                         ok, msg = False, (
                             f"Conflicting mined block {block.index} has no matching "
                             f"local parent")
             else:
                 ok, msg = self._blockchain.apply_block(block)
-            self._storage.record_block_apply_result(block.index, ok)
+
+            # BUG-43: success means this candidate is actually canonical, not
+            # merely that ignoring/rejecting it left the node in a healthy state.
+            if ok:
+                _canonical = self._storage.get_block(block.index)
+                if (_canonical is None
+                        or _canonical.block_hash != block.block_hash):
+                    ok = False
+                    msg = "Mined block not applied: candidate is not canonical"
+                    _record_apply_result = False
+
+            if _record_apply_result:
+                self._storage.record_block_apply_result(block.index, ok)
 
             if ok:
                 if self._network:
@@ -975,6 +1001,24 @@ class StateEngine:
         except Exception as e:
             return False, f"validator_sig error: {e}"
 
+    def _handle_emergency_vote(self, payload: dict,
+                               source_peer: str) -> Tuple[bool, str]:
+        """BUG-12: verify and count a gossiped emergency-disable vote.
+
+        Relayed only when the vote was new and valid, so repeats and invalid
+        votes are not amplified across the mesh.
+        """
+        try:
+            accepted, _disabled, msg = self._blockchain._governance.record_emergency_vote(
+                payload, is_eligible=self._blockchain.emergency_operator_eligible)
+            if accepted and self._network and source_peer:
+                self._network._gossip(
+                    dict(payload, type=MSG_EMERGENCY_VOTE, ttl=Config.GOSSIP_TTL),
+                    exclude=source_peer)
+            return accepted, msg
+        except Exception as e:
+            return False, f"emergency_vote error: {e}"
+
     def _handle_chain_sync(self, payload: dict,
                             source_peer: str) -> Tuple[bool, str]:
         """Accept a sequence of blocks from a peer (sync or reorg)."""
@@ -1005,8 +1049,22 @@ class StateEngine:
             # returns one verdict for the whole batch, not per-block), but
             # far more accurate than recording nothing, and it closes the
             # actual blind spot.
-            for block in blocks:
-                self._storage.record_block_apply_result(block.index, ok)
+            #
+            # Route every height through _record_apply_outcome(), the same
+            # VSA-04 guard the single-block path uses, so a rejected batch
+            # cannot overwrite an "ok" marker for a canonical block that the
+            # batch merely overlaps (same height, same hash) — e.g. a peer on
+            # a lighter fork re-sending the shared canonical prefix.
+            #
+            # A batch refused by accept_chain's header-only preflight was never
+            # validated or applied: its heights have no apply outcome to record,
+            # and a pruned peer's body-less records must not count as failures
+            # of heights this node never executed.
+            _preflight_refused = (
+                not ok and "pruned/header-only" in str(msg or "").lower())
+            if not _preflight_refused:
+                for block in blocks:
+                    self._record_apply_outcome(block, ok)
             if ok:
                 for block in blocks:
                     self._governance.on_block_applied(block)

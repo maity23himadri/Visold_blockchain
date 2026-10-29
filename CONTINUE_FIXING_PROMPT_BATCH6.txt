@@ -1,0 +1,33 @@
+Continue fixing the Visold V4 audit findings using `Visold_V4_Batch5_Fixed.zip` as the ONLY baseline.
+
+Important: do not trust prior "fixed" labels blindly. Before new edits, rerun the cumulative Batch 1–5 regression files and inspect any relevant previous fix for root-cause completeness. Do not accept test-only or overbroad fixes.
+
+Already verified fixed in the current line:
+BUG-1, BUG-2, BUG-3, BUG-4, BUG-5, BUG-6, BUG-7, BUG-8, BUG-9, BUG-10, BUG-11, BUG-13, BUG-14, BUG-15, BUG-16, BUG-17, BUG-19, BUG-20, BUG-21, BUG-22, BUG-23, BUG-25, BUG-26, BUG-27, BUG-28, BUG-45.
+
+Batch-5 report: `VISOLD_V4_BUGFIX_PROGRESS_2026-10-29_BATCH5.md`.
+
+Next priority batch:
+1. BUG-29 (BLOCKFINALIZED determinism)
+2. BUG-30 (unverified name-resolution payment redirection)
+3. BUG-31 (ECDSA recovery formula)
+4. BUG-32 (channel signer/verifier digest convention)
+5. BUG-33 (channel rowcount / settlement / rollback safety)
+
+If and only if those are verified and stable, continue with BUG-34 and BUG-35.
+
+For each finding:
+- verify current source and all affected call paths before modifying;
+- classify confirmed / conditional / false positive / intentional;
+- reproduce against the Batch-5 baseline when feasible;
+- make the smallest complete root-cause fix;
+- add a regression that fails on untouched Batch 5 and passes after the fix;
+- run the new regression, cumulative prior batch regressions, and adjacent feature tests;
+- do not treat a timeout as pass;
+- do not weaken or rewrite tests just to turn them green;
+- preserve deterministic consensus, money conservation, rollback and existing protections;
+- explicitly flag any earlier fix discovered to be incomplete or garbage and correct it before proceeding.
+
+Do NOT "fix" BUG-12 by lowering quorum. Do NOT change BUG-18/BUG-24 without resolving their stated protocol-compatibility questions.
+
+Deliver a new complete ZIP, persistent Batch-6 report, exact commands/results/timeouts, cumulative bug status, limitations/risks, and a prompt for the following session.

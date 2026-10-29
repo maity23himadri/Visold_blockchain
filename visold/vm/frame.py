@@ -113,6 +113,7 @@ class _VMFrame:
                  depth: int = 0,
                  gas_price: int = 0,
                  block_ctx=None,
+                 execution_id: str = "",
                  return_buffer: bytes = b"",
                  reentrance_guard: Optional['_ReentrancyGuard'] = None):
         self.code           = code
@@ -128,6 +129,7 @@ class _VMFrame:
         self.depth          = depth
         self.gas_price_wei  = gas_price
         self.block_ctx      = block_ctx
+        self.execution_id   = str(execution_id or "")
         self.return_buffer  = return_buffer  # return data from last sub-call
         # SC-FIX-1: reentrancy guard — shared across all frames in one execution
         self.reentrance_guard = reentrance_guard
@@ -469,17 +471,10 @@ class _VMFrame:
         if not isinstance(address, str) or not address:
             return 0
 
-        # Canonical user/wallet address: VSD + base58(20 raw bytes).  Keep the
-        # exact 160-bit ABI representation for interoperability with calldata.
-        if address.startswith("VSD") and not address.startswith("VSDc"):
-            try:
-                raw20 = b58decode(address[3:])
-                if len(raw20) == 20:
-                    return int.from_bytes(raw20, "big")
-            except Exception:
-                pass
-
         # Canonical deterministic contract address: VSDc + 36 hex chars.
+        # Test this exact shape first.  A normal wallet may legitimately begin
+        # with the characters ``VSDc`` because its Base58 payload is unconstrained;
+        # prefix alone must never classify an EOA as a contract (BUG-39).
         if address.startswith("VSDc") and len(address) == 40:
             try:
                 suffix = bytes.fromhex(address[4:])
@@ -488,6 +483,17 @@ class _VMFrame:
                     raw = raw.ljust(32, b"\x00")
                     return int.from_bytes(raw, "big")
             except ValueError:
+                pass
+
+        # Canonical user/wallet address: VSD + base58(20 raw bytes).  Do not
+        # exclude the textual prefix ``VSDc``: wallets with a Base58 payload
+        # beginning in ``c`` are still EOAs and must match ABI calldata words.
+        if address.startswith("VSD"):
+            try:
+                raw20 = b58decode(address[3:])
+                if len(raw20) == 20:
+                    return int.from_bytes(raw20, "big")
+            except Exception:
                 pass
 
         # Precompiles and legacy/test addresses are encoded directly.  The

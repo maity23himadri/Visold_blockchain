@@ -84,6 +84,10 @@ _LOCAL_LEDGER_PATH = "vsd_personal_ledger.json"
 
 
 _LOCAL_LEDGER_LOCK = threading.Lock()   # serialises concurrent daemon writes
+# Block hashes rolled out of the canonical chain.  The writer checks this set
+# while holding the same file lock, so a delayed daemon write cannot resurrect
+# an orphaned transaction after rollback (BUG-44).
+_LOCAL_LEDGER_INVALIDATED_BLOCKS: set[str] = set()
 
 
 def _ledger_collect_entries(block, owner_address: str) -> list:
@@ -104,6 +108,7 @@ def _ledger_collect_entries(block, owner_address: str) -> list:
             counterparty = receiver if sender == owner else sender
             collected.append({
                 "Block_Height":         int(block.index),
+                "Block_Hash":           str(getattr(block, "block_hash", "") or ""),
                 "Tx_Hash":              str(getattr(tx, "tx_id", "") or ""),
                 "Type":                 "L1",
                 "Amount":               float(getattr(tx, "amount", 0.0) or 0.0),
@@ -129,6 +134,7 @@ def _ledger_collect_entries(block, owner_address: str) -> list:
                 amount_vsd   = from_satoshi(int(getattr(l2tx, "amount_sat", 0) or 0))
                 collected.append({
                     "Block_Height":         int(block.index),
+                    "Block_Hash":           str(getattr(block, "block_hash", "") or ""),
                     "Tx_Hash":              str(getattr(l2tx, "l2_tx_id", "") or ""),
                     "Type":                 "L2",
                     "Amount":               float(amount_vsd),
@@ -139,7 +145,7 @@ def _ledger_collect_entries(block, owner_address: str) -> list:
     return collected
 
 
-def _ledger_write_worker(block_index: int, new_entries: list,
+def _ledger_write_worker(block_index: int, block_hash: str, new_entries: list,
                          owner_address: str) -> None:
     """Thread-worker: merges *new_entries* into the JSON ledger file.
 
@@ -152,6 +158,8 @@ def _ledger_write_worker(block_index: int, new_entries: list,
         return
     try:
         with _LOCAL_LEDGER_LOCK:
+            if block_hash and block_hash in _LOCAL_LEDGER_INVALIDATED_BLOCKS:
+                return
             # ── Load existing ledger (or start fresh) ──────────────────────
             ledger: dict = {"owner": owner_address, "entries": []}
             if os.path.exists(_LOCAL_LEDGER_PATH):
@@ -200,6 +208,50 @@ def _ledger_write_worker(block_index: int, new_entries: list,
                     block_index, exc)
 
 
+def invalidate_local_ledger_block(block_data) -> None:
+    """Synchronously remove entries belonging to an orphaned block.
+
+    The block hash is also marked invalid while holding the ledger lock so any
+    already-spawned writer for that block will observe the invalidation before
+    it can append stale entries.  Legacy entries without Block_Hash are removed
+    by height as a best-effort migration path.
+    """
+    block_hash = str(getattr(block_data, "block_hash", "") or "")
+    block_index = int(getattr(block_data, "index", -1))
+    try:
+        with _LOCAL_LEDGER_LOCK:
+            if block_hash:
+                _LOCAL_LEDGER_INVALIDATED_BLOCKS.add(block_hash)
+            if not os.path.exists(_LOCAL_LEDGER_PATH):
+                return
+            with open(_LOCAL_LEDGER_PATH, "r", encoding="utf-8") as fh:
+                ledger = json.load(fh)
+            if not isinstance(ledger, dict) or not isinstance(ledger.get("entries"), list):
+                return
+            kept = []
+            changed = False
+            for entry in ledger["entries"]:
+                if not isinstance(entry, dict):
+                    kept.append(entry); continue
+                entry_hash = str(entry.get("Block_Hash", "") or "")
+                remove = (bool(block_hash) and entry_hash == block_hash)
+                if not entry_hash and int(entry.get("Block_Height", -2)) == block_index:
+                    remove = True
+                if remove:
+                    changed = True
+                else:
+                    kept.append(entry)
+            if changed:
+                ledger["entries"] = kept
+                tmp_path = _LOCAL_LEDGER_PATH + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as fh:
+                    json.dump(ledger, fh, indent=2, ensure_ascii=False)
+                os.replace(tmp_path, _LOCAL_LEDGER_PATH)
+    except Exception as exc:
+        log.warning("invalidate_local_ledger_block failed (block=%s): %s",
+                    block_index, exc)
+
+
 def sync_local_ledger(block_data, owner_address: str) -> None:
     """Archive all transactions involving *owner_address* from *block_data*
     into ``vsd_personal_ledger.json`` before the block is pruned.
@@ -237,10 +289,17 @@ def sync_local_ledger(block_data, owner_address: str) -> None:
     if not new_entries:
         return   # nothing to archive — don't even spawn a thread
 
+    # A block with this exact hash is canonical again (e.g. an old suffix was
+    # restored after a failed reorg), so permit its ledger entries to be written.
+    _block_hash = str(getattr(block_data, "block_hash", "") or "")
+    if _block_hash:
+        with _LOCAL_LEDGER_LOCK:
+            _LOCAL_LEDGER_INVALIDATED_BLOCKS.discard(_block_hash)
+
     # Dispatch I/O to a daemon thread so apply_block returns immediately.
     t = threading.Thread(
         target=_ledger_write_worker,
-        args=(getattr(block_data, "index", -1), new_entries, owner_address),
+        args=(getattr(block_data, "index", -1), _block_hash, new_entries, owner_address),
         daemon=True,
         name=f"ledger-writer-{getattr(block_data, 'index', 0)}",
     )

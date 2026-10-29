@@ -149,7 +149,8 @@ class RPCServer:
         _RATE_MAX       = 20.0
         _RATE_REFILL    = 20.0   # tokens per second
         _SLOW_METHODS   = {
-            "analyzecontract", "getmempool", "checkinvariants", "getheaders"
+            "analyzecontract", "getmempool", "checkinvariants", "getheaders",
+            "getblockheaders"
         }
 
         def _consume_token(method: str = "") -> bool:
@@ -191,7 +192,11 @@ class RPCServer:
                 if not auth.startswith("Bearer "):
                     return False
                 provided = auth[len("Bearer "):]
-                return hmac.compare_digest(provided, token)
+                # compare_digest(str, str) raises TypeError for non-ASCII text.
+                # UTF-8 bytes give deterministic constant-time comparison and
+                # turn malformed/non-matching tokens into a normal auth failure.
+                return hmac.compare_digest(
+                    provided.encode("utf-8"), str(token).encode("utf-8"))
 
             def _is_admin(self) -> bool:
                 """v7.5.0-OPT: check whether the caller holds the admin token.
@@ -1199,17 +1204,27 @@ class RPCServer:
                         ok_a, msg_a = seq.add_l2_tx(l2_tx)
                         accepted_locally = ok_a
                         seq_msg = msg_a
+                    gossip_targets = 0
+                    gossip_msg = "network unavailable"
                     try:
                         if node.network is not None:
-                            node.network.broadcast_l2_tx(l2_tx)
+                            gossip_targets = int(node.network.broadcast_l2_tx(l2_tx) or 0)
+                            gossip_msg = (
+                                f"scheduled for {gossip_targets} peer(s)"
+                                if gossip_targets > 0 else "no connected gossip peers")
                     except Exception as _bg_e:
+                        gossip_msg = f"gossip failed: {_bg_e}"
                         log.debug(f"vsd_sendL2Transaction gossip failed: {_bg_e}")
+                    gossiped = gossip_targets > 0
+                    admitted_or_sent = bool(accepted_locally or gossiped)
                     return {
-                        "ok": True,
+                        "ok": admitted_or_sent,
                         "l2_tx_id": l2_tx.l2_tx_id,
                         "accepted_locally": accepted_locally,
                         "sequencer_msg": seq_msg,
-                        "gossiped": True,
+                        "gossiped": gossiped,
+                        "gossip_targets": gossip_targets,
+                        "gossip_msg": gossip_msg,
                     }
 
                 elif method == "vsd_depositToL2":

@@ -235,27 +235,32 @@ class SlashingEvidenceProtocol:
         if not ok:
             return False, reason
 
+        pair = sorted((str(evidence["block_hash_a"]),
+                       str(evidence["block_hash_b"])))
         evidence_id = sha256(
-            f"{evidence['validator']}:{evidence['block_hash_a']}:"
-            f"{evidence['block_hash_b']}".encode())
+            f"{evidence['validator']}:{pair[0]}:{pair[1]}".encode())
         with self._lock:
             if evidence_id in self._seen_evidences:
                 return False, "Evidence already processed"
+            validator = evidence["validator"]
+            role = self._storage.get_role(validator)
+            if not role:
+                return False, f"Validator {validator[:16]} not registered"
+            if role.get("slashed"):
+                return False, f"Validator {validator[:16]} already slashed"
+
+            # Storage.slash() is itself a conditional atomic update.  Holding
+            # this protocol lock across eligibility + mutation also prevents
+            # two opposite-order packets handled by different node threads
+            # from both being accepted by this protocol instance.
+            if not self._storage.slash(validator):
+                return False, f"Validator {validator[:16]} already slashed"
+            self._storage.set_meta(
+                f"slash_evidence:{evidence_id[:32]}",
+                json.dumps({"validator": validator,
+                            "height": evidence.get("height", 0),
+                            "timestamp": int(time.time())}))
             self._seen_evidences.add(evidence_id)
-
-        validator = evidence["validator"]
-        role = self._storage.get_role(validator)
-        if not role:
-            return False, f"Validator {validator[:16]} not registered"
-        if role.get("slashed"):
-            return False, f"Validator {validator[:16]} already slashed"
-
-        self._storage.slash(validator)
-        self._storage.set_meta(
-            f"slash_evidence:{evidence_id[:32]}",
-            json.dumps({"validator": validator,
-                        "height": evidence.get("height", 0),
-                        "timestamp": int(time.time())}))
         log.critical(
             f"SLASH EVIDENCE APPLIED: Validator {validator[:16]}... "
             f"double-signed at height {evidence.get('height', '?')}. "

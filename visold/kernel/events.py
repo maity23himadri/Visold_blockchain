@@ -90,6 +90,7 @@ class EventType(_enum.Enum):
     NEW_BLOCK     = "NEW_BLOCK"
     MINE_RESULT   = "MINE_RESULT"
     VALIDATOR_SIG = "VALIDATOR_SIG"
+    EMERGENCY_VOTE = "EMERGENCY_VOTE"
     CHAIN_SYNC    = "CHAIN_SYNC"
     TIMER         = "TIMER"
     STOP          = "STOP"

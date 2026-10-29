@@ -26,6 +26,7 @@ Origin: visold_vsd_.py L51101-51175, L51178-51371
 
 from typing import Any, Dict, List, Tuple
 
+from visold.kernel.logging_setup import log
 from visold.selfhealing.model import AnomalyKind, AnomalyReport, Severity, SeverityDecision
 
 
@@ -62,12 +63,13 @@ class GameTheoryModel:
         height: int,
     ) -> Tuple[float, float]:
         """Returns (attacker_ev, validator_ev) in VSD units."""
+        supply = self._get_total_supply()
+        block_reward = 10.0   # VSD; would read from Config.BLOCK_REWARD
         try:
-            supply = self._get_total_supply()
-            block_reward = 10.0   # VSD; would read from Config.BLOCK_REWARD
             validators = len(self._storage.get_validators() or [])
-        except Exception:
-            supply, block_reward, validators = 1_000_000.0, 10.0, 3
+        except Exception as exc:
+            log.critical("SHBS validator snapshot unavailable: %s", exc)
+            raise
 
         # Attacker EV models per anomaly kind
         if kind == AnomalyKind.FUND_DRAIN:

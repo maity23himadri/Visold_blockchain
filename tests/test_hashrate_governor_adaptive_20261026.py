@@ -142,7 +142,13 @@ def test_dynamic_throttle_worker_flushes_telemetry_before_1024_batch(monkeypatch
         daemon=True,
     )
     worker.start()
-    time.sleep(0.10)
+    # Do not assume a sub-millisecond sleep has sub-millisecond scheduling
+    # precision.  Android/Termux and loaded CI hosts may round/jitter the
+    # injected 0.2 ms delay substantially.  Wait only until the first 256-hash
+    # telemetry flush becomes visible, with a bounded deadline.
+    deadline = time.monotonic() + 2.0
+    while metrics[0][0] < 256 and time.monotonic() < deadline:
+        time.sleep(0.005)
     visible_count_before_stop = metrics[0][0]
     stop.set()
     worker.join(3.0)

@@ -1,0 +1,25 @@
+Continue the Visold V4 46-finding repair project from `Visold_V4_Batch6_Fixed.zip` and `VISOLD_V4_BUGFIX_PROGRESS_2026-10-29_BATCH6.md`.
+
+Treat Batch 6 as the working baseline. Do not reapply old source archives.
+
+Already verified fixed: BUG-1,2,3,4,5,6,7,8,9,10,11,13,14,15,16,17,19,20,21,22,23,25,26,27,28,29,30,31,32,33,45.
+
+Batch-6 also corrected a pre-existing rollback guard-order regression: rollback targets below the rolling-prune watermark are rejected before finality block scans.
+
+Next priority batch: BUG-34, BUG-35, BUG-36, BUG-37, BUG-38. If and only if those are fully verified and stable, continue with BUG-39 or BUG-40.
+
+Mandatory method:
+1. Re-verify each audit finding against the current Batch-6 source before editing. Classify confirmed/conditional/false-positive/intentional.
+2. Re-run cumulative prior regression tests first or early in the batch, especially Batch-6 channel/crypto/finality tests.
+3. Write targeted regression tests that fail on an untouched Batch-6 baseline and pass on the patch. Do not count a test as evidence if it also passes on the buggy baseline.
+4. For BUG-34, verify challenge-window semantics, higher-sequence replacement, signature validation, timeout behavior, storage journaling, settlement, and rollback.
+5. For BUG-35, test real CREATE→CALL and CREATE→EXTCODESIZE visibility inside one transaction and rollback/revert behavior; do not merely query persistent storage.
+6. For BUG-36, verify the actual RIPEMD precompile dispatch address before editing, and use independent RIPEMD-160 vectors. Never return a different hash as fallback.
+7. For BUG-37, verify GETBLOCKHEADERS workload/rate-cost behavior on both GET/POST or whichever transports actually exist; do not merely rename a string.
+8. For BUG-38, define expected-supply semantics with issuance/burns before changing the monitor; avoid flagging authorized decreases/increases as corruption.
+9. Re-test previous fixes for overbroad/garbage patches. If a previous fix is incomplete or wrong, correct it and explicitly downgrade the earlier completion claim in the new report.
+10. Run affected existing suites separately when aggregate tests hang. A timeout is not a pass.
+11. Preserve an untouched Batch-6 baseline and work on a separate copy.
+12. Deliver patched ZIP, persistent Batch-7 report, exact commands/results/timeouts, unresolved risks, and a Batch-8 continuation prompt.
+
+Do not weaken tests, reduce safety quorum, suppress errors merely to get green, or make arbitrary consensus changes.

@@ -41,9 +41,10 @@ from visold.crypto.ecc import (
 )
 from visold.crypto.hashing import sha256
 from visold.kernel.config import Config
-from visold.kernel.units import VSD_GLOBAL_MARKET, to_satoshi
+from visold.kernel.units import VSD_GLOBAL_MARKET, gas_fee_to_sat, to_satoshi
+from visold.ledger.addressing import is_valid_protocol_address
 from visold.rollup.batches import RollupSubmission
-from visold.rollup.l2_state import L2_BRIDGE_ADDRESS
+from visold.rollup.l2_state import L2_BRIDGE_ADDRESS, L2_WITHDRAW_ADDRESS
 from visold.vm.naming import normalize_contract_name, validate_contract_name
 
 if TYPE_CHECKING:  # annotation-only references (no runtime import, no cycle)
@@ -151,7 +152,7 @@ class Transaction:
         if not raw.casefold().startswith(prefix):
             return None
         name = raw[len(prefix):].strip().casefold()
-        if not (re.fullmatch(r"[a-z0-9_.\\-]{3,32}", name)
+        if not (re.fullmatch(r"[a-z0-9_.\-]{3,32}", name)
                 or re.fullmatch(r"[a-z0-9_]{3,32}#[0-9a-f]{10}", name)):
             return None
         if "#" not in name:
@@ -409,6 +410,19 @@ class Transaction:
             except (TypeError, ValueError, OverflowError):
                 return False, f"{_field} must be a finite number"
 
+        # BUG-8: finite is not sufficient.  Conversion to satoshi must also
+        # fit the signed 64-bit storage/consensus domain; otherwise a finite
+        # Python float such as 1e301 raises in to_satoshi() later.
+        _MAX_CONSENSUS_SAT = 2**63 - 1
+        for _field, _value in (("amount", self.amount), ("fee", self.fee),
+                               ("gas_price", self.gas_price)):
+            try:
+                _scaled = float(_value) * Config.SATOSHI_PER_VSD
+                if not math.isfinite(_scaled) or abs(_scaled) > _MAX_CONSENSUS_SAT:
+                    return False, f"{_field} exceeds consensus numeric range"
+            except (TypeError, ValueError, OverflowError):
+                return False, f"{_field} exceeds consensus numeric range"
+
         # Transaction type is consensus data.  Unknown values must fail closed;
         # otherwise an unsupported future type would silently fall through into
         # the legacy transfer validator and execute with the wrong semantics.
@@ -442,6 +456,11 @@ class Transaction:
             if self.gas_limit > Config.VVM_TX_GAS_CAP:
                 return False, (f"gas_limit {self.gas_limit} exceeds cap "
                                f"{Config.VVM_TX_GAS_CAP}")
+            try:
+                if gas_fee_to_sat(self.gas_limit, self.gas_price) > _MAX_CONSENSUS_SAT:
+                    return False, "Deploy gas fee exceeds consensus numeric range"
+            except (TypeError, ValueError, OverflowError):
+                return False, "Deploy gas fee exceeds consensus numeric range"
             # AUDIT-FIX-10 (unauthorized minting): TYPE_DEPLOY was missing the
             # negative-amount check TYPE_CALL already has below. Without it,
             # a DEPLOY tx with amount < 0 passed validation, and downstream
@@ -491,6 +510,11 @@ class Transaction:
             if self.gas_limit > Config.VVM_TX_GAS_CAP:
                 return False, (f"gas_limit {self.gas_limit} exceeds cap "
                                f"{Config.VVM_TX_GAS_CAP}")
+            try:
+                if gas_fee_to_sat(self.gas_limit, self.gas_price) > _MAX_CONSENSUS_SAT:
+                    return False, "Call gas fee exceeds consensus numeric range"
+            except (TypeError, ValueError, OverflowError):
+                return False, "Call gas fee exceeds consensus numeric range"
             if self.amount < 0:
                 return False, "Call value cannot be negative"
             if self.is_expired(reference_time):
@@ -585,6 +609,20 @@ class Transaction:
             if not signature_already_verified and not self.verify_signature(block_height=block_height):
                 return False, "Invalid signature"
             return True, "OK"
+
+        # BUG-3/4: every remaining REGISTER transaction must be an explicit
+        # role registration. Malformed identity claims and unknown role memos
+        # must fail closed instead of reaching apply-time fallback-to-unstake.
+        if self.tx_type == self.TYPE_REGISTER:
+            _memo = str(self.memo or "").strip().lower()
+            if _memo.startswith(self.IDENTITY_MEMO_PREFIX):
+                return False, "Malformed identity claim memo"
+            if _memo not in ("miner", "investor"):
+                return False, ("REGISTER memo must be miner, investor, none, "
+                               "or a valid identity claim")
+            if self.receiver:
+                return False, "Role registration receiver must be empty"
+
         # ── Standard transfer validation (unchanged) ───────────────────────────
         # ── MEV protection: formats of the commitment and the reveal ──────────
         # Chain rules (commitment on-chain, age, merkle path) are checked by
@@ -624,6 +662,18 @@ class Transaction:
         # Expiry check; historical block validation passes the block time.
         if self.is_expired(reference_time):
             return False, f"Transaction expired at {self.expiry}"
+        # Receiver shape is consensus data.  Reject malformed destinations
+        # before signature acceptance so funds cannot be committed to an
+        # address string that no wallet/contract can ever control.
+        if (self.tx_type == self.TYPE_TRANSFER
+                and self.sender != "COINBASE"
+                and not is_valid_protocol_address(
+                    self.receiver,
+                    specials=(VSD_GLOBAL_MARKET, Config.BURN_ADDRESS,
+                              L2_BRIDGE_ADDRESS, L2_WITHDRAW_ADDRESS),
+                    allow_contract=True)):
+            return False, "Invalid transfer receiver address"
+
         # VSD_GLOBAL_MARKET is a valid broadcast receiver
         if self.receiver == VSD_GLOBAL_MARKET and self.sender != "COINBASE":
             if not self.pub_hex or not self.sig_hex:

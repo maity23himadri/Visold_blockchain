@@ -317,7 +317,9 @@ def test_invalid_high_difficulty_replacement_block_is_rolled_back_without_state_
 
         ok, msg = bc.accept_chain([genesis, bad_block_1, bad_block_2])
         assert not ok
-        assert "Reorg apply block 1" in msg
+        # BUG-5 hardening: the impossible claimed DAA is rejected before
+        # destructive reorg work (even earlier than the PoW check).
+        assert "Fork block 1: difficulty mismatch" in msg
 
         assert bc.height() == before_height
         assert st.get_block(0).block_hash == genesis.block_hash
@@ -381,7 +383,9 @@ def test_invalid_deep_fork_restores_state_after_partial_reorg_application():
         payload = [st_b.get_block(0), peer_block_1, peer_block_2]
         ok, msg = bc_a.accept_chain(payload)
         assert not ok
-        assert "Reorg apply block 2" in msg
+        # BUG-5 hardening: the later block's impossible claimed DAA is
+        # rejected before any canonical rollback.
+        assert "Fork block 2: difficulty mismatch" in msg
 
         assert bc_a.height() == before["height"]
         assert st_a.get_block(1).block_hash == before["tip"]

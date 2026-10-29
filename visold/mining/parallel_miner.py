@@ -236,9 +236,13 @@ class ParallelMiner:
         """
         self.initialize()
         if self._backend == "cuda":
-            return self._mine_cuda(block, stop_event, max_hps=max_hps)
+            return self._mine_cuda(
+                block, stop_event, max_hps=max_hps,
+                max_hps_provider=max_hps_provider)
         if self._backend == "opencl":
-            return self._mine_opencl(block, stop_event, max_hps=max_hps)
+            return self._mine_opencl(
+                block, stop_event, max_hps=max_hps,
+                max_hps_provider=max_hps_provider)
         return self._mine_cpu(block, stop_event, max_hps=max_hps,
                               max_hps_provider=max_hps_provider)
 
@@ -505,7 +509,8 @@ class ParallelMiner:
 
     def _mine_cuda(self, block: 'Block',
                    stop_event: Optional[threading.Event] = None,
-                   max_hps: float = 0.0) -> bool:
+                   max_hps: float = 0.0,
+                   max_hps_provider=None) -> bool:
         """
         Launch repeated CUDA kernel batches until a valid nonce is found.
         Each launch evaluates self._gpu_batch nonces in parallel across all
@@ -577,7 +582,8 @@ class ParallelMiner:
 
     def _mine_opencl(self, block: 'Block',
                      stop_event: Optional[threading.Event] = None,
-                     max_hps: float = 0.0) -> bool:
+                     max_hps: float = 0.0,
+                     max_hps_provider=None) -> bool:
         """
         Identical algorithm to _mine_cuda but uses pyopencl.
         Works on AMD, Intel, and NVIDIA GPUs without proprietary drivers.
