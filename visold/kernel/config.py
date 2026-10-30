@@ -45,11 +45,13 @@ class Config:
     COIN_SYMBOL         = "VSD"
     VERSION             = "11.0.0.0"
 
-    # Chain identity — included in every transaction's signing bytes.
-    # Changing this value creates an incompatible fork.  Testnet nodes must
-    # use a different CHAIN_ID (e.g. "vsd-testnet-1") so that testnet
-    # transactions cannot be replayed on mainnet and vice versa.
-    CHAIN_ID            = "vsd-mainnet-1"
+    # Chain identity — included in canonical L1/L2 transaction signing data,
+    # transaction identifiers, receipt authentication, and the VVM CHAINID.
+    # This repository configuration is for the Visold TESTNET. A future
+    # mainnet must use a distinct chain ID and its own coordinated genesis.
+    # Changing this value is an incompatible network-domain change: every
+    # testnet node must upgrade together and reinitialize chain-specific state.
+    CHAIN_ID            = "vsd-testnet-1"
 
     # ── Genesis block constants (network-wide protocol constants) ─────────────
     # These values MUST be byte-for-byte identical on every node that joins
