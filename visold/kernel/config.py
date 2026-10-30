@@ -47,7 +47,7 @@ class Config:
 
     # Chain identity — included in canonical L1/L2 transaction signing data,
     # transaction identifiers, receipt authentication, and the VVM CHAINID.
-    # This repository configuration is for the Visold TESTNET. A future
+    # This repository configuration is for the Visold TESTNET.  A future
     # mainnet must use a distinct chain ID and its own coordinated genesis.
     # Changing this value is an incompatible network-domain change: every
     # testnet node must upgrade together and reinitialize chain-specific state.
