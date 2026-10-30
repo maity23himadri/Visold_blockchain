@@ -48,7 +48,7 @@ Android power management can stop background processes, so measure reliability o
 
 ## Documentation
 
-- [Whitepaper (DOCX)](docs/Visold_Technical_Whitepaper_v1.2.docx) (also available as [PDF](docs/Visold_Technical_Whitepaper_v1.2.pdf))
+- [Whitepaper (DOCX)](docs/Visold_Technical_Whitepaper_v1.3.docx) (also available as [PDF](docs/Visold_Technical_Whitepaper_v1.3.pdf))
 - [Architecture](docs/ARCHITECTURE.md)
 - [Network ports](docs/NETWORK_PORTS.md)
 - [Crypto acceleration](docs/CRYPTO_ACCELERATION.md)
