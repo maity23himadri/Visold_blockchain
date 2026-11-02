@@ -813,13 +813,19 @@ class Mempool:
         # prefix of the merged list (eligible[:n]) therefore can never leave a
         # nonce gap either.
         def _prio(t: Transaction, qi: int, pos: int):
-            return (-t.fee, t.timestamp, t.tx_id, qi, pos)
+            # ROLLUP-FIRST: a TYPE_ROLLUP is valid only against the L2 root as it
+            # stood before the block, and bridge deposits/withdrawals in the same
+            # block move that root.  Any rollup head therefore outranks every other
+            # head.  Only queue heads compete, so per-sender nonce order is kept.
+            # Non-rollup transactions keep their exact previous relative order.
+            rank = 0 if t.tx_type == Transaction.TYPE_ROLLUP else 1
+            return (rank, -t.fee, t.timestamp, t.tx_id, qi, pos)
 
         heap = [_prio(q[0], qi, 0) for qi, q in enumerate(queues)]
         _heapq.heapify(heap)
         eligible: List[Transaction] = []
         while heap:
-            _nf, _ts, _tid, qi, pos = _heapq.heappop(heap)
+            _rank, _nf, _ts, _tid, qi, pos = _heapq.heappop(heap)
             q = queues[qi]
             eligible.append(q[pos])
             pos += 1

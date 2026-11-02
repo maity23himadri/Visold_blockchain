@@ -455,14 +455,37 @@ class ConsensusEngine:
             if self.wallet.address in eligible_addresses:
                 # This node is a registered validator — cast a BFT vote.
                 try:
+                    # Self-equivocation guard (must run BEFORE signing).
+                    # A normal 1-block reorg can make this node vote for a
+                    # sibling at a height where it already voted for a
+                    # different block. Signing that second vote would be
+                    # recorded as a double-sign and would penalise an honest
+                    # validator. Vote history is persistent, so this check
+                    # also holds across restarts. Withholding the vote is
+                    # safe: the block stays eligible for depth finality.
+                    votes_at_height = self.blockchain.storage \
+                        .get_validator_votes_at_height(block.index)
+                    own_votes = [
+                        vote for vote in votes_at_height
+                        if vote.get("validator_addr") == self.wallet.address
+                    ]
+                    signed_other_hash = any(
+                        vote.get("block_hash") != block.block_hash
+                        for vote in own_votes
+                    )
+                    if signed_other_hash:
+                        log.warning(
+                            f"Block #{block.index}: BFT vote withheld — this "
+                            f"validator already voted for a different block at "
+                            f"height {block.index}; signing {block.block_hash[:16]} "
+                            f"would be a self-equivocation")
+                        return True, "OK"
+                    already_voted = any(
+                        vote.get("block_hash") == block.block_hash
+                        for vote in own_votes
+                    )
                     sig     = self.wallet.sign(block.block_hash.encode())
                     sig_hex = sig_to_hex(sig)
-                    already_voted = any(
-                        vote.get("validator_addr") == self.wallet.address
-                        and vote.get("block_hash") == block.block_hash
-                        for vote in self.blockchain.storage
-                        .get_validator_votes_at_height(block.index)
-                    )
                     accepted = self.blockchain.add_validator_sig(
                         block.block_hash,
                         self.wallet.address,

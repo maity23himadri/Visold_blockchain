@@ -121,3 +121,18 @@ class ProtocolVersionManager:
         with self._lock:
             if new_version > self._current_ver:
                 self._current_ver = new_version
+
+    def rewind_version(self, to_version: int) -> None:
+        """Undo an activation: lower the enforced version to ``to_version``.
+
+        Used only when a rollback or reorg removes the block that activated an
+        upgrade.  It never raises the version.
+        """
+        with self._lock:
+            if int(to_version) < self._current_ver:
+                self._current_ver = int(to_version)
+
+    def restore_version(self, version: int) -> None:
+        """Set the enforced version exactly, for restoring a saved governance snapshot."""
+        with self._lock:
+            self._current_ver = int(version)

@@ -54,34 +54,29 @@ def _factory_create2_runtime(init: bytes, salt: int) -> bytes:
     return prefix + init
 
 
-def test_bug23_reversed_concurrent_evidence_slashes_exactly_once():
+def test_bug23_reversed_concurrent_evidence_is_recorded_exactly_once():
     class _FakeStorage:
         def __init__(self):
             self.stake = 100.0
             self.slashed = False
             self.meta = {}
+            self.slash_calls = 0
             self.barrier = threading.Barrier(2)
             self.lock = threading.Lock()
 
         def get_role(self, _addr):
-            # Return a snapshot. Both baseline threads can observe unslashed.
+            # Return a snapshot. Both threads can observe the validator as registered.
             return {"stake": self.stake, "slashed": self.slashed}
 
         def slash(self, _addr):
-            # Force both baseline callers into the old check-then-act window.
-            try:
-                self.barrier.wait(timeout=0.25)
-            except threading.BrokenBarrierError:
-                pass
+            # Evidence must never touch consensus state (stake/slashed) locally.
             with self.lock:
-                if self.slashed:
-                    return False
-                self.stake *= 0.9
-                self.slashed = True
-                return True
+                self.slash_calls += 1
+            return False
 
         def set_meta(self, k, v):
-            self.meta[k] = v
+            with self.lock:
+                self.meta[k] = v
 
     st = _FakeStorage()
     p = SlashingEvidenceProtocol(st, object())
@@ -104,8 +99,11 @@ def test_bug23_reversed_concurrent_evidence_slashes_exactly_once():
     t1.start(); t2.start(); t1.join(2); t2.join(2)
     assert not t1.is_alive() and not t2.is_alive()
     assert sorted(results) == [False, True]
-    assert st.stake == 90.0
+    # Exactly one packet is recorded, and no local stake penalty is applied.
     assert len(st.meta) == 1
+    assert st.slash_calls == 0
+    assert st.stake == 100.0
+    assert st.slashed is False
 
 
 def test_bug23_storage_slash_is_conditional_and_idempotent():

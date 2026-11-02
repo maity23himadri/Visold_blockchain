@@ -101,6 +101,11 @@ class StateEngine:
                  storage: 'Storage'):
         self._blockchain  = blockchain
         self._governance  = governance
+        # Governance finality is read from the blockchain's canonical fence,
+        # never from wire-supplied block flags (see GovernanceEngine.on_block_applied).
+        _register_fence = getattr(governance, "set_finality_source", None)
+        if callable(_register_fence):
+            _register_fence(self._canonical_finalized_height)
         self._storage     = storage
         self._network: Optional['P2PNetwork'] = None  # set after network starts
         self._queue: queue.Queue = queue.Queue(
@@ -150,10 +155,15 @@ class StateEngine:
         # Capacity is bounded so a malicious peer cannot OOM us by flooding
         # bogus future blocks.  Entries expire by simple FIFO eviction.
         # ─────────────────────────────────────────────────────────────────────
-        self._orphans: Dict[str, dict] = {}        # prev_hash -> block_dict
-        self._orphan_order: List[str] = []         # FIFO eviction order
+        # Keyed by the orphan's own block hash, so several children of the same
+        # parent can wait together.  A junk block can no longer hold a slot that
+        # belongs to the real child (see _orphan_admissible).
+        self._orphans: Dict[str, dict] = {}        # block_hash -> block_dict
+        self._orphan_meta: Dict[str, dict] = {}    # block_hash -> {"parent", "peer"}
+        self._orphan_order: List[str] = []         # FIFO eviction order (block hashes)
         self._orphans_lock = threading.Lock()
         self.MAX_ORPHANS = 256                     # bounded — DoS-resistant
+        self.MAX_ORPHANS_PER_PEER = 32             # one peer cannot fill the pool
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -224,15 +234,33 @@ class StateEngine:
             return False
 
 
-    def _record_apply_outcome(self, block, ok: bool) -> None:
-        """Record block_apply:<height> without poisoning an applied block (VSA-04).
+    def _canonical_finalized_height(self) -> Optional[int]:
+        """The blockchain's canonical finality fence, or None if unavailable."""
+        try:
+            return int(self._blockchain._highest_finalized_height)
+        except Exception:
+            return None
 
-        A failed outcome must not overwrite an ok marker for the very block already
-        stored at this height: that result reflects a duplicate or late delivery,
-        not a failed application of the stored block.
+    def _record_apply_outcome(self, block, ok: bool) -> None:
+        """Record block_apply:<height> only for the block that owns that height.
+
+        The marker is keyed by height alone, so it describes the canonical block
+        stored at that height.  A candidate whose hash differs from that stored
+        block (a stale or lighter fork, a rejected sync batch from a peer's
+        branch, a losing same-height candidate) says nothing about the canonical
+        block and must not touch the marker, whatever its outcome.  This is what
+        keeps a foreign branch from poisoning canonical markers and the invalid-
+        rate monitor that reads them.
+
+        Heights with no stored block have no canonical block to protect, so their
+        outcome is recorded; a later canonical apply at that height overwrites it.
+        A failed outcome for the stored block itself is ignored once that block
+        is marked applied (VSA-04: a late duplicate is not a failed application).
         """
+        stored_hash = self._storage.get_block_hash(block.index)
+        if stored_hash is not None and stored_hash != block.block_hash:
+            return
         if not ok:
-            stored_hash = self._storage.get_block_hash(block.index)
             if (stored_hash == block.block_hash
                     and self._storage.get_meta(f"block_apply:{block.index}") == "ok"):
                 return
@@ -558,21 +586,60 @@ class StateEngine:
             return False, f"new_tx error: {e}"
 
     # ── Orphan-pool helpers (v7.1.8 — Bug 3 fix) ──────────────────────────
-    def _stash_orphan(self, block: 'Block', block_data: dict) -> None:
-        """Buffer a block whose parent we don't have yet.  Bounded FIFO."""
+    def _orphan_admissible(self, block: 'Block') -> bool:
+        """Cheap proof-of-work gate required before a block may enter the orphan pool.
+
+        An orphan's parent is unknown, so its full validity cannot be checked yet.
+        Requiring real proof of work makes holding a pool slot cost real work, and
+        a block that fails this check is never stored, so it cannot shadow the
+        block that will later extend the same parent.
+
+        The block's declared difficulty must also meet the hard floor
+        (Config.MIN_DIFFICULTY).  Honest difficulty is always clamped to that
+        floor, so without this check a block could declare an easy difficulty for
+        itself and pass validate_pow() with almost no work.
+        """
+        try:
+            if not isinstance(block.index, int) or block.index < 1:
+                return False
+            if float(block.difficulty) < float(Config.MIN_DIFFICULTY):
+                return False
+            return bool(block.validate_pow())
+        except Exception:
+            return False
+
+    def _stash_orphan(self, block: 'Block', block_data: dict,
+                      source_peer: str = "") -> bool:
+        """Buffer a block whose parent we don't have yet.  Bounded FIFO.
+
+        Returns True when the block is held in the pool.  Callers must only
+        stash blocks that passed _orphan_admissible().
+        """
         with self._orphans_lock:
-            key = block.prev_hash
+            key = block.block_hash
             if key in self._orphans:
-                return                              # already stashed
+                return True                          # already stashed
+            if source_peer:
+                held = sum(1 for m in self._orphan_meta.values()
+                           if m.get("peer") == source_peer)
+                if held >= self.MAX_ORPHANS_PER_PEER:
+                    log.warning(
+                        f"[ORPHAN] Peer {source_peer[:12]} already holds "
+                        f"{held} orphans; dropping block #{block.index}")
+                    return False
             if len(self._orphan_order) >= self.MAX_ORPHANS:
                 evict = self._orphan_order.pop(0)
                 self._orphans.pop(evict, None)
+                self._orphan_meta.pop(evict, None)
             self._orphans[key] = block_data
+            self._orphan_meta[key] = {"parent": block.prev_hash, "peer": source_peer}
             self._orphan_order.append(key)
+            pool_size = len(self._orphan_order)
         log.info(
             f"[ORPHAN] Stashed block #{block.index} "
             f"({block.block_hash[:12]}…) waiting for parent "
-            f"{block.prev_hash[:12]}…  (pool size: {len(self._orphan_order)})")
+            f"{block.prev_hash[:12]}…  (pool size: {pool_size})")
+        return True
 
     def _drain_orphans_for(self, parent_hash: str,
                            source_peer: str) -> None:
@@ -595,35 +662,38 @@ class StateEngine:
         pending: List[str] = [parent_hash]
         while pending:
             key = pending.pop()
+            children: List[dict] = []
             with self._orphans_lock:
-                child_data = self._orphans.pop(key, None)
-                if child_data is not None:
+                child_hashes = [h for h, m in self._orphan_meta.items()
+                                if m.get("parent") == key]
+                for h in child_hashes:
+                    children.append(self._orphans.pop(h))
+                    self._orphan_meta.pop(h, None)
                     try:
-                        self._orphan_order.remove(key)
+                        self._orphan_order.remove(h)
                     except ValueError:
                         pass
-            if child_data is None:
-                continue
-            log.info(
-                f"[ORPHAN] Parent {key[:12]}… now applied — "
-                f"replaying buffered child block")
-            # _drain=False: this call must NOT itself recurse into
-            # _drain_orphans_for — this loop already owns draining the
-            # whole chain iteratively; queue the child's own hash below
-            # instead so any orphans waiting on IT get picked up next.
-            ok, _msg = self._handle_new_block(
-                {"block": child_data}, source_peer, _drain=False)
-            if ok:
-                try:
-                    child_block = Block.from_dict(child_data)
-                    pending.append(child_block.block_hash)
-                except Exception:
-                    # child_data just round-tripped through
-                    # _handle_new_block successfully, so this parse
-                    # should not fail — but if it somehow does, there is
-                    # nothing further to drain from this branch, not a
-                    # reason to raise out of the drain loop.
-                    pass
+            for child_data in children:
+                log.info(
+                    f"[ORPHAN] Parent {key[:12]}… now applied — "
+                    f"replaying buffered child block")
+                # _drain=False: this call must NOT itself recurse into
+                # _drain_orphans_for — this loop already owns draining the
+                # whole chain iteratively; queue the child's own hash below
+                # instead so any orphans waiting on IT get picked up next.
+                ok, _msg = self._handle_new_block(
+                    {"block": child_data}, source_peer, _drain=False)
+                if ok:
+                    try:
+                        child_block = Block.from_dict(child_data)
+                        pending.append(child_block.block_hash)
+                    except Exception:
+                        # child_data just round-tripped through
+                        # _handle_new_block successfully, so this parse
+                        # should not fail — but if it somehow does, there is
+                        # nothing further to drain from this branch, not a
+                        # reason to raise out of the drain loop.
+                        pass
 
     def _handle_new_block(self, payload: dict,
                           source_peer: str,
@@ -665,6 +735,12 @@ class StateEngine:
             # gap-fetch response doesn't include the tip.
             my_tip = self._blockchain.height()
             if block.index > my_tip + 1 and source_peer and self._network:
+                # Only a block with real proof of work may take an orphan slot.
+                # Junk is refused here, before a gap fetch is requested for it.
+                if not self._orphan_admissible(block):
+                    return False, (
+                        f"Rejected unproven orphan block {block.index}: "
+                        f"proof-of-work or difficulty invalid")
                 with self._network._lock:
                     gap_peer = self._network.peers.get(source_peer)
                 if gap_peer and gap_peer.connected:
@@ -677,7 +753,7 @@ class StateEngine:
                         f"{my_tip+1}..{block.index} from {source_peer[:12]}")
                 # v7.1.8 Bug 3: stash so we don't lose the tip block if the
                 # gap-fetch response is partial / dropped.
-                self._stash_orphan(block, _block_dict_for_orphan)
+                self._stash_orphan(block, _block_dict_for_orphan, source_peer)
                 return False, (
                     f"Gap: missing blocks {my_tip+1}..{block.index-1}; "
                     f"requested from peer; tip block stashed")
@@ -694,7 +770,8 @@ class StateEngine:
                 # a fork choice; it is a harmless late relay, not an apply
                 # failure. Same-height candidates still go through reorg.
                 if block.index < self._blockchain.height():
-                    self._storage.record_block_apply_result(block.index, True)
+                    # No marker is written: the stored block at this height is
+                    # canonical and this candidate has no say over its marker.
                     return True, "Stale conflicting block ignored; higher tip retained"
                 _parent = self._storage.get_block(block.index - 1)
                 if _parent is not None and _parent.block_hash == block.prev_hash:
@@ -708,7 +785,18 @@ class StateEngine:
                         _fork_msg = (
                             "Fork candidate rejected by deterministic fork choice; "
                             f"local chain retained ({_fork_msg})")
-                    self._storage.record_block_apply_result(block.index, _fork_ok)
+                    # Routed through the canonical-owner guard: the stored block
+                    # at this height is the old canonical block, so a losing
+                    # candidate records nothing; a winning one is already marked
+                    # by its own apply inside accept_chain().
+                    self._record_apply_outcome(block, _fork_ok)
+                    if _fork_ok:
+                        # The winning candidate is now canonical; drive protocol
+                        # governance for it as for any other applied block.
+                        _canon_here = self._storage.get_block(block.index)
+                        if (_canon_here is not None
+                                and _canon_here.block_hash == block.block_hash):
+                            self._governance.on_block_applied(block)
                     return _fork_ok, _fork_msg
                 return False, (
                     f"Conflicting block {block.index} has no matching local "
@@ -726,7 +814,9 @@ class StateEngine:
             # rather than a hard reject.  Stash in orphan pool and request
             # the immediate parent so the chain heals automatically.
             if (not ok) and msg and "Previous block not found" in msg:
-                self._stash_orphan(block, _block_dict_for_orphan)
+                if not self._orphan_admissible(block):
+                    return False, f"Rejected unproven orphan block: {msg}"
+                self._stash_orphan(block, _block_dict_for_orphan, source_peer)
                 if source_peer and self._network:
                     try:
                         with self._network._lock:

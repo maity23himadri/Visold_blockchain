@@ -64,8 +64,10 @@ class SlashingEvidenceProtocol:
          signatures, the block hashes they signed, and the validator's
          identity (pub_hex → address binding).
       2. Broadcasts the evidence to all peers via MSG_SLASH_EVIDENCE.
-      3. Any receiving node independently verifies the evidence and applies
-         the slash, ensuring network-wide consistency.
+      3. Any receiving node independently verifies the evidence and records
+         it. Stake is NOT changed locally: stake feeds consensus rewards, so
+         a penalty only becomes safe once it is applied by a consensus-level
+         slash at a common block height.
 
     Evidence format (JSON):
       {
@@ -210,9 +212,10 @@ class SlashingEvidenceProtocol:
 
     def apply_evidence(self, evidence: dict) -> Tuple[bool, str]:
         """
-        Apply verified evidence: slash the validator and record the event.
-        Returns (True, "OK") if slashed, (False, reason) if already slashed
-        or evidence is invalid.
+        Verify and durably record double-sign evidence.
+        Returns (True, reason) when newly recorded, (False, reason) when the
+        evidence is invalid, duplicate, or the validator is unknown. No stake
+        penalty is applied locally: see the comment at the recording step.
         """
         # AUDIT-FIX (Batch E): verify BEFORE marking evidence_id as seen —
         # not after. evidence_id is derived only from (validator,
@@ -246,27 +249,29 @@ class SlashingEvidenceProtocol:
             role = self._storage.get_role(validator)
             if not role:
                 return False, f"Validator {validator[:16]} not registered"
-            if role.get("slashed"):
-                return False, f"Validator {validator[:16]} already slashed"
 
-            # Storage.slash() is itself a conditional atomic update.  Holding
-            # this protocol lock across eligibility + mutation also prevents
-            # two opposite-order packets handled by different node threads
-            # from both being accepted by this protocol instance.
-            if not self._storage.slash(validator):
-                return False, f"Validator {validator[:16]} already slashed"
+            # Record the verified evidence only. Storage.slash() mutates
+            # roles.stake and roles.slashed, which feed the validator reward
+            # split. Applying that on this node alone makes its balances
+            # diverge from the network (state_root mismatch on the next
+            # block), and gossiped evidence arrives at different times on
+            # different nodes, so no node can apply it at a common block height.
+            # Penalties need an on-chain slash, which does not exist yet.
             self._storage.set_meta(
                 f"slash_evidence:{evidence_id[:32]}",
                 json.dumps({"validator": validator,
                             "height": evidence.get("height", 0),
-                            "timestamp": int(time.time())}))
+                            "timestamp": int(time.time()),
+                            "penalty_applied": False}))
             self._seen_evidences.add(evidence_id)
         log.critical(
-            f"SLASH EVIDENCE APPLIED: Validator {validator[:16]}... "
-            f"double-signed at height {evidence.get('height', '?')}. "
+            f"DOUBLE-SIGN EVIDENCE RECORDED: Validator {validator[:16]}... "
+            f"signed two blocks at height {evidence.get('height', '?')}. "
+            f"No local stake penalty applied (consensus-relevant state). "
             f"Submitted by {evidence.get('submitted_by','?')[:16]}.")
         metrics.inc("slash_evidence_applied")
-        return True, f"Validator {validator[:16]} slashed via automated evidence"
+        return True, (f"Validator {validator[:16]} double-sign evidence recorded; "
+                      f"no local stake penalty applied")
 
     def handle_network_evidence(self, evidence: dict) -> Tuple[bool, str]:
         """Process incoming evidence from the network."""

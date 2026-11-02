@@ -71,6 +71,25 @@ def _effective_ecdsa_digest(msg_hash: bytes) -> bytes:
     return hashlib.sha256(raw).digest()
 
 
+def _canonical_low_s(s: int) -> int:
+    """Return the low-S member of the signature pair ``(r, s)`` / ``(r, N-s)``.
+
+    Both forms are valid ECDSA signatures for the same message and key, so the
+    consensus rule is "accept either form".  The OpenSSL fallback accepts both.
+    libsecp256k1 (coincurve) accepts only the low form, so every native call
+    passes its input through here first.  Both backends therefore accept exactly
+    the same signatures, and no historically valid signature changes validity.
+    """
+    n = ECPoint.N
+    return s if s <= n // 2 else n - s
+
+
+def _native_verify(native_pub, digest: bytes, r: int, s: int) -> bool:
+    """Verify with the native backend using the canonical low-S form."""
+    sig_der = encode_dss_signature(r, _canonical_low_s(s))
+    return bool(native_pub.verify(sig_der, digest, hasher=None))
+
+
 @lru_cache(maxsize=8192)
 def _cached_coincurve_public_key(pub_bytes: bytes):
     """Bounded cache of immutable native public-key objects.
@@ -134,6 +153,14 @@ def _self_test_coincurve() -> bool:
             # an acceptable rejection result for the optional backend.
             tampered_valid = False
         if tampered_valid:
+            return False
+        # Both signature forms must be accepted by the native path, exactly as
+        # the OpenSSL fallback accepts them.  The self-test signs low-S only, so
+        # the high form is checked explicitly through the production helper.
+        r_self, s_self = decode_dss_signature(sig_der)
+        if not _native_verify(pub, effective_digest, r_self, s_self):
+            return False
+        if not _native_verify(pub, effective_digest, r_self, ECPoint.N - s_self):
             return False
         # Also require the mandatory cryptography/OpenSSL path to accept the
         # libsecp-generated signature under Visold's historical double-SHA flow.
@@ -244,6 +271,7 @@ def ecdsa_sign(priv: int, msg_hash: bytes, _native_private_key=None, _crypto_pri
     compatibility self-test.  The fallback is the existing cryptography path.
     New signatures remain ordinary secp256k1 ECDSA signatures; old signatures
     remain valid because verification accepts the same curve/signature domain.
+    Output is always canonical low-S, so both backends emit the same form.
     """
     digest = _effective_ecdsa_digest(msg_hash)
     if _COINCURVE_SELFTEST_OK:
@@ -253,7 +281,8 @@ def ecdsa_sign(priv: int, msg_hash: bytes, _native_private_key=None, _crypto_pri
                 raw_priv = int(priv).to_bytes(32, "big")
                 key = _CoincurvePrivateKey(raw_priv)
             sig_der = key.sign(digest, hasher=None)
-            return decode_dss_signature(sig_der)
+            r, s = decode_dss_signature(sig_der)
+            return r, _canonical_low_s(s)
         except Exception:
             # Do not silently accept a malformed/unsupported native result.
             # The mandatory implementation remains the authoritative fallback.
@@ -262,7 +291,7 @@ def ecdsa_sign(priv: int, msg_hash: bytes, _native_private_key=None, _crypto_pri
     priv_key = _crypto_private_key or _priv_int_to_crypto_key(priv)
     sig_der = priv_key.sign(digest, _ec.ECDSA(Prehashed(_hashes.SHA256())))
     r, s = decode_dss_signature(sig_der)
-    return r, s
+    return r, _canonical_low_s(s)
 
 
 def ecdsa_sign_digest(priv: int, digest: bytes, _native_private_key=None, _crypto_private_key=None) -> Tuple[int, int]:
@@ -283,12 +312,14 @@ def ecdsa_sign_digest(priv: int, digest: bytes, _native_private_key=None, _crypt
             key = _native_private_key
             if key is None:
                 key = _CoincurvePrivateKey(int(priv).to_bytes(32, "big"))
-            return decode_dss_signature(key.sign(digest, hasher=None))
+            r, s = decode_dss_signature(key.sign(digest, hasher=None))
+            return r, _canonical_low_s(s)
         except Exception:
             pass
     priv_key = _crypto_private_key or _priv_int_to_crypto_key(priv)
     sig_der = priv_key.sign(digest, _ec.ECDSA(Prehashed(_hashes.SHA256())))
-    return decode_dss_signature(sig_der)
+    r, s = decode_dss_signature(sig_der)
+    return r, _canonical_low_s(s)
 
 
 def ecdsa_verify(pub: ECPoint, msg_hash: bytes, sig: Tuple[int, int]) -> bool:
@@ -301,8 +332,9 @@ def ecdsa_verify(pub: ECPoint, msg_hash: bytes, sig: Tuple[int, int]) -> bool:
         if _COINCURVE_SELFTEST_OK:
             pub_bytes = pub_to_bytes(pub)
             native_pub = _cached_coincurve_public_key(pub_bytes)
-            sig_der = encode_dss_signature(r, s)
-            return bool(native_pub.verify(sig_der, digest, hasher=None))
+            # Normalise to low-S first so the native backend accepts exactly
+            # what the OpenSSL fallback below accepts (see _canonical_low_s).
+            return _native_verify(native_pub, digest, r, s)
 
         pub_key = _cached_crypto_public_key(pub.x, pub.y)
         sig_der = encode_dss_signature(r, s)

@@ -97,52 +97,68 @@ class StateSnapshotEngine:
 
     # ── Snapshot creation ─────────────────────────────────────────────────────
     def _create_snapshot(self, height: int, state_root: str, state_lock=None):
-        """Background thread: capture state at `height` atomically, then compress/store it."""
-        with self._snap_lock:
-            if height == self._last_snap_h:
-                return   # raced with another thread for the same height
-            try:
-                # apply_block mutates state before committing the block/header.
-                # Capture while Blockchain's writer lock is held so a snapshot
-                # can never combine the state of height H+1 with H's header.
-                if state_lock is not None:
-                    with state_lock:
-                        if self._storage.chain_height() != height:
-                            log.info(
-                                "StateSnapshotEngine: skipping height=%d; "
-                                "canonical height is %d", height, self._storage.chain_height())
-                            return
-                        raw = self._serialise_state(height, state_root, compress=False)
-                else:
-                    if self._storage.chain_height() != height:
-                        log.info(
-                            "StateSnapshotEngine: skipping height=%d; canonical height is %d",
-                            height, self._storage.chain_height())
-                        return
-                    raw = self._serialise_state(height, state_root, compress=False)
-                if raw is None:
-                    return
-                blob = zlib.compress(raw, level=9)
-                if blob is None:
-                    return
+        """Background thread: capture state at `height` atomically, then compress/store it.
+
+        Lock order is always the chain lock (``state_lock``) first, then
+        ``_snap_lock``.  invalidate_snapshots_above() runs while rollback() or
+        reorg() holds the chain lock, so waiting for the chain lock while
+        holding ``_snap_lock`` here could deadlock with it.
+        """
+        if height == self._last_snap_h:
+            return   # already stored for this height
+        try:
+            # apply_block mutates state before committing the block/header.
+            # Capture while Blockchain's writer lock is held so a snapshot
+            # can never combine the state of height H+1 with H's header.
+            if state_lock is not None:
+                with state_lock:
+                    captured = self._capture_snapshot_locked(height, state_root)
+            else:
+                captured = self._capture_snapshot_locked(height, state_root)
+            if captured is None:
+                return
+            raw, anchor_hash = captured
+            blob = zlib.compress(raw, level=9)
+            if blob is None:
+                return
+            with self._snap_lock:
+                if height == self._last_snap_h:
+                    return   # raced with another thread for the same height
                 key = f"{self._KEY_PREFIX}{height}"
                 # Store as hex string so set_meta (text column) can hold it
                 self._storage.set_meta(key, blob.hex())
                 self._last_snap_h = height
-                header = self._storage.get_block_header(height) or {}
                 self._update_manifest(
-                    height, state_root, len(blob), str(header.get("block_hash", "")),
+                    height, state_root, len(blob), anchor_hash,
                     bootstrap_digest=hashlib.sha256(raw).hexdigest(),
                 )
                 self._evict_old_snapshots(height)
-                log.info(
-                    f"StateSnapshotEngine: snapshot created at height={height} "
-                    f"size={len(blob):,}B state_root={state_root[:16]}..."
-                )
-                metrics.inc("snapshots_created")
-                metrics.set_gauge("last_snapshot_height", float(height))
-            except Exception as e:
-                log.warning("StateSnapshotEngine: create error at %d: %s", height, e)
+            log.info(
+                f"StateSnapshotEngine: snapshot created at height={height} "
+                f"size={len(blob):,}B state_root={state_root[:16]}..."
+            )
+            metrics.inc("snapshots_created")
+            metrics.set_gauge("last_snapshot_height", float(height))
+        except Exception as e:
+            log.warning("StateSnapshotEngine: create error at %d: %s", height, e)
+
+    def _capture_snapshot_locked(self, height: int, state_root: str):
+        """Serialise canonical state at ``height``.
+
+        Returns ``(raw_bytes, anchor_block_hash)``, or None when the chain is no
+        longer at ``height``.  The caller must hold the chain lock, so the state
+        and the header read here describe the same canonical block.
+        """
+        if self._storage.chain_height() != height:
+            log.info(
+                "StateSnapshotEngine: skipping height=%d; canonical height is %d",
+                height, self._storage.chain_height())
+            return None
+        raw = self._serialise_state(height, state_root, compress=False)
+        if raw is None:
+            return None
+        header = self._storage.get_block_header(height) or {}
+        return raw, str(header.get("block_hash", ""))
 
     def _serialise_state(self, height: int, state_root: str,
                          compress: bool = True, *,
@@ -677,7 +693,15 @@ class StateSnapshotEngine:
             if self.get_snapshot_blob(h) is None:
                 continue
             try:
-                if not self._storage.get_block_header(h) or not self._storage.get_block_header(h + 1):
+                anchor_header = self._storage.get_block_header(h)
+                if not anchor_header or not self._storage.get_block_header(h + 1):
+                    continue
+                # The snapshot must still describe the canonical block at H.
+                # After a reorg replaces H, the stored entry names the old
+                # block and old state_root; it must not be advertised.
+                if (not entry.get("anchor_block_hash")
+                        or str(entry.get("anchor_block_hash")) != str(anchor_header.get("block_hash", ""))
+                        or str(entry.get("state_root", "")) != str(anchor_header.get("state_root", ""))):
                     continue
             except Exception:
                 continue

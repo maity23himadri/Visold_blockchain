@@ -25,6 +25,7 @@ Origin: visold_vsd_.py L5983-5997, L6000-6078, L6081-6732
 """
 
 import hashlib
+import json
 import re
 import secrets
 import threading
@@ -375,6 +376,7 @@ class GovernanceEngine:
                 rollback_window     = rw,
             )
             self._proposals[version] = proposal
+            self._clear_fail_record(version)
             proposal._persist(self.storage)
 
             log.info(
@@ -386,18 +388,45 @@ class GovernanceEngine:
                 f"Upgrade to protocol v{version} announced. "
                 f"Signal window: blocks {signal_start_height}–{sig_end}.")
 
+    def set_finality_source(self, source) -> None:
+        """Register a zero-argument callable returning the canonical finality fence.
+
+        The StateEngine registers the blockchain's fence here.  Without a source,
+        on_block_applied() falls back to the canonical stored block.
+        """
+        self._finality_source = source
+
     def on_block_applied(self, block: 'Block'):
         """
         Called by the StateEngine after every successfully applied block.
         Drives the governance state machine forward and runs the rollback check.
+
+        Finality is taken from canonical state only, never from
+        ``block.finalized``: that flag arrives on the wire, and any peer can set
+        it on a block it relays.  The blockchain's finality fence is used when a
+        source is registered; otherwise the canonical block stored at this
+        height is consulted.
         """
         with self._lock:
             height = block.index
 
-            # Track finality for rollback check
-            if block.finalized:
-                self._last_finalized_height = max(
-                    self._last_finalized_height, height)
+            # Track finality for rollback check -- from canonical state only.
+            _source = getattr(self, "_finality_source", None)
+            _fence = None
+            if _source is not None:
+                try:
+                    _fence = _source()
+                except Exception:
+                    _fence = None
+            if _fence is not None:
+                self._last_finalized_height = int(_fence)
+            else:
+                stored = self.storage.get_block(height)
+                if (stored is not None
+                        and stored.block_hash == block.block_hash
+                        and stored.finalized):
+                    self._last_finalized_height = max(
+                        self._last_finalized_height, height)
 
             # Drive each non-terminal proposal
             for version, proposal in list(self._proposals.items()):
@@ -746,6 +775,137 @@ class GovernanceEngine:
 
     # ── Internal state-machine transitions ───────────────────────────────────
 
+    # ── Reversible governance state (rollback / reorg support) ───────────────
+
+    @staticmethod
+    def _fail_key(version: int) -> str:
+        return f"gov_fail:{int(version)}"
+
+    def _read_fail_record(self, version: int) -> Optional[dict]:
+        raw = self.storage.get_meta(self._fail_key(version))
+        if not raw:
+            return None
+        try:
+            rec = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return rec if isinstance(rec, dict) else None
+
+    def _write_fail_record(self, version: int, rec: dict) -> None:
+        self.storage.set_meta(self._fail_key(version), json.dumps(rec, sort_keys=True))
+
+    def _clear_fail_record(self, version: int) -> None:
+        key = self._fail_key(version)
+        if self.storage.get_meta(key):
+            self.storage.set_meta(key, "")
+
+    def _unlog_rollback(self, rec: dict) -> None:
+        """Reverse a rollback's effect on the oscillation guard."""
+        entry = rec.get("log_entry")
+        if entry:
+            want = (int(entry[0]), int(entry[1]))
+            items = list(self._rollback_log)
+            for i in range(len(items) - 1, -1, -1):
+                if (int(items[i][0]), int(items[i][1])) == want:
+                    del items[i]
+                    break
+            self._rollback_log = deque(items, maxlen=self._rollback_log.maxlen)
+        self._cooldown_until_height = int(rec.get("cooldown_before", 0) or 0)
+
+    def reconcile_to_height(self, height: int) -> None:
+        """Undo every upgrade transition that happened above ``height``.
+
+        Called after blocks above ``height`` have been removed by rollback() or
+        by the removed suffix of reorg().  Each lifecycle step is recorded with
+        the height it happened at: lock_in_height, activation_height, and a fail
+        record for a failure.  A step above ``height`` did not happen on the
+        surviving chain, so it is reversed.  Reversing an activation winds the
+        enforced protocol version back.
+
+        Emergency-disabled proposals are skipped, because their state comes from
+        signed operator votes, not from the chain.
+        """
+        target = int(height)
+        with self._lock:
+            for version, p in list(self._proposals.items()):
+                if p.disabled or version in self._blacklist:
+                    continue
+                rec = self._read_fail_record(version)
+                if (p.phase == UpgradePhase.FAILED and rec is not None
+                        and int(rec.get("height", -1)) > target):
+                    if rec.get("kind") == "rollback":
+                        self._unlog_rollback(rec)
+                    self._clear_fail_record(version)
+                    if p.lock_in_height == 0 or p.lock_in_height > target:
+                        p.phase = UpgradePhase.SIGNALING
+                        p.lock_in_height = 0
+                        p.activation_height = 0
+                    elif p.activation_height > target:
+                        p.phase = UpgradePhase.LOCKED_IN
+                    else:
+                        p.phase = UpgradePhase.ACTIVE
+                elif p.phase in (UpgradePhase.LOCKED_IN, UpgradePhase.ACTIVE) \
+                        and p.lock_in_height > target:
+                    p.phase = UpgradePhase.SIGNALING
+                    p.lock_in_height = 0
+                    p.activation_height = 0
+                elif p.phase == UpgradePhase.ACTIVE and p.activation_height > target:
+                    p.phase = UpgradePhase.LOCKED_IN
+                else:
+                    continue
+                if p.phase != UpgradePhase.ACTIVE:
+                    # Only lowers the version, and only when this proposal's
+                    # activation had raised it.
+                    self.proto_mgr.rewind_version(int(version) - 1)
+                p._persist(self.storage)
+                log.warning(
+                    f"GOVERNANCE RECONCILE: version {version} reset to "
+                    f"{p.phase.value} for chain tip {target} (transition was "
+                    f"above the new tip).")
+
+    def snapshot_state(self) -> dict:
+        """Capture every field that reorg() may change, for a later restore_state()."""
+        with self._lock:
+            return {
+                "proposals": {v: p.to_dict() for v, p in self._proposals.items()},
+                "fail_records": {v: self.storage.get_meta(self._fail_key(v))
+                                 for v in self._proposals},
+                "current_version": int(self.proto_mgr.current_version()),
+                "rollback_log": [(int(h), int(v)) for h, v in self._rollback_log],
+                "cooldown_until": int(self._cooldown_until_height),
+                "last_finalized": int(self._last_finalized_height),
+            }
+
+    def restore_state(self, snap: dict) -> None:
+        """Put back exactly the state captured by snapshot_state()."""
+        with self._lock:
+            for version, d in snap["proposals"].items():
+                p = self._proposals.get(version)
+                if p is None:
+                    p = UpgradeProposal(
+                        version=int(version), phase=UpgradePhase(d["phase"]),
+                        signal_start_height=int(d["signal_start_height"]),
+                        signal_end_height=int(d["signal_end_height"]),
+                        lock_in_height=int(d["lock_in_height"]),
+                        activation_height=int(d["activation_height"]),
+                        threshold=float(d["threshold"]),
+                        rollback_window=int(d["rollback_window"]),
+                        disabled=bool(d["disabled"]))
+                    self._proposals[version] = p
+                p.phase = UpgradePhase(d["phase"])
+                p.lock_in_height = int(d["lock_in_height"])
+                p.activation_height = int(d["activation_height"])
+                p.disabled = bool(d["disabled"])
+                p._persist(self.storage)
+            for version, raw in snap["fail_records"].items():
+                self.storage.set_meta(self._fail_key(version), raw or "")
+            self.proto_mgr.restore_version(int(snap["current_version"]))
+            self._rollback_log = deque(
+                [(int(h), int(v)) for h, v in snap["rollback_log"]],
+                maxlen=self._rollback_log.maxlen)
+            self._cooldown_until_height = int(snap["cooldown_until"])
+            self._last_finalized_height = int(snap["last_finalized"])
+
     def _check_lock_in(self, proposal: UpgradeProposal, height: int):
         """
         Check signaling fraction at `height`.
@@ -792,6 +952,10 @@ class GovernanceEngine:
         if height > proposal.signal_end_height:
             proposal.phase = UpgradePhase.FAILED
             proposal._persist(self.storage)
+            self._write_fail_record(proposal.version, {
+                "height": int(height), "kind": "signal",
+                "cooldown_before": int(self._cooldown_until_height),
+                "log_entry": None})
             log.warning(
                 f"GOVERNANCE FAILED: Version {proposal.version} signaling "
                 f"ended at height {height} without reaching {proposal.threshold*100:.0f}% "
@@ -839,7 +1003,8 @@ class GovernanceEngine:
             self._trigger_rollback(
                 proposal,
                 f"invalid block rate {inv_rate*100:.1f}% exceeds "
-                f"{Config.GOVERNANCE_ROLLBACK_INVALID_RATE*100:.0f}% threshold")
+                f"{Config.GOVERNANCE_ROLLBACK_INVALID_RATE*100:.0f}% threshold",
+                height)
             return
 
         # (b) Finality timeout
@@ -848,10 +1013,12 @@ class GovernanceEngine:
             self._trigger_rollback(
                 proposal,
                 f"no BFT finality for {blocks_since_finality} blocks "
-                f"(timeout={Config.GOVERNANCE_FINALITY_TIMEOUT})")
+                f"(timeout={Config.GOVERNANCE_FINALITY_TIMEOUT})",
+                height)
             return
 
-    def _trigger_rollback(self, proposal: UpgradeProposal, reason: str):
+    def _trigger_rollback(self, proposal: UpgradeProposal, reason: str,
+                          height: int = -1):
         """
         Revert an active upgrade to FAILED and restore previous rules.
 
@@ -869,6 +1036,12 @@ class GovernanceEngine:
             f"GOVERNANCE ROLLBACK: Version {proposal.version} REVERTED. "
             f"Reason: {reason}. Previous rules restored.")
         metrics.inc("governance_rollbacks")
+        # Record the trigger height and the oscillation-guard state before this
+        # rollback changes it, so reconcile_to_height() can reverse it exactly.
+        self._write_fail_record(proposal.version, {
+            "height": int(height), "kind": "rollback",
+            "cooldown_before": int(self._cooldown_until_height),
+            "log_entry": [int(current_height), int(proposal.version)]})
 
         # ── Oscillation guard ─────────────────────────────────────────────────
         self._rollback_log.append((current_height, proposal.version))

@@ -9,7 +9,10 @@ limits, and validation decisions are unchanged by the acceleration layer.
 The mandatory `cryptography` / OpenSSL implementation remains available as the
 fallback. The optional Coincurve/libsecp256k1 backend is enabled only after a
 startup compatibility self-test covering valid signing/verification, invalid
-signature rejection, and OpenSSL interoperability. A failed self-test disables
+signature rejection, acceptance of both signature forms (low-S and high-S), and
+OpenSSL interoperability. The native backend is only ever called with the
+canonical low-S form, so it accepts exactly the signatures the fallback accepts.
+Signers emit canonical low-S output on both backends. A failed self-test disables
 the optional backend rather than lowering security or changing consensus.
 
 ## Optional installation

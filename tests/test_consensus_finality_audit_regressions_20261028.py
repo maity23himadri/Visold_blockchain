@@ -108,7 +108,9 @@ def test_embedded_votes_check_conflicts_and_persist_history_without_counting_con
         # Only two of four validators' stake remains eligible for quorum.
         assert stored.finalized is False
         assert bc._highest_finalized_height == 0
-        assert bool(storage.get_role(validators[0].address)["slashed"])
+        # Equivocation is evidence only; no local stake/slashed mutation.
+        assert not bool(storage.get_role(validators[0].address)["slashed"])
+        assert storage.get_role(validators[0].address)["stake"] == 100.0
 
         history = storage.get_validator_votes_at_height(1)
         assert {(row["validator_addr"], row["block_hash"]) for row in history} >= {
@@ -161,7 +163,9 @@ def test_valid_conflicting_live_vote_is_rejected_even_after_target_finalization(
             conflicting["sig"], validator.pub_hex,
         )
         assert result is False
-        assert bool(storage.get_role(validator.address)["slashed"])
+        # The conflict is durable evidence only; stake stays consensus-identical.
+        assert not bool(storage.get_role(validator.address)["slashed"])
+        assert storage.get_role(validator.address)["stake"] == before_stake
         history = storage.get_validator_votes_at_height(1)
         assert (validator.address, other_hash) in {
             (row["validator_addr"], row["block_hash"]) for row in history
@@ -170,14 +174,13 @@ def test_valid_conflicting_live_vote_is_rejected_even_after_target_finalization(
             (row["validator_addr"], row["block_hash"]) for row in history
         }
 
-        # Re-delivery is idempotent and must not repeatedly reduce stake.
-        slashed_stake = storage.get_role(validator.address)["stake"]
-        assert slashed_stake <= before_stake
+        # Re-delivery stays rejected and never changes consensus stake.
         assert bc.add_validator_sig(
             stored.block_hash, validator.address,
             conflicting["sig"], validator.pub_hex,
         ) is False
-        assert storage.get_role(validator.address)["stake"] == slashed_stake
+        assert storage.get_role(validator.address)["stake"] == before_stake
+        assert not bool(storage.get_role(validator.address)["slashed"])
 
 
 def test_bootstrap_pow_finality_uses_minimum_validator_activation_threshold():
@@ -324,7 +327,10 @@ def test_embedded_equivocation_runs_auto_evidence_after_block_commit():
         assert (validators[0].address, block.block_hash) in {
             (row["validator_addr"], row["block_hash"]) for row in history
         }
-        assert bool(storage.get_role(validators[0].address)["slashed"])
+        # Evidence is verified and recorded, but consensus stake is untouched.
+        assert len(bc._slash_evidence._seen_evidences) == 1
+        assert not bool(storage.get_role(validators[0].address)["slashed"])
+        assert storage.get_role(validators[0].address)["stake"] == 100.0
         assert storage.get_block(1).finalized is False
 
 

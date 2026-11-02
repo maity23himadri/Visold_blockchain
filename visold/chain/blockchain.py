@@ -96,6 +96,34 @@ class CandidateTxRejected(RuntimeError):
             f"(sender {self.sender[:12]}, nonce {self.nonce}) rejected: {self.reason}")
 
 
+class _BoundedHashSet:
+    """Insertion-ordered, size-bounded set of block hashes.
+
+    It is only a fast duplicate-apply cache: apply_block() still consults the
+    durable ``block_apply:<height>`` marker and the stored block hash, so
+    evicting the oldest entry can never let a block be re-applied.
+    """
+
+    def __init__(self, maxlen: int):
+        self._maxlen = int(maxlen)
+        self._items: "dict[str, None]" = {}
+
+    def add(self, value: str) -> None:
+        self._items.pop(value, None)
+        self._items[value] = None
+        while len(self._items) > self._maxlen:
+            self._items.pop(next(iter(self._items)))
+
+    def discard(self, value: str) -> None:
+        self._items.pop(value, None)
+
+    def __contains__(self, value) -> bool:
+        return value in self._items
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
 class Blockchain:
     def __init__(self, storage: Storage):
         self.storage        = storage
@@ -103,7 +131,10 @@ class Blockchain:
         self._lock          = threading.RLock()
         # In-memory guard closes the small window between a successful
         # apply_block() return and the caller's durable block_apply marker.
-        self._applied_block_hashes: set[str] = set()
+        self._applied_block_hashes = _BoundedHashSet(4096)
+        # Called with the tx id of every TYPE_ROLLUP skipped during apply (see
+        # ROLLUP-SKIP).  The sequencer uses this to re-queue L2 transfers.
+        self._rollup_drop_listeners: list = []
         # Equivocation penalties/evidence discovered from embedded votes are
         # deferred until the enclosing block transaction commits. Thread-local
         # storage avoids mixing events from concurrent peer/apply threads.
@@ -253,6 +284,14 @@ class Blockchain:
             canonical_hash = None
         if canonical_hash != str(block.block_hash):
             block.finalized = False
+
+    def add_rollup_drop_listener(self, fn) -> None:
+        """Register ``fn(tx_id)``, called when a TYPE_ROLLUP tx is skipped on-chain.
+
+        Listeners run while the chain lock is held and must not block or take
+        other locks.
+        """
+        self._rollup_drop_listeners.append(fn)
 
     def set_network(self, network: 'P2PNetwork') -> None:
         """Inject the P2PNetwork reference after both objects are created.
@@ -2428,6 +2467,10 @@ class Blockchain:
             except Exception as _l2_pre_e:
                 log.error(f"[ROLLBACK] L2 pre-check raised, continuing: {_l2_pre_e}")
 
+            if self._critical_recovery:
+                return False, (
+                    f"Rollback refused: chain requires operator recovery "
+                    f"({self._critical_recovery})")
             deleted = 0
             # Rolling pruning runs on a background thread outside blockchain._lock.
             # Never let it compact a block body while rollback is trying to undo
@@ -2440,38 +2483,25 @@ class Blockchain:
                     "Rollback deferred: rolling pruning is currently in progress. "
                     "Retry after the active prune pass completes.")
 
-            # ── Roll back blocks from tip down to target + 1 ──────────
-            # BUG FIX: previously called storage.delete_block(h) directly,
-            # which only removed the block record from DB/KV but NEVER
-            # reversed the balance/reward/nonce mutations that apply_block
-            # performed.  This caused height to decrease while balances
-            # stayed at their post-block values — a state corruption that
-            # caused state_root mismatches and made contract deploy/call
-            # fail after rollback.
-            #
-            # Fix: call _rollback_block() for each block, which:
-            #   1. Calls _rollback_rewards() to debit every reward credit.
-            #   2. Reverses every transaction (credits sender, debits receiver).
-            #   3. Restores VVM contract storage slots from the receipt delta.
-            #   4. Re-adds transactions to the mempool for re-mining.
-            #   5. Finally calls storage.delete_block() to remove the record.
+            # Each block is reversed as one atomic unit by _rollback_block().  A
+            # failure stops the loop at a clean intermediate height: the failing
+            # block and everything below it are intact.  L2, the snapshot
+            # index and the caches are reconciled to whatever height is reached,
+            # on success and on failure alike.
+            failure = None   # (height, message) of the first failed block
             try:
                 for h in range(current, target_height, -1):
+                    blk = self.storage.get_block(h)
+                    if blk is None:
+                        failure = (h, "block missing from storage")
+                        break
                     try:
-                        blk = self.storage.get_block(h)
-                        if blk is None:
-                            log.warning("rollback: block %d not found, skipping", h)
-                            deleted += 1
-                            continue
                         self._rollback_block(blk)
-                        deleted += 1
                     except Exception as exc:
-                        log.error("rollback: failed to rollback block %d: %s",
-                                  h, exc)
-                        return False, (
-                            "Error rolling back block {}: {}. "
-                            "Rollback incomplete — {} blocks removed "
-                            "before failure.".format(h, exc, deleted))
+                        log.error("rollback: failed to rollback block %d: %s", h, exc)
+                        failure = (h, str(exc))
+                        break
+                    deleted += 1
             finally:
                 # A rollback moves the tip backwards, so the pruner's last-run
                 # height from the old tip must not suppress future prune triggers.
@@ -2482,51 +2512,53 @@ class Blockchain:
                 if _prune_guarded:
                     _prune_lock.release()
 
+            reached = self.height()
+            if not self._reconcile_l2_to(reached, "manual rollback"):
+                return False, (
+                    "Rollback changed chain state, but L2 reconciliation failed; "
+                    f"{self._critical_recovery}")
+            DifficultyEngine.invalidate_cache(from_height=reached)
+            # Protocol-upgrade state reached through the removed blocks is undone.
+            try:
+                self._governance.reconcile_to_height(reached)
+            except Exception as _gov_rb_exc:
+                self._mark_critical_recovery(
+                    f"governance reconciliation after manual rollback failed: {_gov_rb_exc}")
+                return False, (
+                    "Rollback changed chain state, but governance reconciliation failed; "
+                    f"{self._critical_recovery}")
+            try:
+                self._snapshot_engine.invalidate_snapshots_above(reached)
+            except Exception as _snap_rb_exc:
+                log.error(
+                    "[ROLLBACK] Failed to invalidate snapshots above %d: %s",
+                    reached, _snap_rb_exc)
+            try:
+                self._recompute_highest_finalized_height()
+            except Exception as exc:
+                self._mark_critical_recovery(
+                    f"finality fence recomputation after manual rollback failed: {exc}")
+                return False, (
+                    "Rollback changed chain state, but finality-fence reconciliation "
+                    f"failed; {self._critical_recovery}")
+
+            if failure is not None:
+                return False, (
+                    f"Rollback incomplete: error rolling back block {failure[0]}: "
+                    f"{failure[1]}. Chain reconciled at height {reached} "
+                    f"({deleted} blocks removed before failure).")
+
             # ── Recompute state_root from the surviving ledger ─────────
             # Now that balances have been correctly reversed, this root
             # will match target_block.state_root (no divergence warning).
             new_state_root = self.storage.compute_state_root()
             target_sr = getattr(target_block, "state_root", "")
 
-            # ── Roll back the L2 tree to match the new L1 tip ─────────
-            # _rollback_block() above already reversed each withdrawal tx's
-            # L2_deposit() call (restoring individual L2 balances), but the
-            # L2StateTree also keeps a confirmed-root history keyed by L1
-            # height.  Rolling back that history ensures the next
-            # RollupSubmission uses the correct previous_l2_root and that
-            # reorg detection works correctly in Layer2State.
-            try:
-                layer2 = getattr(self, "layer2", None)
-                if layer2 is not None:
-                    ok_l2, msg_l2 = layer2.rollback_to_height(target_height)
-                    if ok_l2:
-                        log.info(
-                            f"[ROLLBACK] L2 tree rolled back to height "
-                            f"{target_height}: {msg_l2}")
-                    else:
-                        log.error(
-                            f"[ROLLBACK] L2 rollback_to_height({target_height}) "
-                            f"failed: {msg_l2}")
-            except Exception as _l2_rb_e:
-                log.error(f"[ROLLBACK] L2 tree rollback raised: {_l2_rb_e}")
-
             # Rollback must also roll back bootstrap-serving metadata.  Snapshot
             # blobs/manifests above the new tip belong to history that this node
             # can no longer authenticate locally (H+1 is gone).  Leaving them
             # advertised can send fresh peers into an impossible bootstrap and
             # strand them at an older retained checkpoint.
-            try:
-                self._snapshot_engine.invalidate_snapshots_above(target_height)
-            except Exception as _snap_rb_exc:
-                log.error(
-                    "[ROLLBACK] Failed to invalidate snapshots above %d: %s",
-                    target_height, _snap_rb_exc)
-
-            # ── Flush difficulty cache so next query reads fresh data ──
-            try:
-                DifficultyEngine.invalidate_cache(from_height=target_height)
-            except Exception:
-                pass   # non-fatal; cache will self-heal on next miss
 
             # ── Record the rollback event in node metadata ─────────────
             try:
@@ -2543,14 +2575,6 @@ class Blockchain:
                 pass  # metadata write failure is non-fatal
 
             new_height = self.height()  # re-read from storage
-            try:
-                self._recompute_highest_finalized_height()
-            except Exception as exc:
-                self._mark_critical_recovery(
-                    f"finality fence recomputation after manual rollback failed: {exc}")
-                return False, (
-                    "Rollback changed chain state, but finality-fence reconciliation "
-                    f"failed; {self._critical_recovery}")
 
             summary = (
                 "Rollback OK: {} -> {} "
@@ -2775,11 +2799,27 @@ class Blockchain:
             atomic_storage = self.storage
             result = None
             finality_fence_before = int(self._highest_finalized_height)
+            # Layer2State lives partly in memory (tree, checkpoint history,
+            # last batch id) and partly in node_meta rows written inside this
+            # block's database transaction.  When the transaction is rolled
+            # back by an exception that escapes _apply_block_unwrapped() (any
+            # failure after its own try/except, a failed
+            # record_block_apply_result(), or a failed COMMIT) the rows revert
+            # but the in-memory L2 state would otherwise keep every deposit,
+            # withdrawal and rollup this block applied -- and a retry of the
+            # same block would then apply them a second time.  Take ONE
+            # snapshot here, before anything can mutate L2, and restore it on
+            # every exceptional exit.  _apply_block_unwrapped() reuses it for
+            # its own logical-failure paths instead of taking a second copy.
+            _l2_wrapper_ref = getattr(self, "layer2", None)
+            _l2_wrapper_snap = (_l2_wrapper_ref.snapshot_full()
+                                if _l2_wrapper_ref is not None else None)
             try:
                 if getattr(atomic_storage, "_pgx_enabled", False):
                     with atomic_storage.pgx_atomic_block() as pgx_tx:
                         result = self._apply_block_unwrapped(
-                            block, defer_finality=defer_finality)
+                            block, defer_finality=defer_finality,
+                            _l2_snapshot=_l2_wrapper_snap)
                         if result[0] and pgx_tx is not None:
                             pgx_tx["commit"] = True
                     if result[0]:
@@ -2790,7 +2830,8 @@ class Blockchain:
                     atomic_started = True
                     try:
                         result = self._apply_block_unwrapped(
-                            block, defer_finality=defer_finality)
+                            block, defer_finality=defer_finality,
+                            _l2_snapshot=_l2_wrapper_snap)
                     except BaseException:
                         if atomic_started:
                             atomic_storage.rollback_sqlite_atomic_block()
@@ -2810,6 +2851,15 @@ class Blockchain:
                         else:
                             atomic_storage.rollback_sqlite_atomic_block()
             except BaseException:
+                # The backend transaction is already rolled back (or never
+                # committed).  Put every in-memory counterpart back as well.
+                if self.storage is not atomic_storage:
+                    # A BaseException (KeyboardInterrupt, SystemExit, ...) can
+                    # escape while the TPS-OPT-2 batching proxy is installed.
+                    self.storage = atomic_storage
+                self._restore_l2_after_failed_unit(
+                    _l2_wrapper_ref, _l2_wrapper_snap,
+                    f"apply_block #{getattr(block, 'index', '?')}")
                 self._reconcile_finality_after_failed_apply(
                     block, finality_fence_before)
                 if not owns_pending:
@@ -2840,8 +2890,98 @@ class Blockchain:
                 self._flush_vote_equivocations(pending)
             return result
 
+    def _reconcile_l2_to(self, height: int, context: str) -> bool:
+        """Restore Layer2State to the newest checkpoint at or below *height*.
+
+        Called after L1 blocks were removed.  L2 is the authoritative
+        checkpointed state, so this makes it match the L1 height actually
+        reached.  Failure is critical: L2 would no longer match the escrow.
+        """
+        layer2 = getattr(self, "layer2", None)
+        if layer2 is None:
+            return True
+        try:
+            ok, msg = layer2.rollback_to_height(int(height))
+        except Exception as exc:
+            ok, msg = False, str(exc)
+        if not ok:
+            self._mark_critical_recovery(
+                f"{context}: L2 reconciliation to height {height} failed: {msg}")
+            return False
+        return True
+
+    def _restore_removed_suffix(self, removed_desc: list, old_tip: int,
+                                fork_height: int, finality_by_height: dict,
+                                hash_by_height: dict, fence_before: int,
+                                context: str) -> Tuple[bool, str]:
+        """Put back the blocks that a failed reorg step removed.
+
+        ``removed_desc`` lists the removed blocks newest first.  Every block
+        below the failed step is still intact, so L2 is first reconciled to the
+        current tip, then the removed blocks are re-applied in ascending order
+        and their original finality flags restored.  Any failure during this
+        recovery leaves the chain partially mutated and is critical.
+        """
+        try:
+            if not self._reconcile_l2_to(self.height(), context):
+                return False, self._critical_recovery
+            for ob in reversed(removed_desc):
+                try:
+                    ok, msg = self.apply_block(ob, defer_finality=True)
+                except Exception as exc:
+                    ok, msg = False, f"exception: {exc}"
+                if not ok:
+                    self._mark_critical_recovery(
+                        f"{context}: re-applying old block #{ob.index} failed: {msg}")
+                    return False, self._critical_recovery
+            try:
+                for ob in reversed(removed_desc):
+                    idx = int(ob.index)
+                    restored = self.storage.get_block(idx)
+                    if restored is None or restored.block_hash != hash_by_height[idx]:
+                        raise RuntimeError(
+                            f"restored block identity mismatch at height {idx}")
+                    if bool(restored.finalized) != finality_by_height[idx]:
+                        restored.finalized = finality_by_height[idx]
+                        self.storage.save_block(restored)
+            except Exception as exc:
+                self._mark_critical_recovery(
+                    f"{context}: restoring original finality state failed: {exc}")
+                return False, self._critical_recovery
+            if self.height() != int(old_tip):
+                self._mark_critical_recovery(
+                    f"{context}: chain height {self.height()} after restore "
+                    f"differs from the old tip {old_tip}")
+                return False, self._critical_recovery
+            return True, "old chain restored"
+        finally:
+            self._highest_finalized_height = fence_before
+            DifficultyEngine.invalidate_cache(from_height=fork_height)
+
+    def _restore_l2_after_failed_unit(self, layer2, snapshot, label: str) -> None:
+        """Restore in-memory Layer2State after its database writes were rolled back.
+
+        ``restore_full()`` assigns the in-memory state first and only then
+        re-persists it, so a persistence failure (for example the very
+        "database or disk is full" that aborted the unit) must not mask the
+        original exception or undo the in-memory restore.  The rows the
+        rolled-back transaction wrote are already reverted, so a failed
+        re-persist leaves memory and disk identical anyway.
+        """
+        if layer2 is None or snapshot is None:
+            return
+        try:
+            layer2.restore_full(snapshot)
+        except Exception as exc:
+            log.error(
+                "CRITICAL: L2 state restore after failed %s raised: %s "
+                "(in-memory L2 state was restored; persisted rows were "
+                "already reverted by the rolled-back transaction)", label, exc)
+
     def _apply_block_unwrapped(self, block: Block, *,
-                               defer_finality: bool = False) -> Tuple[bool, str]:
+                               defer_finality: bool = False,
+                               _l2_snapshot: Optional[dict] = None
+                               ) -> Tuple[bool, str]:
         with self._lock:
             # DUPLICATE-BLOCK IDEMPOTENCY FIX:
             # A peer may relay the same block more than once.  Once a block
@@ -2995,7 +3135,11 @@ class Blockchain:
             # mutation, drifting from the canonical chain and from peers.
             # Take the snapshot now so every failure path can restore it.
             _l2 = getattr(self, "layer2", None)
-            l2_snap = _l2.snapshot_full() if _l2 is not None else None
+            if _l2_snapshot is not None and _l2 is not None:
+                # apply_block() already captured this before any mutation.
+                l2_snap = _l2_snapshot
+            else:
+                l2_snap = _l2.snapshot_full() if _l2 is not None else None
 
             # ═══════════════════════════════════════════════════════════════════
             # TPS-OPT-2: BATCH PROXY
@@ -3115,6 +3259,12 @@ class Blockchain:
                                     f"[ROLLUP-SKIP] mempool.remove failed: "
                                     f"{_mp_err}")
                             metrics.inc("rollup_txs_skipped")
+                            for _drop_fn in list(self._rollup_drop_listeners):
+                                try:
+                                    _drop_fn(tx.tx_id)
+                                except Exception as _drop_err:
+                                    log.debug(
+                                        f"[ROLLUP-SKIP] drop listener error: {_drop_err}")
                             # Bump nonce + (zero) fee path so the dry_run /
                             # apply_block state-root parity (see TYPE_ROLLUP
                             # branch in dry_run_state_root) holds: dry_run
@@ -4581,16 +4731,20 @@ class Blockchain:
         return valid
 
     def _slash_validator_for_equivocation(self, validator_address: str) -> None:
-        """Apply the local equivocation penalty at most once as a fallback."""
-        try:
-            role = self.storage.get_role(validator_address)
-            if not role or bool(role.get("slashed", False)):
-                return
-            self.storage.slash(validator_address)
-        except Exception as exc:
-            log.error(
-                "Unable to apply equivocation slash for %s: %s",
-                str(validator_address)[:16], exc)
+        """Record equivocation without mutating local stake or slashed state.
+
+        roles.stake and roles.slashed feed the validator reward split
+        (_distribute_rewards -> get_all_by_role). A penalty applied on one node
+        therefore changes that node's balances, and that node then rejects the
+        next honest block with state_root mismatch. No on-chain slash transaction
+        exists yet, so no node can apply a penalty at the same block height as
+        the others. The durable vote rows written by add_validator_sig() are
+        the evidence; the penalty itself requires consensus-level slashing.
+        """
+        log.warning(
+            "Equivocation by %s recorded as evidence; no local stake penalty "
+            "applied (stake is consensus-relevant state)",
+            str(validator_address)[:16])
 
     def _queue_or_handle_vote_equivocation(self, validator_address: str,
                                            target_block: Block, sig_hex: str,
@@ -4624,9 +4778,13 @@ class Blockchain:
     def _handle_vote_equivocation(self, validator_address: str,
                                   target_block: Block, sig_hex: str,
                                   pub_hex: str, prior_vote: dict) -> None:
-        """Persist the penalty/evidence for an authenticated conflicting vote."""
+        """Persist evidence for an authenticated conflicting vote.
+
+        Only evidence is recorded here. Stake and the slashed flag are consensus
+        state (see _slash_validator_for_equivocation), so no local penalty is applied.
+        """
         role = self.storage.get_role(validator_address)
-        if not role or bool(role.get("slashed", False)):
+        if not role:
             return
         if Config.AUTO_SLASH_EVIDENCE and getattr(self, "_slash_evidence", None):
             try:
@@ -4648,7 +4806,7 @@ class Blockchain:
                 applied, _message = self._slash_evidence.apply_evidence(evidence)
                 if applied:
                     log.info(
-                        "Automatic equivocation slash evidence applied for %s at height %d",
+                        "Equivocation evidence recorded for %s at height %d",
                         str(validator_address)[:16], int(target_block.index))
                     metrics.inc("slash_evidence_auto_built")
                     return
@@ -5023,17 +5181,90 @@ class Blockchain:
                 self.storage.debit_sat(block.miner_address, v_pool_sat)
 
     def _rollback_block(self, block: Block):
-        """
-        Reverse a block's state changes.
-        Re-adds non-coinbase transactions back to the mempool so they can be
-        re-mined in the new canonical chain.
-        VVM transactions are rolled back using the storage_delta from their receipt.
-        """
-        # BUG-44: the personal ledger mirrors canonical history.  Invalidate
-        # this exact block before any asynchronous writer can preserve its
-        # transactions as confirmed local history.
-        invalidate_local_ledger_block(block)
+        """Reverse one canonical block as an all-or-nothing unit.
 
+        The body performs every L1 mutation and the canonical block deletion.
+        On SQLite it runs inside one atomic storage transaction, so a failure
+        at any step (for example a failed delete after balances were already
+        reversed) rolls the whole block back; a retry then starts from the
+        same state instead of reversing the block a second time.  In-memory
+        Layer2State is restored from a snapshot on every failure path.
+
+        Side effects that must follow the canonical commit (ledger
+        invalidation, replay-guard bookkeeping, economic-monitor history and
+        mempool re-admission) run only after the commit succeeds.
+
+        PGX has no cross-backend atomic unit for rollback.  A failure after a
+        mutation has started is therefore recorded as a critical recovery
+        condition, and the chain refuses further writes until an operator
+        repairs it.
+        """
+        layer2 = getattr(self, "layer2", None)
+        l2_snap = layer2.snapshot_full() if layer2 is not None else None
+        atomic_storage = self.storage
+        pgx = bool(getattr(atomic_storage, "_pgx_enabled", False))
+        owns_atomic = False
+        if not pgx:
+            _conn = atomic_storage._conn()
+            _already = getattr(_conn, "atomic_active", None)
+            if not (_already is not None and _already()):
+                atomic_storage.begin_sqlite_atomic_block()
+                owns_atomic = True
+        progress = {"mutated": False}
+        mempool_restore: list = []
+        try:
+            mempool_restore = self._rollback_block_body(block, progress)
+            if owns_atomic:
+                owns_atomic = False
+                atomic_storage.commit_sqlite_atomic_block()
+        except BaseException as exc:
+            if owns_atomic:
+                owns_atomic = False
+                try:
+                    atomic_storage.rollback_sqlite_atomic_block()
+                except Exception as rb_exc:
+                    log.error(f"[ROLLBACK] atomic rollback of block "
+                              f"#{block.index} failed: {rb_exc}")
+            if self.storage is not atomic_storage:
+                self.storage = atomic_storage
+            self._restore_l2_after_failed_unit(
+                layer2, l2_snap, f"rollback of block #{block.index}")
+            if pgx and progress["mutated"]:
+                self._mark_critical_recovery(
+                    f"rollback of block #{block.index} failed after PGX "
+                    f"mutation started: {exc}")
+            raise
+
+        # ── Post-commit side effects: the block is gone, so these may not fail
+        # the rollback.  Each one is idempotent or in-memory only.
+        self._applied_block_hashes.discard(block.block_hash)
+        try:
+            invalidate_local_ledger_block(block)   # BUG-44 ledger invalidation
+        except Exception as _led_exc:
+            log.warning(f"[ROLLBACK] local ledger invalidation failed: {_led_exc}")
+        try:
+            # Economic-monitor histories are in-memory and must follow canonical
+            # storage after rollback/reorg; otherwise orphaned blocks can sustain
+            # false producer-streak and concentration alerts.
+            self._rebuild_economic_monitor_history()
+        except Exception as _eco_exc:
+            log.warning(f"[ROLLBACK] economic monitor rebuild failed: {_eco_exc}")
+        # Confirmed indexes are now gone, so mempool.restore() can legitimately
+        # accept the original tx ids back into the pool.
+        for _tx in mempool_restore:
+            _ok, _msg = self.mempool.restore(_tx)
+            if not _ok:
+                log.warning(
+                    "[ROLLBACK] Could not restore tx %s to mempool: %s",
+                    _tx.tx_id[:8], _msg)
+
+    def _rollback_block_body(self, block: Block, progress: dict) -> list:
+        """Body of _rollback_block().  Runs inside the caller's atomic unit.
+
+        Returns the transactions to re-admit to the mempool after commit.
+        ``progress["mutated"]`` is set before the first state write so the
+        caller can tell a pure pre-flight rejection from a partial mutation.
+        """
         # Mempool.restore() deliberately refuses a tx that is still present in
         # the confirmed transaction indexes. Queue orphaned transactions and
         # restore them only after storage.delete_block() has removed the block,
@@ -5233,6 +5464,7 @@ class Blockchain:
         # during forward application.  Rollback therefore restores the exact
         # pre-block role snapshot BEFORE reversing rewards, because rewards for
         # this block were calculated from that pre-block validator/miner set.
+        progress["mutated"] = True
         register_txs = [
             tx for tx in block.transactions
             if tx.tx_type == Transaction.TYPE_REGISTER
@@ -5605,12 +5837,21 @@ class Blockchain:
             if tx.receiver == L2_WITHDRAW_ADDRESS and amount_sat > 0:
                 payout_sat = amount_sat - fee_sat
                 if payout_sat > 0 and not self.storage.debit_sat(tx.sender, payout_sat):
-                    log.warning(
-                        f"[ROLLBACK] L2 withdrawal payout debit failed for "
-                        f"{tx.sender[:12]}")
+                    # The payout was credited on the forward path. If it cannot be
+                    # reversed the user must have spent it, which means the descendant
+                    # blocks were not rolled back first. Refusing is the only safe
+                    # outcome: skipping would mint the amount on the L1 side.
+                    raise RuntimeError(
+                        f"[ROLLBACK] cannot reverse L2 withdrawal payout of "
+                        f"{payout_sat} sat from {tx.sender[:12]} for tx "
+                        f"{tx.tx_id[:8]}; roll back descendant blocks first")
                 self.storage.credit_sat(L2_BRIDGE_ADDRESS, amount_sat)
                 layer2 = getattr(self, "layer2", None)
                 if layer2 is not None:
+                    # Per-transaction L2 inverse. It is best-effort: the L2
+                    # checkpoint restore performed by rollback()/reorg()/_hard_reset_to()
+                    # is the authoritative L2 state, so a failure here is logged and
+                    # reconciled rather than aborting the L1 side.
                     try:
                         ok_rb, msg_rb = layer2.L2_deposit(tx.sender, amount_sat)
                         if not ok_rb:
@@ -5634,9 +5875,10 @@ class Blockchain:
                 layer2 = getattr(self, "layer2", None)
                 if layer2 is not None:
                     try:
-                        ok_rb, msg_rb = layer2.L2_withdraw(tx.sender, amount_sat,
-                                                           l1_height=block.index,
-                                                           l1_block_hash=block.block_hash)
+                        # No l1_height: a checkpoint recorded at the height being
+                        # deleted would describe state that no longer exists.
+                        # Authoritative restore is the checkpoint rollback above.
+                        ok_rb, msg_rb = layer2.L2_withdraw(tx.sender, amount_sat)
                         if not ok_rb:
                             log.error(
                                 f"[ROLLBACK] L2_withdraw (deposit undo) failed for "
@@ -5661,7 +5903,10 @@ class Blockchain:
             debit_target = (Config.BURN_ADDRESS
                             if tx.receiver == "VSD_GLOBAL_MARKET" else tx.receiver)
             if not self.storage.debit_sat(debit_target, amount_sat):
-                log.warning(f"Reorg rollback: cannot debit receiver {debit_target[:12]}")
+                raise RuntimeError(
+                    f"[ROLLBACK] cannot reverse transfer of {amount_sat} sat to "
+                    f"{debit_target[:12]} for tx {tx.tx_id[:8]}; roll back "
+                    f"descendant blocks first")
             self.storage.credit_sat(tx.sender, total_debit_sat)
             # Mempool restoration is deferred until the confirmed block is
             # removed from storage (see _mempool_restore above).
@@ -5689,30 +5934,12 @@ class Blockchain:
             raise RuntimeError(
                 f"Failed to delete rolled-back block {block.index} from storage")
 
-        # Clear duplicate-application memory immediately after the canonical
-        # delete succeeds. No later bookkeeping failure may resurrect the old
-        # in-memory "already applied" state for a block that no longer exists.
-        self._applied_block_hashes.discard(block.block_hash)
-
         # The reward distributor increments cumulative NEW issuance once per
-        # block. Reverse it only after block deletion has succeeded, so a failed
-        # storage delete cannot leave the supply counter ahead of the chain.
+        # block. Reverse it inside the same unit as the block delete, so the
+        # supply counter can never disagree with the stored chain.
         self.storage.decrement_cumulative_issued_sat(
             self.compute_reward_sat(block.index))
-
-        # Economic-monitor histories are in-memory and must follow canonical
-        # storage after rollback/reorg; otherwise orphaned blocks can sustain
-        # false producer-streak and concentration alerts.
-        self._rebuild_economic_monitor_history()
-
-        # Confirmed indexes are now gone, so mempool.restore() can legitimately
-        # accept the original tx ids back into the pool.
-        for _tx in _mempool_restore:
-            _ok, _msg = self.mempool.restore(_tx)
-            if not _ok:
-                log.warning(
-                    "[ROLLBACK] Could not restore tx %s to mempool: %s",
-                    _tx.tx_id[:8], _msg)
+        return _mempool_restore
 
     def _reconcile_tip_marker(self) -> None:
         """VSA-24: repair or fence a tip block committed without its applied marker.
@@ -5784,8 +6011,27 @@ class Blockchain:
             log.critical(f"[RECOVERY] could not persist recovery marker: {exc}")
 
     def reorg(self, new_chain: List[Block], *,
-              allow_deep_no_investor: bool = False,
-              enforce_deep_tiebreak: bool = False) -> Tuple[bool, str]:
+              allow_deep_no_investor: bool = False) -> Tuple[bool, str]:
+        """Switch to ``new_chain``.  Fork-choice and finality rules are in _reorg_locked.
+
+        Protocol-upgrade state is captured first.  If the reorg fails, the old
+        chain is restored, and that captured state is put back exactly, so the
+        upgrade lifecycle matches the chain that remains.
+        """
+        with self._lock:
+            gov_snap = self._governance.snapshot_state()
+            ok, msg = self._reorg_locked(
+                new_chain, allow_deep_no_investor=allow_deep_no_investor)
+            if not ok and self._governance.snapshot_state() != gov_snap:
+                try:
+                    self._governance.restore_state(gov_snap)
+                except Exception as _gov_restore_exc:
+                    self._mark_critical_recovery(
+                        f"governance state restore after failed reorg failed: {_gov_restore_exc}")
+            return ok, msg
+
+    def _reorg_locked(self, new_chain: List[Block], *,
+                      allow_deep_no_investor: bool = False) -> Tuple[bool, str]:
         """
         Perform a chain reorganisation.
         new_chain: ordered list of blocks starting from the fork point.
@@ -5863,12 +6109,12 @@ class Blockchain:
                     "full old-chain recovery on validation failure.",
                     highest_finalized)
 
-            # A competing branch may be the same height. It is eligible
-            # when it carries more cumulative work, or when equal work is
-            # resolved by the deterministic tip-hash tiebreak below.
+            # Fork choice is cumulative work alone (see the work comparison
+            # below), with a deterministic tip-hash tiebreak on equal work.
+            # Block height is deliberately NOT a criterion: a shorter branch
+            # with more work must win, or two nodes that each prefer a
+            # different branch would stay split forever.
             new_tip = new_chain[-1].index
-            if new_tip < tip:
-                return False, f"New chain tip {new_tip} below current tip {tip}"
 
             # ── BUG-FIX (v7.1.2) — Remove two-pass dry-run validation ─────
             # The old code pre-validated ALL new_chain blocks BEFORE rolling
@@ -5961,9 +6207,9 @@ class Blockchain:
                     f"New chain tip {new_tip} has less cumulative work from "
                     f"height {fork_height} ({new_work:.2f} < {old_work:.2f}); "
                     f"rejecting to enforce the heaviest-chain rule")
-            if new_work == old_work and (
-                    (new_tip == tip)
-                    or enforce_deep_tiebreak):
+            # Equal work is decided by the same tip-hash rule on every node,
+            # whatever the heights of the two tips.
+            if new_work == old_work and _saved_old_blocks:
                 _old_tip_hash = _saved_old_blocks[-1].block_hash if _saved_old_blocks else ""
                 _new_tip_hash = new_chain[-1].block_hash
                 if _new_tip_hash >= _old_tip_hash:
@@ -5985,17 +6231,50 @@ class Blockchain:
             except Exception as _l2_pre_e:
                 log.error(f"[L2-REORG] pre-check raised, continuing: {_l2_pre_e}")
 
-            # Rollback current chain from tip down to fork_height
+            # Rollback current chain from tip down to fork_height.  Each block is
+            # atomic (_rollback_block).  If a step fails, the blocks already removed
+            # are put back, so the old canonical chain is intact and the reorg is
+            # rejected rather than left half-done.
+            _suffix_removed: list = []   # newest first
             try:
                 for blk in reversed(_saved_old_blocks):
                     self._rollback_block(blk)
+                    _suffix_removed.append(blk)
             except Exception as _old_rb_e:
-                self._mark_critical_recovery(
-                    f"rollback of the old suffix failed: {_old_rb_e}")
-                return False, f"Reorg aborted: {self._critical_recovery}"
+                _ok_r, _msg_r = self._restore_removed_suffix(
+                    _suffix_removed, tip, fork_height, _old_finality_by_height,
+                    _old_hash_by_height, _pre_reorg_finality_fence,
+                    "reorg old-suffix rollback")
+                return False, (
+                    f"Reorg aborted: rollback of the old suffix failed: "
+                    f"{_old_rb_e}; {_msg_r}")
             # VSA-21: difficulty entries at or above the fork point were computed on the
             # abandoned branch.  Drop them before any replacement block is validated.
             DifficultyEngine.invalidate_cache(from_height=fork_height)
+            # Snapshots at or above the fork point describe the abandoned suffix.
+            # Drop them now, as rollback() does.  get_servable_manifest() also
+            # refuses any entry whose anchor no longer matches the canonical block.
+            try:
+                self._snapshot_engine.invalidate_snapshots_above(fork_height - 1)
+            except Exception as _snap_reorg_exc:
+                log.error(
+                    "[REORG] Failed to invalidate snapshots above %d: %s",
+                    fork_height - 1, _snap_reorg_exc)
+            # Protocol-upgrade state reached through the removed suffix is undone,
+            # so replacement blocks are checked against the fork-point state.
+            try:
+                self._governance.reconcile_to_height(fork_height - 1)
+            except Exception as _gov_reorg_exc:
+                log.error(
+                    "[REORG] governance reconciliation at fork %d failed: %s",
+                    fork_height, _gov_reorg_exc)
+                _ok_r, _msg_r = self._restore_removed_suffix(
+                    _suffix_removed, tip, fork_height, _old_finality_by_height,
+                    _old_hash_by_height, _pre_reorg_finality_fence,
+                    "reorg governance reconciliation")
+                return False, (
+                    f"Reorg aborted: governance reconciliation failed: "
+                    f"{_gov_reorg_exc}; {_msg_r}")
 
             # ── v7.5.0-OPT LAYER-2 REORG HOOK ────────────────────────────────
             # Any RollupSubmission confirmed at an L1 height >= fork_height
@@ -6010,15 +6289,14 @@ class Blockchain:
             # a height that has no matching snapshot resets the tree to
             # empty (which is correct for a deep reorg below any ever-
             # confirmed batch).
-            try:
-                layer2 = getattr(self, "layer2", None)
-                if layer2 is not None:
-                    safe_l1 = fork_height - 1
+            layer2 = getattr(self, "layer2", None)
+            safe_l1 = fork_height - 1
+            _l2_err = None
+            if layer2 is not None:
+                try:
                     ok_rb, msg_rb = layer2.rollback_to_height(safe_l1)
                     if not ok_rb:
-                        log.error(
-                            f"[L2-REORG] rollback_to_height({safe_l1}) "
-                            f"returned non-OK: {msg_rb}")
+                        _l2_err = msg_rb
                     elif msg_rb == "no-l2-state":
                         log.debug(
                             f"[L2-REORG] no L2 state to roll back "
@@ -6027,8 +6305,19 @@ class Blockchain:
                         log.info(
                             f"[L2-REORG] L2 state rolled back to L1 height "
                             f"<= {safe_l1} ({msg_rb})")
-            except Exception as _l2_rb_e:
-                log.error(f"[L2-REORG] rollback hook raised: {_l2_rb_e}")
+                except Exception as _l2_rb_e:
+                    _l2_err = str(_l2_rb_e)
+            if _l2_err is not None:
+                # The replacement cannot be validated against L2 that is not at
+                # the fork point, so the removed suffix is put back.
+                log.error(f"[L2-REORG] rollback_to_height({safe_l1}) failed: {_l2_err}")
+                _ok_r, _msg_r = self._restore_removed_suffix(
+                    _suffix_removed, tip, fork_height, _old_finality_by_height,
+                    _old_hash_by_height, _pre_reorg_finality_fence,
+                    "reorg L2 fork-point rollback")
+                return False, (
+                    f"Reorg aborted: L2 rollback to height {safe_l1} failed: "
+                    f"{_l2_err}; {_msg_r}")
 
             # Capture the exact L2 state at the fork point.  If applying the
             # replacement chain fails, _rollback_block() cannot undo a committed
@@ -6041,7 +6330,12 @@ class Blockchain:
                     _l2_reorg_base_snap = layer2.snapshot_full()
             except Exception as _l2_snap_e:
                 log.error(f"[L2-REORG] failed to snapshot fork-point L2 state: {_l2_snap_e}")
-                return False, f"Unable to snapshot L2 state before reorg: {_l2_snap_e}"
+                _ok_r, _msg_r = self._restore_removed_suffix(
+                    _suffix_removed, tip, fork_height, _old_finality_by_height,
+                    _old_hash_by_height, _pre_reorg_finality_fence,
+                    "reorg fork-point snapshot")
+                return False, (
+                    f"Unable to snapshot L2 state before reorg: {_l2_snap_e}; {_msg_r}")
 
             # Apply new chain — on any failure, restore the old chain.
             _applied: list = []
@@ -6447,10 +6741,22 @@ class Blockchain:
         before the peer's blocks are re-applied by accept_chain().
         """
         tip = self.height()
-        for idx in range(tip, keep_height, -1):
-            blk = self.storage.get_block(idx)
-            if blk:
-                self._rollback_block(blk)   # returns txs to mempool + deletes block
+        reached = tip
+        try:
+            for idx in range(tip, keep_height, -1):
+                blk = self.storage.get_block(idx)
+                if blk:
+                    self._rollback_block(blk)   # returns txs to mempool + deletes block
+                reached = idx - 1
+        finally:
+            # Whatever height the loop reached, L2 must be restored to match it
+            # before any peer block is applied.  A failure here is critical.
+            self._reconcile_l2_to(max(reached, -1), "hard reset")
+            try:
+                self._governance.reconcile_to_height(max(reached, -1))
+            except Exception as _gov_hr_exc:
+                self._mark_critical_recovery(
+                    f"governance reconciliation after hard reset failed: {_gov_hr_exc}")
 
         # BUG-FIX: genesis-level reset — wipe any orphaned balance rows.
         # _rollback_block only undoes credits/debits for blocks it finds in DB.
@@ -6775,10 +7081,11 @@ class Blockchain:
                 new_blocks = [b for b in blocks if b.index >= fork_start]
                 if not new_blocks:
                     return True, "Already have all these blocks"
-                if new_blocks[-1].index < current_tip:
-                    return False, (
-                        f"Incoming tip {new_blocks[-1].index} below our tip "
-                        f"{current_tip}")
+                # No height gate here: a branch that ends below our tip is
+                # still eligible when its cumulative work is higher. reorg()
+                # makes that decision by work. Pagination is safe because
+                # p2p buffers a divergent suffix until it reaches the server's
+                # tip before calling accept_chain().
 
                 # BUG-5: verify linkage, canonical expected difficulty, PoW,
                 # timestamp and integrity against a read-only fork overlay before
@@ -6820,13 +7127,10 @@ class Blockchain:
                     "Deep fork rejected: BFT-finalized blocks are irreversible. "
                     "Cannot adopt peer chain that diverges below the finality fence.")
 
-            # A deep-fork decision requires the complete peer suffix through
-            # the peer tip.  Using only a 200-block response page as "peer
-            # cumulative work" can reject a genuinely longer chain.
-            if incoming_tip < current_tip:
-                return False, (
-                    f"Deep-fork comparison requires peer tip >= ours; "
-                    f"peer={incoming_tip}, ours={current_tip}")
+            # Fork choice needs the complete peer suffix through the peer tip.
+            # For divergent chains, p2p buffers pages until it reaches the
+            # server's advertised tip before calling accept_chain(). A shorter
+            # complete suffix with more work is valid and must win.
 
             # Compare work only AFTER the common ancestor; work before that
             # point is shared by definition and cancels out.  Preserve the
@@ -6871,7 +7175,6 @@ class Blockchain:
             return self.reorg(
                 peer_suffix,
                 allow_deep_no_investor=True,
-                enforce_deep_tiebreak=True,
             )
 
     # ── BFT finality + slashing ───────────────────────────────────────────────

@@ -333,23 +333,28 @@ class RollbackExecutor:
         replay_safe: bool = True,
     ) -> Tuple[bool, str]:
         """
-        Roll back from current tip to target_height, then replay safe txs.
+        Roll back from current tip to target_height, then apply the replay policy.
 
         Args:
             target_height: the chain height to roll back TO (exclusive).
                            All blocks from current_tip down to target_height+1
                            will be removed.
             flagged_addresses: transactions involving these addresses are NOT
-                               replayed.
-            replay_safe: if True, replay non-flagged transactions into mempool.
+                               re-admitted to the mempool.
+            replay_safe: if True, re-admit the non-flagged transactions of the
+                         removed blocks; if False, re-admit none of them.
 
         Returns (success: bool, message: str)
 
         SAFETY INVARIANTS:
           1. Never rolls back below genesis (height 0)
           2. Never rolls back more than SnapshotStore.MAX_SNAPSHOTS blocks
-          3. Each block rollback is atomic — uses existing _rollback_block()
-          4. State root is verified after rollback completes
+          3. The rollback itself is Blockchain.rollback(): every block is
+             reversed as one atomic unit, and Layer2State, the snapshot index,
+             the difficulty cache and the finality fence are reconciled to the
+             height actually reached
+          4. The state root is verified by Blockchain.rollback() (divergence
+             is reported and makes the result unsuccessful)
         """
         with self._lock:
             try:
@@ -369,125 +374,78 @@ class RollbackExecutor:
                         f"Rollback depth {rollback_depth} exceeds "
                         f"safe window {SnapshotStore.MAX_SNAPSHOTS}")
 
-                # Collect blocks to roll back and their safe transactions
-                safe_txs: List[dict] = []
-                rolled_heights: List[int] = []
-
+                # Canonical Block objects for every height that will be removed.
+                # They are read before the rollback so their transactions can be
+                # classified afterwards.
+                removed_blocks = []
                 for h in range(current_tip, target_height, -1):
-                    block_dict = self._storage.get_block(h)
-                    if block_dict is None:
+                    blk = self._storage.get_block(h)
+                    if blk is None:
                         log.error(f"[ROLLBACK] Block {h} not found — aborting")
                         return False, f"Block {h} missing from storage"
+                    removed_blocks.append(blk)
 
-                    # Collect safe transactions before rolling back
-                    if replay_safe:
-                        block_safe_txs = self._collect_safe_txs(
-                            block_dict, flagged_addresses, h)
-                        # AUDIT-FIX-M3: this loop walks tip -> target (newest
-                        # to oldest). Prepend (not extend/append) so the
-                        # final safe_txs list ends up in true chronological
-                        # order (oldest block first, in-block order
-                        # preserved within each block). Mempool.add()
-                        # enforces strict per-sender nonce contiguity with
-                        # no future-nonce buffering, so replaying
-                        # newest-first silently dropped a sender's newer tx
-                        # whenever they had more than one tx in the
-                        # rolled-back range.
-                        safe_txs = block_safe_txs + safe_txs
-
-                    # Reconstruct Block object and call existing _rollback_block
-                    try:
-                        # Import Block from the main module at call time
-                        # (avoids circular import at module load)
-                        block_obj = self._dict_to_block(block_dict)
-                        self._blockchain._rollback_block(block_obj)
-                        rolled_heights.append(h)
-                        log.info(f"[ROLLBACK] Rolled back block {h}")
-                    except Exception as exc:
-                        log.error(
-                            f"[ROLLBACK] Failed to rollback block {h}: {exc}")
-                        return False, f"Rollback of block {h} failed: {exc}"
-
+                ok, msg = self._blockchain.rollback(target_height)
                 new_tip = self._blockchain.height()
+                removed_now = [b for b in removed_blocks if int(b.index) > new_tip]
+                replayed, dropped = self._apply_replay_policy(
+                    removed_now, flagged_addresses, replay_safe)
                 log.warning(
-                    f"[ROLLBACK] Complete. Removed {len(rolled_heights)} blocks. "
+                    f"[ROLLBACK] Complete. Removed {len(removed_now)} blocks. "
                     f"New tip: {new_tip}")
 
-                # Replay safe transactions into mempool
-                replayed = 0
-                if replay_safe and safe_txs:
-                    replayed = self._replay_into_mempool(safe_txs)
-                    log.info(f"[ROLLBACK] Replayed {replayed} safe transactions")
-
+                if new_tip != target_height:
+                    # Partial: the chain is reconciled at new_tip (the failing
+                    # block and everything below it are intact).
+                    return False, (
+                        f"Rollback incomplete at height {new_tip}: {msg}. "
+                        f"Replayed {replayed} safe txs, dropped {dropped}.")
+                if not ok:
+                    return False, (
+                        f"Rollback reached target {target_height} but was flagged: {msg}. "
+                        f"Replayed {replayed} safe txs, dropped {dropped}.")
                 return True, (
-                    f"Rolled back {len(rolled_heights)} blocks "
+                    f"Rolled back {len(removed_now)} blocks "
                     f"(tip: {current_tip} → {new_tip}). "
-                    f"Replayed {replayed} safe txs.")
+                    f"Replayed {replayed} safe txs, dropped {dropped}.")
 
             except Exception as exc:
                 log.error(f"[ROLLBACK] Unexpected error: {exc}", exc_info=True)
                 return False, f"Rollback failed: {exc}"
 
-    def _collect_safe_txs(
+    def _apply_replay_policy(
         self,
-        block_dict: dict,
+        removed_blocks: List,
         flagged: Set[str],
-        height: int,
-    ) -> List[dict]:
-        """
-        Collect transactions from a block that are safe to replay:
-        - Not coinbase
-        - Sender and receiver not in flagged set
-        """
-        safe = []
-        for tx in block_dict.get("transactions", []):
-            if not isinstance(tx, dict):
-                continue
-            sender   = tx.get("sender", "")
-            receiver = tx.get("receiver", "")
-            if sender == "COINBASE":
-                continue
-            if sender in flagged or receiver in flagged:
-                continue
-            safe.append(tx)
-        return safe
+        replay_safe: bool,
+    ) -> Tuple[int, int]:
+        """Decide which transactions of the removed blocks stay in the mempool.
 
-    def _replay_into_mempool(self, safe_txs: List[dict]) -> int:
-        """Re-add safe transactions to the mempool."""
-        count = 0
-        for tx_dict in safe_txs:
-            try:
-                # Import Transaction from main module at call time
-                tx = self._dict_to_tx(tx_dict)
-                ok, _ = self._blockchain.mempool.add(tx)
-                if ok:
-                    count += 1
-            except Exception as exc:
-                log.debug(f"[ROLLBACK] replay tx failed: {exc}")
-        return count
-
-    def _dict_to_block(self, block_dict: dict):
+        Blockchain.rollback() already re-admits every non-coinbase transaction
+        of the removed blocks.  The policy then:
+          * keeps (and, if missing, re-adds in chronological order) a transaction
+            only when replay_safe is True and neither its sender nor its receiver
+            is flagged;
+          * removes every other transaction from the mempool.
+        Mempool.add() re-validates nonce, fee and signature, so a stale
+        transaction is simply not admitted.  Returns (replayed, dropped).
         """
-        Reconstruct a Block object from a dict using the main module's class.
-        Imported lazily to avoid circular import at module load time.
-        """
-        import sys
-        # The main visold module registers itself; look for 'Block' in globals
-        for mod_name, mod in sys.modules.items():
-            if hasattr(mod, "Block") and hasattr(mod, "Transaction"):
-                try:
-                    return mod.Block.from_dict(block_dict)
-                except Exception:
-                    pass
-        raise RuntimeError("Block class not found in loaded modules")
-
-    def _dict_to_tx(self, tx_dict: dict):
-        """Reconstruct Transaction from dict."""
-        import sys
-        for mod_name, mod in sys.modules.items():
-            if hasattr(mod, "Transaction"):
-                try:
-                    return mod.Transaction.from_dict(tx_dict)
-                except Exception:
-                    pass
-        raise RuntimeError("Transaction class not found in loaded modules")
+        mempool = self._blockchain.mempool
+        replayed = 0
+        dropped = 0
+        # Chronological order: lowest height first, in-block order preserved.
+        for blk in sorted(removed_blocks, key=lambda b: int(b.index)):
+            for tx in blk.transactions:
+                if tx.sender == "COINBASE":
+                    continue
+                is_safe = (replay_safe
+                           and tx.sender not in flagged
+                           and tx.receiver not in flagged)
+                if is_safe:
+                    ok, _ = mempool.add(tx)
+                    if ok:
+                        replayed += 1
+                else:
+                    mempool.remove(tx.tx_id)
+                    dropped += 1
+        return replayed, dropped

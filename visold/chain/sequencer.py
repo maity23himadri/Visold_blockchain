@@ -25,6 +25,7 @@ Origin: visold_vsd_.py L25231-25767
 
 import json
 import threading
+from collections import deque
 import time
 from typing import Dict, List, Optional, TYPE_CHECKING, Tuple
 
@@ -109,6 +110,63 @@ class Sequencer:
         # "in flight" on the same uncommitted pending window / batch_id at
         # once. See _seal_one()/_finalize_seal()/_abandon_seal() docstrings.
         self._seal_cycle_lock = threading.Lock()
+        # Rollup re-queue: each sealed batch is remembered under its L1 rollup
+        # tx id.  If the chain later skips that rollup (for example a deposit
+        # landed first and made the batch stale), the batch's L2 transfers go
+        # back to _pending instead of disappearing.  The blockchain calls the
+        # listener while holding its own lock, so the listener only appends to
+        # a deque; the lock-taking work happens later, in _process_dropped_rollups.
+        self._sealed_by_l1: Dict[str, Tuple[int, List[L2Transaction]]] = {}
+        self._SEALED_MAX = 256
+        self._dropped_rollups: deque = deque()
+        _add_listener = getattr(blockchain, "add_rollup_drop_listener", None)
+        if callable(_add_listener):
+            _add_listener(self._on_rollup_dropped)
+
+    # ── Rollup re-queue ───────────────────────────────────────────────────
+    def _on_rollup_dropped(self, tx_id: str) -> None:
+        """Blockchain listener: a sealed rollup was skipped on-chain.
+
+        Runs while the blockchain lock is held, so it only queues the id.
+        """
+        self._dropped_rollups.append(tx_id)
+
+    def _record_sealed(self, l1_tx_id: str, batch_id: int,
+                       applied: List[L2Transaction]) -> None:
+        with self._lock:
+            self._sealed_by_l1[l1_tx_id] = (batch_id, list(applied))
+            while len(self._sealed_by_l1) > self._SEALED_MAX:
+                del self._sealed_by_l1[next(iter(self._sealed_by_l1))]
+
+    def _process_dropped_rollups(self) -> int:
+        """Put back the L2 transfers of every sealed rollup that was skipped.
+
+        Transfers already in _pending are not duplicated.  Each transfer is
+        still checked by apply_l2_tx at the next seal, so nonce and balance
+        rules keep applying.  Returns the number of transfers re-queued.
+        """
+        requeued = 0
+        while True:
+            try:
+                tx_id = self._dropped_rollups.popleft()
+            except IndexError:
+                break
+            with self._lock:
+                record = self._sealed_by_l1.pop(tx_id, None)
+                if record is None:
+                    continue
+                batch_id, txs = record
+                pending_ids = {t.l2_tx_id for t in self._pending}
+                back = [t for t in txs if t.l2_tx_id not in pending_ids]
+                if back:
+                    self._pending = back + self._pending
+                    requeued += len(back)
+            if back:
+                log.warning(
+                    f"[SEQUENCER] rollup {tx_id[:12]} for batch {batch_id} was "
+                    f"skipped on-chain; re-queued {len(back)} L2 transfer(s)")
+                metrics.inc("l2_requeued_txs", float(len(back)))
+        return requeued
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
     def start(self) -> Tuple[bool, str]:
@@ -276,6 +334,7 @@ class Sequencer:
         all future sealing on this node.
 
         Returns None if there is nothing to seal or sealing failed."""
+        self._process_dropped_rollups()
         if not self._seal_cycle_lock.acquire(blocking=False):
             return None
         try:
@@ -463,6 +522,7 @@ class Sequencer:
                      f"backend={backend.name()}")
             # AUDIT-FIX-L4: lock intentionally still held -- caller now owns
             # it and must release via _finalize_seal() or _abandon_seal().
+            self._record_sealed(l1_tx.tx_id, batch_id, applied)
             return l1_tx, batch_id, applied
         except Exception:
             self._seal_cycle_lock.release()
@@ -532,6 +592,7 @@ class Sequencer:
             if self._stop_evt.wait(timeout=_POLL_SECS):
                 break
             try:
+                self._process_dropped_rollups()
                 if self._should_seal():
                     sealed = self._seal_one()
                     if sealed is not None:
