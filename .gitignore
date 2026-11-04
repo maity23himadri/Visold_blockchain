@@ -1,6 +1,22 @@
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 .venv/
 venv/
 .env
+.pytest_cache/
+
+# Runtime output and local node data (never commit)
+*.log
+visold_input_diagnostics.log*
+.visold*/
+account.json
+config.json
+*.db
+*.sqlite*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
