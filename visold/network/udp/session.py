@@ -27,6 +27,7 @@ import json
 import queue
 import threading
 import time
+import zlib
 from typing import TYPE_CHECKING
 
 from visold.network.udp.reliability import _UDPReassembler, _UDPWindow
@@ -40,6 +41,7 @@ from visold.network.udp.wire import (
     _UDP_FEC_GROUP,
     _UDP_FRAG_MAX,
     _UDP_FRAG_MAX_PER_GROUP,
+    _UDP_FRAG_TTL,
     _UDP_HB_INTERVAL,
     _UDP_HB_TIMEOUT,
     _UDP_PAYLOAD_MAX,
@@ -78,6 +80,7 @@ class UDPSession:
         self._window       = _UDPWindow()
         # inbound reassembly: frag_id → _UDPReassembler
         self._reassemblers: dict = {}
+        self._completed_frags: dict = {}  # frag_id -> completion monotonic ts
         self._rassem_lock  = threading.Lock()
         # inbound message queue (decoded dicts)
         self.inbound: queue.Queue = queue.Queue(maxsize=2048)
@@ -146,6 +149,8 @@ class UDPSession:
 
         This is the sole egress path for all P2P messages over UDP.
         """
+        if self._rtx_stop.is_set():
+            raise ConnectionError("UDP session is closed")
         frag_id  = self._next_frag_id()
         chunks   = [data[i:i + _UDP_PAYLOAD_MAX]
                     for i in range(0, max(len(data), 1), _UDP_PAYLOAD_MAX)]
@@ -162,11 +167,13 @@ class UDPSession:
             flags   = _F_FRAG | (_F_LAST if is_last else 0)
 
             # --- Sliding window back-pressure ---
-            # Block until there is room in the window.  This is the
-            # rate-limiter: a fast sender is throttled here instead of
-            # flooding the receiver's UDP buffer.
+            # Block until there is room in the window or the session closes.
             while self._window.is_full():
-                time.sleep(_UDP_WINDOW_SLEEP)
+                if self._rtx_stop.wait(_UDP_WINDOW_SLEEP):
+                    raise ConnectionError("UDP session is closed")
+
+            if self._rtx_stop.is_set():
+                raise ConnectionError("UDP session is closed")
 
             seq = self._next_seq()
             pkt = _udp_pack(flags, seq, frag_id, off, chunk)
@@ -227,9 +234,16 @@ class UDPSession:
         if frag_off < 0 or frag_off >= _UDP_FRAG_MAX_PER_GROUP:
             return
 
+        if self._is_completed_frag(frag_id):
+            self.send_ack(seq)
+            return
+
         if flags & _F_FEC:
             self._handle_fec(frag_id, frag_off, payload)
             self.send_ack(seq)
+            return
+
+        if not (flags & _F_FRAG):
             return
 
         is_last = bool(flags & _F_LAST)
@@ -241,6 +255,8 @@ class UDPSession:
                 return
         # Duplicates are ACKed so ordinary retransmission can terminate.
         self.send_ack(seq)
+        if not r.complete():
+            r.try_fec_recover()
         self._try_deliver(frag_id, r)
 
     def _get_or_create_reassembler(self, frag_id: int) -> '_UDPReassembler':
@@ -267,19 +283,74 @@ class UDPSession:
             r.try_fec_recover()
         self._try_deliver(frag_id, r)
 
+    def _is_completed_frag(self, frag_id: int) -> bool:
+        now = time.monotonic()
+        with self._rassem_lock:
+            ts = self._completed_frags.get(frag_id)
+            if ts is None:
+                return False
+            if now - ts > _UDP_FRAG_TTL:
+                del self._completed_frags[frag_id]
+                return False
+            return True
+
+    def _record_completed_frag_locked(self, frag_id: int):
+        """Record a delivered frag_id under self._rassem_lock with bounded size."""
+        self._completed_frags[frag_id] = time.monotonic()
+        if len(self._completed_frags) > _UDP_FRAG_MAX * 4:
+            oldest = min(self._completed_frags, key=self._completed_frags.get)
+            del self._completed_frags[oldest]
+
     def _try_deliver(self, frag_id: int, r: '_UDPReassembler'):
         """If reassembly is complete, decode the message and enqueue it."""
         if not r.complete():
             return
         raw = r.reassemble()
+        fec_padded = getattr(r, "fec_recovered_last", False)
         with self._rassem_lock:
             self._reassemblers.pop(frag_id, None)
+            self._record_completed_frag_locked(frag_id)
         try:
-            decompressed = _udp_decompress(raw)
+            if fec_padded:
+                decompressed = self._decompress_fec_padded(raw)
+            else:
+                decompressed = _udp_decompress(raw)
             msg = json.loads(decompressed.decode())
             self.inbound.put_nowait(msg)
         except Exception:
             pass   # malformed or oversized — silently drop
+
+    @staticmethod
+    def _decompress_fec_padded(raw: bytes) -> bytes:
+        """Decompress a message whose last fragment was FEC-recovered and may
+        carry trailing 0x00 XOR-padding bytes."""
+        _MAX = 32 * 1024 * 1024
+        try:
+            dec = zlib.decompressobj(wbits=15)
+            out = bytearray()
+            rem = raw
+            while rem:
+                allowance = _MAX - len(out) + 1
+                if allowance <= 0:
+                    raise ValueError("decompressed output exceeds configured limit")
+                out.extend(dec.decompress(rem, allowance))
+                if len(out) > _MAX:
+                    raise ValueError("decompressed output exceeds configured limit")
+                rem = dec.unconsumed_tail
+                if not rem:
+                    break
+            if not dec.eof:
+                allowance = _MAX - len(out) + 1
+                if allowance <= 0:
+                    raise ValueError("decompressed output exceeds configured limit")
+                out.extend(dec.flush(allowance))
+                if len(out) > _MAX:
+                    raise ValueError("decompressed output exceeds configured limit")
+            if dec.eof and not dec.unused_data.strip(b'\x00'):
+                return bytes(out)
+        except (zlib.error, ValueError):
+            pass
+        return raw.rstrip(b'\x00')
 
     # ── Retransmit background loop ────────────────────────────────────────
     def _retransmit_loop(self):
@@ -301,12 +372,19 @@ class UDPSession:
                 if now - self._last_hb_sent >= _UDP_HB_INTERVAL:
                     self.send_heartbeat()
 
-                # Evict stale reassembly groups
+                # Evict stale reassembly groups and expired dedup entries
+                now = time.monotonic()
                 with self._rassem_lock:
                     stale = [fid for fid, r in self._reassemblers.items()
                              if r.is_expired()]
                     for fid in stale:
                         del self._reassemblers[fid]
+                    expired_done = [
+                        fid for fid, ts in self._completed_frags.items()
+                        if now - ts > _UDP_FRAG_TTL
+                    ]
+                    for fid in expired_done:
+                        del self._completed_frags[fid]
             except Exception:
                 pass
 

@@ -145,22 +145,30 @@ def patch_decision_engine(decision_engine, signal_window, freq_tracker,
                     f"{blk_count} block(s)")
 
         # Step 7: Economic gate for RESTRICTED/CRITICAL
+        # Exempt critical consensus/supply invariants (double_sign,
+        # supply_inflation) matching DecisionEngine._should_suppress().
         econ_note = None
         action_tags = _build_action_tags(tier, report)
+        kind_val = getattr(report.kind, "value", str(report.kind))
         if tier in ("RESTRICTED", "CRITICAL"):
-            freeze_dur = 1800.0 if tier == "CRITICAL" else 600.0
-            should_act, dmg, cost, econ_note = econ_simulator.simulate(
-                attacker_ev=attacker_ev,
-                action_tags=action_tags,
-                affected_addr=report.affected_addr,
-                freeze_duration_secs=freeze_dur,
-            )
-            if not should_act:
-                log.warning(
-                    f"[DEv2] Econ gate blocked {tier} action for "
-                    f"{report.kind.value}: {econ_note}")
-                tier = "SOFT"
-                action_tags = _build_action_tags(tier, report)
+            if kind_val in ("double_sign", "supply_inflation"):
+                econ_note = (
+                    f"Exempt from economic gate ({kind_val} invariant violation)"
+                )
+            else:
+                freeze_dur = 1800.0 if tier == "CRITICAL" else 600.0
+                should_act, dmg, cost, econ_note = econ_simulator.simulate(
+                    attacker_ev=attacker_ev,
+                    action_tags=action_tags,
+                    affected_addr=report.affected_addr,
+                    freeze_duration_secs=freeze_dur,
+                )
+                if not should_act:
+                    log.warning(
+                        f"[DEv2] Econ gate blocked {tier} action for "
+                        f"{report.kind.value}: {econ_note}")
+                    tier = "SOFT"
+                    action_tags = _build_action_tags(tier, report)
 
         # Step 8: Suppress logic — low-confidence stat noise
         suppress = False
@@ -297,7 +305,15 @@ class SafeActionValidator:
         allowed = []
         stripped = []
         kind_str = getattr(decision.report.kind, "value", "")
-        tier = decision.action_stage
+        tier = getattr(
+            decision,
+            "action_stage",
+            getattr(
+                getattr(decision, "severity", None),
+                "name",
+                "UNKNOWN",
+            ),
+        )
 
         for tag in action_tags:
             # R1: Never allow automatic rollback
@@ -429,7 +445,9 @@ def _notify_governance_required(decision, hal) -> None:
     try:
         payload = {
             "type": "SHBS_GOVERNANCE_REQUIRED",
-            "risk_score": getattr(decision.risk_score, "value", None),
+            "risk_score": getattr(
+                getattr(decision, "risk_score", None), "value", None
+            ),
             "kind": decision.report.kind.value,
             "evidence_summary": {
                 k: v for k, v in list(decision.report.evidence.items())[:5]
@@ -598,6 +616,7 @@ def patch_rollback_executor(rollback_executor,
             while not (status.get("auto_approve")
                        or status["reached"] or status["fast_track"]):
                 if time.time() >= deadline:
+                    confirmation.close()
                     rollback_executor._preview_confirmations.pop(confirm_id, None)
                     log.error(
                         f"[RBv2] Rollback ABORTED: preview confirmation "
@@ -608,6 +627,7 @@ def patch_rollback_executor(rollback_executor,
                 time.sleep(0.5)
                 status = confirmation.quorum_status()
 
+            confirmation.close()
             rollback_executor._preview_confirmations.pop(confirm_id, None)
             log.warning(
                 f"[RBv2] Preview CONFIRMED: {status['approve_count']}/"
@@ -723,8 +743,8 @@ def _dry_run_preview(
 
     try:
         for h in range(current_tip, target_height, -1):
-            block_dict = executor._storage.get_block(h)
-            if block_dict is None:
+            block_obj = executor._storage.get_block(h)
+            if block_obj is None:
                 return RollbackPreview(
                     target_height=target_height,
                     current_tip=current_tip,
@@ -737,12 +757,22 @@ def _dry_run_preview(
                     reason=f"Block {h} missing from storage",
                 )
 
-            for tx in block_dict.get("transactions", []):
-                if not isinstance(tx, dict):
+            txs = (
+                block_obj.get("transactions", [])
+                if isinstance(block_obj, dict)
+                else (getattr(block_obj, "transactions", None) or [])
+            )
+            for tx in txs:
+                if isinstance(tx, dict):
+                    sender   = tx.get("sender", "")
+                    receiver = tx.get("receiver", "")
+                    amount   = tx.get("amount", 0)
+                elif hasattr(tx, "sender") and hasattr(tx, "receiver"):
+                    sender   = getattr(tx, "sender", "")
+                    receiver = getattr(tx, "receiver", "")
+                    amount   = getattr(tx, "amount", 0)
+                else:
                     continue
-                sender   = tx.get("sender", "")
-                receiver = tx.get("receiver", "")
-                amount   = tx.get("amount", 0)
                 if sender == "COINBASE":
                     continue
 
@@ -929,12 +959,8 @@ def patch_anomaly_detection_engine(ade,
         # Step 4: Standard dedup
         filtered = ade._dedup(all_anomalies)
 
-        # Step 5: Feed into signal window and freq tracker
-        for report in filtered:
-            signal_window.add_signal(report)
-            freq_tracker.record(report.kind.value, report.affected_addr or "")
-
-        # Step 6: Notify listeners
+        # Step 5: Notify listeners (_on_anomaly -> _hardened_decide records
+        # into signal_window and freq_tracker exactly once per report)
         for report in filtered:
             for listener in ade._listeners:
                 try:

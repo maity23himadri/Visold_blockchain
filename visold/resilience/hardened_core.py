@@ -26,6 +26,7 @@ Origin: visold_vsd_.py L41881-41895, L41900-41901, L41904-41907, L41910-41929, L
 
 import contextlib
 import functools
+import math
 import os
 import resource
 import sys
@@ -36,7 +37,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from visold.kernel.compat import _NTPLIB_AVAILABLE, _ntplib
 from visold.kernel.logging_setup import log
-from visold.kernel.config import BLOCK_ALREADY_APPLIED_MSG
+from visold.kernel.config import BLOCK_ALREADY_APPLIED_MSG, Config
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -72,7 +73,7 @@ _HC_MAX_TIMESTAMP_DRIFT_SEC: int = 7_200
 _HC_MAX_BLOCK_TX_COUNT: int      = 10_000
 
 
-_HC_MAX_RECURSION_DEPTH: int     = 64
+_HC_MAX_RECURSION_DEPTH: int     = getattr(Config, "VVM_MAX_CALL_DEPTH", 1024)
 
 
 _HC_MAX_HEAP_MB: int             = 2_048
@@ -186,22 +187,33 @@ class _HardenedCBSingleton:
     _corruption_count: int
     _corruption_timestamps: List[float]
 
+    @staticmethod
+    def _init_state(inst: '_HardenedCBSingleton') -> None:
+        inst._mode = _HardenedSystemMode.NORMAL  # type: ignore[misc]
+        inst._mode_lock = threading.RLock()  # type: ignore[misc]
+        inst._subsystems = {}  # type: ignore[misc]
+        inst._mode_change_callbacks = []  # type: ignore[misc]
+        inst._corruption_count = 0  # type: ignore[misc]
+        # FIX-4: rolling list of monotonic timestamps for corruption
+        # events within the active window.  Replaces the bare counter
+        # so stale events age out and don't cause spurious shutdown.
+        inst._corruption_timestamps = []  # type: ignore[misc]
+        inst._read_only_since = 0.0  # type: ignore[misc]
+
     def __new__(cls) -> '_HardenedCBSingleton':
         with cls._class_lock:
             if cls._instance is None:
                 inst = object.__new__(cls)
-                inst._mode = _HardenedSystemMode.NORMAL  # type: ignore[misc]
-                inst._mode_lock = threading.RLock()  # type: ignore[misc]
-                inst._subsystems: Dict[str, _HCCircuitBreakerRecord] = {}  # type: ignore[misc]
-                inst._mode_change_callbacks: List = []  # type: ignore[misc]
-                inst._corruption_count: int = 0  # type: ignore[misc]
-                # FIX-4: rolling list of monotonic timestamps for corruption
-                # events within the active window.  Replaces the bare counter
-                # so stale events age out and don't cause spurious shutdown.
-                inst._corruption_timestamps: List[float] = []  # type: ignore[misc]
-                inst._read_only_since: float = 0.0  # type: ignore[misc]
+                cls._init_state(inst)
                 cls._instance = inst
             return cls._instance
+
+    @classmethod
+    def new_isolated(cls) -> '_HardenedCBSingleton':
+        """Create an isolated circuit-breaker instance for a single node."""
+        inst = object.__new__(cls)
+        cls._init_state(inst)
+        return inst
 
     @property
     def mode(self) -> _HardenedSystemMode:
@@ -361,6 +373,11 @@ class _HardenedCBSingleton:
     def _transition(self, new_mode: _HardenedSystemMode, reason: str) -> None:
         if self._mode == new_mode:
             return
+        if self._mode == _HardenedSystemMode.SAFE_SHUTDOWN:
+            log.warning(
+                "[HCB] Ignoring transition %s → %s (%s): SAFE_SHUTDOWN is terminal",
+                self._mode.value, new_mode.value, reason)
+            return
         old_mode = self._mode
         self._mode = new_mode
         if new_mode == _HardenedSystemMode.READ_ONLY:
@@ -369,7 +386,7 @@ class _HardenedCBSingleton:
                      old_mode.value, new_mode.value, reason)
         # Write flag file for external watchdogs
         try:
-            flag_dir = os.path.expanduser("~/.visold")
+            flag_dir = getattr(Config, "DATA_DIR", "") or os.path.expanduser("~/.visold")
             os.makedirs(flag_dir, exist_ok=True)
             flag_path = os.path.join(flag_dir, f"PANIC_{new_mode.value}.flag")
             with open(flag_path, "w") as _f:
@@ -402,6 +419,11 @@ class _NTPClock:
         self._alive: bool        = True
 
     def start(self) -> None:
+        with self._sync_lock:
+            if self._sync_thread is not None and self._sync_thread.is_alive():
+                self._alive = True
+                return
+            self._alive = True
         self._sync_now()
         self._sync_thread = threading.Thread(
             target=self._bg_sync_loop, daemon=True, name="ntp-clock-sync")
@@ -511,10 +533,13 @@ class SystemInvariantGate:
                 f"> MAX={_HC_MAX_SATOSHI_SUPPLY}. Context: {context}")
 
     @staticmethod
-    def assert_timestamp_valid(timestamp_unix, context: str = "") -> None:
-        if not isinstance(timestamp_unix, (int, float)):
+    def assert_timestamp_valid(timestamp_unix, context: str = "",
+                               allow_past_sync: bool = False) -> None:
+        if (isinstance(timestamp_unix, bool)
+                or not isinstance(timestamp_unix, (int, float))
+                or not math.isfinite(float(timestamp_unix))):
             raise TimestampAnomalyError(
-                f"[INV] Timestamp is not numeric: {timestamp_unix!r}. "
+                f"[INV] Timestamp is not a finite number: {timestamp_unix!r}. "
                 f"Context: {context}")
         ts = int(timestamp_unix)
         if ts < _HC_MIN_TIMESTAMP_UNIX:
@@ -523,7 +548,13 @@ class SystemInvariantGate:
                 f"Context: {context}")
         now_adjusted = _hc_ntp_clock.now()
         drift = ts - now_adjusted
-        if abs(drift) > _HC_MAX_TIMESTAMP_DRIFT_SEC:
+        if allow_past_sync:
+            if drift > _HC_MAX_TIMESTAMP_DRIFT_SEC:
+                raise TimestampAnomalyError(
+                    f"[INV] Timestamp drift too large: ts={ts} "
+                    f"ntp_now={now_adjusted} drift={drift:+}s "
+                    f"(max ±{_HC_MAX_TIMESTAMP_DRIFT_SEC}s). Context: {context}")
+        elif abs(drift) > _HC_MAX_TIMESTAMP_DRIFT_SEC:
             raise TimestampAnomalyError(
                 f"[INV] Timestamp drift too large: ts={ts} "
                 f"ntp_now={now_adjusted} drift={drift:+}s "
@@ -569,10 +600,11 @@ class SystemInvariantGate:
 
     @staticmethod
     def assert_tx_id_length(tx_id: str, context: str = "") -> None:
-        if len(tx_id) != 64:
+        if not isinstance(tx_id, str) or len(tx_id) != 64:
+            tx_len = len(tx_id) if isinstance(tx_id, str) else type(tx_id).__name__
             raise ImmediateAbort(
-                f"[INV] tx_id invalid length {len(tx_id)} "
-                f"(expected 64 hex chars). tx_id={tx_id[:32]}... Context: {context}")
+                f"[INV] tx_id invalid length {tx_len} "
+                f"(expected 64 hex chars). tx_id={repr(tx_id)[:32]}... Context: {context}")
 
     @staticmethod
     def assert_conservation(storage: Any, context: str = "") -> None:
@@ -857,7 +889,7 @@ class GracefulDegradation:
 
 
 # ── Hardened apply_block factory ──────────────────────────────────────────────
-def _make_hardened_apply_block(original_apply_block):
+def _make_hardened_apply_block(original_apply_block, panic_cb=None):
     """
     Wraps Blockchain.apply_block() with all hardening layers:
       Req-1 Invariant Safety Gate    — pre-conditions before any write
@@ -867,11 +899,13 @@ def _make_hardened_apply_block(original_apply_block):
       Req-5 Resource Cap             — recursion + memory pressure check
       Req-6 Graceful Degradation     — secondary component isolation
     """
+    cb = panic_cb if panic_cb is not None else _hc_panic_cb
+
     @functools.wraps(original_apply_block)
-    def hardened_apply_block(self_bc, block) -> Tuple[bool, str]:
+    def hardened_apply_block(self_bc, block, *args, **kwargs) -> Tuple[bool, str]:
         # Gate 0: Hardened CB write gate
         try:
-            _hc_panic_cb.assert_writable(f"apply_block idx={block.index}")
+            cb.assert_writable(f"apply_block idx={block.index}")
         except ImmediateAbort as e:
             log.warning("[HAB] apply_block blocked by hardened CB: %s", e)
             return False, str(e)
@@ -882,49 +916,39 @@ def _make_hardened_apply_block(original_apply_block):
         _local_state_check = False
         # Gate 2: Block pre-conditions (all checked before any write)
         try:
-            # Timestamp drift check — only for genuinely live blocks.
-            #
-            # BUG-FIX (sync-fix-6): The old logic treated ANY block whose
-            # index > our current tip as 'live', including ALL blocks received
-            # during initial sync on a fresh node (tip = -1 or 0).
-            # Scenario: Node B (fresh, tip=-1) syncs from Node A which mined
-            # 9 blocks 3 hours ago.  Block 1 arrives: index(1) > max(0,-1)=0
-            # → flagged as live → timestamp check fires → drift = 3 hours >
-            # 2-hour limit → TimestampAnomalyError → apply_block fails →
-            # sync impossible.
-            #
-            # Correct definition of 'live block':
-            #   A block is live only when its timestamp is AHEAD of (or very
-            #   close to) now — i.e. it was just mined.  A block whose
-            #   timestamp is already in the past (even by many hours) is
-            #   historical/sync data and must never be rejected for drift.
-            #
-            # New rule:
-            #   - Always skip genesis (index == 0).
-            #   - For all other blocks: only run the drift check if the
-            #     block's timestamp is >= (now - 2*max_drift).  Blocks
-            #     clearly in the past are historical sync data; blocks
-            #     at or ahead of now are live and must be checked.
-            #   - Future-dated blocks (drift > +max_drift) are still
-            #     rejected exactly as before.
             _our_tip = self_bc.storage.chain_height()
             _now_ts  = _hc_ntp_clock.now()
-            _is_past_block = (int(block.timestamp) < _now_ts - _HC_MAX_TIMESTAMP_DRIFT_SEC)
-            if block.index != 0 and not _is_past_block:
+            if block.index != 0:
+                _ts_raw = getattr(block, "timestamp", None)
+                if (isinstance(_ts_raw, bool)
+                        or not isinstance(_ts_raw, (int, float))
+                        or not math.isfinite(float(_ts_raw))):
+                    raise TimestampAnomalyError(
+                        f"[INV] Timestamp is not a finite number: {_ts_raw!r}. "
+                        f"Context: apply_block idx={block.index}")
+                _is_past_block = (int(_ts_raw) < _now_ts - _HC_MAX_TIMESTAMP_DRIFT_SEC)
                 _hc_inv.assert_timestamp_valid(
-                    block.timestamp,
-                    context=f"apply_block idx={block.index}")
+                    _ts_raw,
+                    context=f"apply_block idx={block.index}",
+                    allow_past_sync=_is_past_block)
+            _txs = getattr(block, "transactions", None)
+            if not isinstance(_txs, (list, tuple)):
+                raise ImmediateAbort(
+                    f"[INV] Invalid transactions container: {type(_txs).__name__}. "
+                    f"Context: apply_block idx={block.index}")
             _hc_inv.assert_tx_count_bounded(
-                len(block.transactions),
+                len(_txs),
                 context=f"apply_block idx={block.index}")
-            for tx in block.transactions:
+            for tx in _txs:
                 if getattr(tx, 'sender', '') == "COINBASE":
                     continue
+                _tx_id = getattr(tx, "tx_id", None)
+                _tx_id_preview = _tx_id[:16] if isinstance(_tx_id, str) else repr(_tx_id)[:16]
                 _hc_inv.assert_tx_id_length(
-                    tx.tx_id,
-                    context=f"block={block.index} tx={tx.tx_id[:16]}")
+                    _tx_id,
+                    context=f"block={block.index} tx={_tx_id_preview}")
             _local_state_check = True
-            for tx in block.transactions:
+            for tx in _txs:
                 if getattr(tx, 'sender', '') == "COINBASE":
                     continue
                 sender_sat = self_bc.storage.get_balance_sat(tx.sender)
@@ -941,38 +965,64 @@ def _make_hardened_apply_block(original_apply_block):
                 return False, f"Pre-condition violated: {pre_err}"
             log.error("[HAB] PRE-CONDITION FAILURE for block %d: %s",
                       block.index, pre_err)
-            _hc_panic_cb.record_failure("apply_block_pre", pre_err,
-                                        corruption_level=False)
+            cb.record_failure("apply_block_pre", pre_err,
+                              corruption_level=False)
             return False, f"Pre-condition violated: {pre_err}"
 
         # VSA-05: a passing precheck clears only its own failure counter, so valid
         # blocks interleaved with rejected ones cannot leave the counter armed.
-        _hc_panic_cb.record_success("apply_block_pre")
+        cb.record_success("apply_block_pre")
+
+        pre_height = None
+        try:
+            pre_height = self_bc.storage.chain_height()
+        except Exception:
+            pass
 
         # Gate 3: Delegate to original implementation
         try:
-            ok, msg = original_apply_block(self_bc, block)
+            ok, msg = original_apply_block(self_bc, block, *args, **kwargs)
         except (ImmediateAbort, InvariantViolation, StateRootMismatch) as abort:
-            _hc_panic_cb.record_failure("apply_block_exec", abort,
-                                        corruption_level=True)
+            cb.record_failure("apply_block_exec", abort,
+                              corruption_level=True)
             return False, f"Invariant abort during apply: {abort}"
         except Exception as exc:
-            _hc_panic_cb.record_failure("apply_block_exec", exc,
-                                        corruption_level=False)
+            cb.record_failure("apply_block_exec", exc,
+                              corruption_level=False)
             log.exception("[HAB] Unexpected exception in apply_block idx=%d",
                           block.index)
             return False, f"Unexpected error: {exc}"
 
         if not ok:
-            _hc_panic_cb.record_success("apply_block_exec")
+            cb.record_success("apply_block_exec")
             return False, msg
+
+        def _rollback_post_apply():
+            if (block.index > 0
+                    and msg not in (BLOCK_ALREADY_APPLIED_MSG,
+                                    "Genesis already present (idempotent)")):
+                try:
+                    if pre_height is not None and hasattr(self_bc, "rollback"):
+                        rb_res = self_bc.rollback(pre_height)
+                        if isinstance(rb_res, tuple) and len(rb_res) >= 2 and not rb_res[0]:
+                            log.warning("[HAB] rollback(%s) returned False: %s",
+                                        pre_height, rb_res[1])
+                    elif hasattr(self_bc, "_rollback_block"):
+                        with self_bc._lock:
+                            self_bc._rollback_block(block)
+                except Exception as rb_err:
+                    log.critical("[HAB] Rollback after post-commit failure failed for block %d: %s",
+                                 block.index, rb_err)
+                    if hasattr(self_bc, "_mark_critical_recovery"):
+                        self_bc._mark_critical_recovery(
+                            f"post-commit gate rollback failed at #{block.index}: {rb_err}")
 
         # Gate 4: Post-apply state root verification
         try:
             computed_root = (self_bc.storage.compute_state_root()
                              if hasattr(self_bc.storage, 'compute_state_root') else "")
             expected_root = getattr(block, "state_root", "")
-            if msg == BLOCK_ALREADY_APPLIED_MSG:
+            if msg in (BLOCK_ALREADY_APPLIED_MSG, "Genesis already present (idempotent)"):
                 # VSA-04: an idempotent duplicate applied nothing new; its historical
                 # root is not comparable with the current tip.
                 expected_root = ""
@@ -980,30 +1030,41 @@ def _make_hardened_apply_block(original_apply_block):
                 _hc_inv.assert_state_root_matches(
                     expected_root, computed_root, block.index)
         except StateRootMismatch as srm:
-            log.critical("[HAB] STATE ROOT MISMATCH — block %d rejected. %s",
+            log.critical("[HAB] STATE ROOT MISMATCH — rolling back block %d. %s",
                          block.index, srm)
+            _rollback_post_apply()
+            if cb is not _hc_panic_cb:
+                cb.record_failure("state_root_verify", srm, corruption_level=True)
             return False, str(srm)
 
         # Gate 5: Periodic conservation check (every 100 blocks)
-        if block.index % 100 == 0:
+        if block.index % 100 == 0 and msg not in (
+                BLOCK_ALREADY_APPLIED_MSG, "Genesis already present (idempotent)"):
             try:
                 _hc_inv.assert_conservation(
                     self_bc.storage,
                     context=f"block={block.index} periodic")
             except ConservationViolation as cv:
+                log.critical("[HAB] CONSERVATION VIOLATION — rolling back block %d. %s",
+                             block.index, cv)
+                _rollback_post_apply()
+                if cb is not _hc_panic_cb:
+                    cb.record_failure("conservation_check", cv, corruption_level=True)
                 return False, str(cv)
 
-        _hc_panic_cb.record_success("apply_block_exec")
+        cb.record_success("apply_block_exec")
         return True, msg
 
     return hardened_apply_block
 
 
 # ── Hardened debit_sat / credit_sat factories ─────────────────────────────────
-def _make_hardened_debit_sat(original_debit_sat):
+def _make_hardened_debit_sat(original_debit_sat, panic_cb=None):
+    cb = panic_cb if panic_cb is not None else _hc_panic_cb
+
     @functools.wraps(original_debit_sat)
     def hardened_debit_sat(self_storage, address: str, amount_sat: int):
-        _hc_panic_cb.assert_writable(f"debit_sat({address[:16]}, {amount_sat})")
+        cb.assert_writable(f"debit_sat({address[:16]}, {amount_sat})")
         current = self_storage._get_balance_satoshi(address)
         _hc_inv.assert_balance_non_negative(address, current, context="pre-debit")
         if amount_sat < 0:
@@ -1014,7 +1075,7 @@ def _make_hardened_debit_sat(original_debit_sat):
         result = original_debit_sat(self_storage, address, amount_sat)
         post = self_storage._get_balance_satoshi(address)
         if post < 0:
-            _hc_panic_cb.record_failure(
+            cb.record_failure(
                 "post_debit_negative",
                 InvariantViolation(
                     f"Post-debit balance negative: {address[:16]}={post}"),
@@ -1026,10 +1087,12 @@ def _make_hardened_debit_sat(original_debit_sat):
     return hardened_debit_sat
 
 
-def _make_hardened_credit_sat(original_credit_sat):
+def _make_hardened_credit_sat(original_credit_sat, panic_cb=None):
+    cb = panic_cb if panic_cb is not None else _hc_panic_cb
+
     @functools.wraps(original_credit_sat)
     def hardened_credit_sat(self_storage, address: str, amount_sat: int):
-        _hc_panic_cb.assert_writable(f"credit_sat({address[:16]}, {amount_sat})")
+        cb.assert_writable(f"credit_sat({address[:16]}, {amount_sat})")
         _hc_inv.assert_credit_safe(address, amount_sat, context="pre-credit")
         return original_credit_sat(self_storage, address, amount_sat)
     return hardened_credit_sat
@@ -1039,10 +1102,17 @@ def _make_hardened_credit_sat(original_credit_sat):
 def _make_hardened_vvm_internal_call(original_internal_call):
     @functools.wraps(original_internal_call)
     def hardened_internal_call(self_vvm, *args, **kwargs):
-        caller = getattr(self_vvm, "_current_contract", "?")
-        callee = args[0] if args else "?"
-        with ResourceCap.call_frame(str(caller), str(callee)):
-            return original_internal_call(self_vvm, *args, **kwargs)
+        caller_frame = kwargs.get("caller_frame")
+        caller = getattr(caller_frame, "address", None) or getattr(
+            self_vvm, "_current_contract", "?"
+        )
+        callee = kwargs.get("callee_addr") or (args[0] if args else "?")
+        try:
+            with ResourceCap.call_frame(str(caller), str(callee)):
+                return original_internal_call(self_vvm, *args, **kwargs)
+        except RecursionLimitExceeded as exc:
+            log.warning("[HARDENED] %s", exc)
+            return False, b""
     return hardened_internal_call
 
 
@@ -1064,7 +1134,8 @@ def apply_hardened_overlay(blockchain_instance,
                             storage_instance=None,
                             vvm_engine_instance=None,
                             event_index_instance=None,
-                            start_ntp_clock: bool = True) -> None:
+                            start_ntp_clock: bool = True,
+                            panic_cb=None):
     """
     Inject all hardening layers onto live instances.
 
@@ -1093,6 +1164,8 @@ def apply_hardened_overlay(blockchain_instance,
             log.warning("[HARDENED] NTP clock failed to start (%s); "
                         "falling back to system clock.", e)
 
+    cb = panic_cb if panic_cb is not None else _HardenedCBSingleton.new_isolated()
+
     # 2. Resolve instances
     storage = storage_instance or getattr(blockchain_instance, "storage", None)
     vvm     = vvm_engine_instance or getattr(
@@ -1100,9 +1173,13 @@ def apply_hardened_overlay(blockchain_instance,
     ei      = event_index_instance or getattr(
         blockchain_instance, "_event_index", None)
 
+    blockchain_instance._hc_panic_cb = cb
+    if storage is not None:
+        storage._hc_panic_cb = cb
+
     # 3. Patch Blockchain.apply_block
     original_apply = blockchain_instance.__class__.apply_block
-    hardened_apply = _make_hardened_apply_block(original_apply)
+    hardened_apply = _make_hardened_apply_block(original_apply, panic_cb=cb)
     blockchain_instance.apply_block = _types.MethodType(
         hardened_apply, blockchain_instance)
     log.info("[HARDENED] apply_block patched with full invariant safety gates.")
@@ -1118,9 +1195,9 @@ def apply_hardened_overlay(blockchain_instance,
             orig_debit  = storage.__class__.debit_sat
             orig_credit = storage.__class__.credit_sat
             storage.debit_sat  = _types.MethodType(
-                _make_hardened_debit_sat(orig_debit),  storage)
+                _make_hardened_debit_sat(orig_debit, panic_cb=cb), storage)
             storage.credit_sat = _types.MethodType(
-                _make_hardened_credit_sat(orig_credit), storage)
+                _make_hardened_credit_sat(orig_credit, panic_cb=cb), storage)
             log.info("[HARDENED] debit_sat / credit_sat patched with "
                      "pre-condition invariant guards.")
         else:
@@ -1146,11 +1223,11 @@ def apply_hardened_overlay(blockchain_instance,
     # 8. Expose hardening status API on blockchain instance
     def _hardened_status() -> dict:
         return {
-            "circuit_breaker_mode":     _hc_panic_cb.mode.value,
+            "circuit_breaker_mode":     cb.mode.value,
             "ntp_offset_sec":           _hc_ntp_clock.offset_sec,
             "subsystem_failure_counts": {
                 k: v.failure_count
-                for k, v in _hc_panic_cb._subsystems.items()
+                for k, v in cb._subsystems.items()
             },
             "degraded_subsystems": {
                 k: {"failures": c, "last_ts": ts}
@@ -1161,3 +1238,4 @@ def apply_hardened_overlay(blockchain_instance,
     blockchain_instance.hardened_status = _hardened_status
     log.info("[HARDENED] Overlay fully applied. "
              "Node operating under hardened invariant enforcement.")
+    return cb

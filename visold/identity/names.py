@@ -143,10 +143,24 @@ class IdentitySystem:
         fee_vsd = from_satoshi(int(getattr(Config, "MIN_TX_FEE_SAT", 1000)))
         sender = self.wallet.address
         try:
-            chain_nonce = self.storage.get_nonce(sender)
-            pending_count = len(
-                self.blockchain.mempool._pending_nonces.get(sender, set()))
-            nonce = chain_nonce + pending_count
+            mempool = self.blockchain.mempool
+            if hasattr(mempool, "next_nonce"):
+                nonce = mempool.next_nonce(sender)
+            else:
+                lock = getattr(mempool, "_lock", None)
+                if lock is not None:
+                    with lock:
+                        nonce = self.storage.get_nonce(sender)
+                        pending = mempool._pending_nonces.get(sender)
+                        if pending:
+                            while nonce in pending:
+                                nonce += 1
+                else:
+                    nonce = self.storage.get_nonce(sender)
+                    pending = mempool._pending_nonces.get(sender)
+                    if pending:
+                        while nonce in pending:
+                            nonce += 1
         except Exception:
             nonce = 0
         tx = Transaction(

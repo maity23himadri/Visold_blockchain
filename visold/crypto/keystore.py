@@ -67,6 +67,17 @@ _ARGON2_HASH_LEN     = 32
 
 _ARGON2_KDF_TAG      = f"argon2id-t{_ARGON2_TIME_COST}-m{_ARGON2_MEMORY_COST}-p{_ARGON2_PARALLELISM}"
 
+_ARGON2_MIN_TIME_COST   = 1
+_ARGON2_MAX_TIME_COST   = 64
+_ARGON2_MIN_MEMORY_COST = 8192      # 8 MiB floor
+_ARGON2_MAX_MEMORY_COST = 1_048_576 # 1 GiB cap
+_ARGON2_MIN_PARALLELISM = 1
+_ARGON2_MAX_PARALLELISM = 64
+
+_PBKDF2_DEFAULT_ITERS   = 260_000
+_PBKDF2_MIN_ITERS       = 100_000
+_PBKDF2_MAX_ITERS       = 10_000_000
+
 
 # ── 2G. AES-256-CBC encrypted keystore ───────────────────────────────────────
 def _derive_key(password: str, salt: bytes) -> bytes:
@@ -110,8 +121,10 @@ def _pkcs7_pad(data: bytes, block_size: int = 16) -> bytes:
 
 
 def _pkcs7_unpad(data: bytes) -> bytes:
+    if not data or len(data) % 16 != 0:
+        raise ValueError("Invalid PKCS7 padding")
     pad_len = data[-1]
-    if pad_len == 0 or pad_len > 16:
+    if pad_len == 0 or pad_len > 16 or pad_len > len(data):
         raise ValueError("Invalid PKCS7 padding")
     # BUG-FIX: original code only checked the last byte for length.  PKCS#7
     # requires ALL padding bytes to equal pad_len.  Skipping this verification
@@ -121,11 +134,12 @@ def _pkcs7_unpad(data: bytes) -> bytes:
     return data[:-pad_len]
 
 
-def keystore_encrypt(priv_hex: str, password: str) -> dict:
+def keystore_encrypt(priv_hex: str, password: str, aad: bytes = b"") -> dict:
     """
     Encrypt private key hex with AES-256-GCM (authenticated encryption).
     GCM provides both confidentiality AND integrity — any tampering of the
-    ciphertext will cause decryption to fail with an authentication error.
+    ciphertext (or optional AAD) will cause decryption to fail with an
+    authentication error.
     Returns a JSON-serialisable dict.
     """
     salt      = secrets.token_bytes(32)
@@ -134,6 +148,8 @@ def keystore_encrypt(priv_hex: str, password: str) -> dict:
     plaintext = priv_hex.encode()
     cipher    = Cipher(algorithms.AES(key), modes.GCM(nonce), backend=default_backend())
     enc       = cipher.encryptor()
+    if aad:
+        enc.authenticate_additional_data(aad)
     ct        = enc.update(plaintext) + enc.finalize()
     tag       = enc.tag                  # 128-bit GCM authentication tag
     # Store the exact KDF tag so keystore_decrypt can reproduce the derivation
@@ -149,7 +165,7 @@ def keystore_encrypt(priv_hex: str, password: str) -> dict:
     }
 
 
-def keystore_decrypt(ks: dict, password: str) -> str:
+def keystore_decrypt(ks: dict, password: str, aad: bytes = b"") -> str:
     """
     Decrypt AES-256-GCM keystore.
     Raises ValueError on wrong password or any data tampering.
@@ -160,22 +176,33 @@ def keystore_decrypt(ks: dict, password: str) -> str:
       "PBKDF2-SHA256-i*"     — same, iteration count encoded in tag
     Supported cipher modes: AES-256-GCM (current), AES-256-CBC (legacy).
     """
-    salt      = bytes.fromhex(ks["salt"])
-    ct        = bytes.fromhex(ks["ct"])
-    kdf_tag   = ks.get("kdf", "PBKDF2-SHA256")
+    if not isinstance(ks, dict):
+        raise ValueError("Invalid keystore object")
+    try:
+        salt = bytes.fromhex(ks["salt"])
+        ct   = bytes.fromhex(ks["ct"])
+    except (KeyError, ValueError, TypeError):
+        raise ValueError("Corrupted keystore")
+    kdf_tag     = ks.get("kdf", "PBKDF2-SHA256")
     cipher_mode = ks.get("cipher", "AES-256-GCM")
 
+    if not isinstance(kdf_tag, str) or not kdf_tag:
+        raise ValueError(f"Unsupported or invalid KDF tag: {kdf_tag!r}")
+
     # ── KDF dispatch ─────────────────────────────────────────────────────────
+    import re as _re
     if kdf_tag.startswith("argon2id-"):
-        # Parse stored Argon2id parameters so old keystores are always
-        # decryptable even if the global defaults change in a future version.
-        import re as _re
-        m = _re.match(r'argon2id-t(\d+)-m(\d+)-p(\d+)', kdf_tag)
-        if m:
-            _t, _m, _p = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        else:
-            _t, _m, _p = (_ARGON2_TIME_COST, _ARGON2_MEMORY_COST,
-                          _ARGON2_PARALLELISM)
+        # Parse stored Argon2id parameters strictly; reject malformed tags.
+        m = _re.fullmatch(r'argon2id-t(\d+)-m(\d+)-p(\d+)', kdf_tag)
+        if not m:
+            raise ValueError(f"Malformed Argon2id KDF tag: {kdf_tag!r}")
+        _t, _m, _p = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if not (_ARGON2_MIN_TIME_COST <= _t <= _ARGON2_MAX_TIME_COST):
+            raise ValueError(f"Argon2id time_cost out of bounds: {_t}")
+        if not (_ARGON2_MIN_PARALLELISM <= _p <= _ARGON2_MAX_PARALLELISM):
+            raise ValueError(f"Argon2id parallelism out of bounds: {_p}")
+        if not (_ARGON2_MIN_MEMORY_COST <= _m <= _ARGON2_MAX_MEMORY_COST) or _m < 8 * _p:
+            raise ValueError(f"Argon2id memory_cost out of bounds: {_m}")
         if not _ARGON2_AVAILABLE:
             raise ValueError(
                 "Keystore was created with Argon2id but argon2-cffi is not "
@@ -189,12 +216,22 @@ def keystore_decrypt(ks: dict, password: str) -> str:
             hash_len=_ARGON2_HASH_LEN,
             type=_Argon2Type.ID,
         )
+    elif kdf_tag == "PBKDF2-SHA256":
+        kdf = PBKDF2HMAC(
+            algorithm=_hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=_PBKDF2_DEFAULT_ITERS,
+            backend=default_backend(),
+        )
+        key = kdf.derive(password.encode("utf-8"))
     else:
-        # PBKDF2-SHA256 — old or constrained-device keystore.
-        # Parse iteration count from tag if present (e.g. "PBKDF2-SHA256-i260000")
-        import re as _re
-        m = _re.search(r'i(\d+)', kdf_tag)
-        _iters = int(m.group(1)) if m else 260_000
+        m = _re.fullmatch(r'PBKDF2-SHA256-i(\d+)', kdf_tag)
+        if not m:
+            raise ValueError(f"Unsupported KDF tag: {kdf_tag!r}")
+        _iters = int(m.group(1))
+        if not (_PBKDF2_MIN_ITERS <= _iters <= _PBKDF2_MAX_ITERS):
+            raise ValueError(f"PBKDF2 iteration count out of bounds: {_iters}")
         kdf = PBKDF2HMAC(
             algorithm=_hashes.SHA256(),
             length=32,
@@ -206,28 +243,36 @@ def keystore_decrypt(ks: dict, password: str) -> str:
 
     # ── Cipher dispatch ───────────────────────────────────────────────────────
     if cipher_mode == "AES-256-GCM":
-        nonce = bytes.fromhex(ks["nonce"])
-        tag   = bytes.fromhex(ks["tag"])
         try:
+            nonce = bytes.fromhex(ks["nonce"])
+            tag   = bytes.fromhex(ks["tag"])
             cipher = Cipher(algorithms.AES(key), modes.GCM(nonce, tag),
                             backend=default_backend())
             dec    = cipher.decryptor()
+            if aad:
+                dec.authenticate_additional_data(aad)
             pt     = dec.update(ct) + dec.finalize()
+            return pt.decode()
         except Exception:
             raise ValueError("Wrong password or corrupted/tampered keystore")
-        return pt.decode()
 
     elif cipher_mode == "AES-256-CBC":
         # Legacy path — migrate on next save
-        iv         = bytes.fromhex(ks["iv"])
-        mac_stored = bytes.fromhex(ks["mac"])
-        mac_computed = hmac.new(key, ct, hashlib.sha256).digest()
+        try:
+            iv         = bytes.fromhex(ks["iv"])
+            mac_stored = bytes.fromhex(ks["mac"])
+        except (KeyError, ValueError, TypeError):
+            raise ValueError("Wrong password or corrupted keystore")
+        mac_computed = hmac.new(key, iv + ct, hashlib.sha256).digest()
         if not hmac.compare_digest(mac_stored, mac_computed):
             raise ValueError("Wrong password or corrupted keystore")
-        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())  # type: ignore[arg-type]
-        dec    = cipher.decryptor()
-        pt     = dec.update(ct) + dec.finalize()
-        return _pkcs7_unpad(pt).decode()
+        try:
+            cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())  # type: ignore[arg-type]
+            dec    = cipher.decryptor()
+            pt     = dec.update(ct) + dec.finalize()
+            return _pkcs7_unpad(pt).decode()
+        except Exception:
+            raise ValueError("Wrong password or corrupted keystore")
 
     else:
         raise ValueError(f"Unknown cipher mode: {cipher_mode}")

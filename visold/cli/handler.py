@@ -332,20 +332,29 @@ class CLIHandler:
         The nonce is fetched from the running node so that the user
         doesn't have to track it manually.
         """
-        # Load wallet — prefer explicit --keystore, fall back to node's
-        # default location.
-        keystore_path = args.keystore or os.path.join(
-            Config.DATA_DIR, "wallet.json")
-        if not os.path.exists(keystore_path):
-            # Try cli-created keystore too.
-            alt = os.path.join(Config.DATA_DIR, "wallet_cli.json")
-            if os.path.exists(alt):
-                keystore_path = alt
-            else:
-                print(f"ERROR: keystore not found (looked at {keystore_path}, "
-                      f"{alt}).  Run `wallet create` or pass --keystore.",
-                      file=sys.stderr)
+        # Load wallet — fail immediately if an explicit --keystore is missing;
+        # otherwise try the node's default wallet.json then wallet_cli.json.
+        if args.keystore:
+            keystore_path = args.keystore
+            if not os.path.exists(keystore_path):
+                print(
+                    f"ERROR: keystore not found at {keystore_path}.",
+                    file=sys.stderr,
+                )
                 return 2
+        else:
+            keystore_path = os.path.join(Config.DATA_DIR, "wallet.json")
+            if not os.path.exists(keystore_path):
+                alt = os.path.join(Config.DATA_DIR, "wallet_cli.json")
+                if os.path.exists(alt):
+                    keystore_path = alt
+                else:
+                    print(
+                        f"ERROR: keystore not found (looked at {keystore_path}, "
+                        f"{alt}).  Run `wallet create` or pass --keystore.",
+                        file=sys.stderr,
+                    )
+                    return 2
         try:
             if args.password:
                 wallet = Wallet.load_keystore(keystore_path, args.password)

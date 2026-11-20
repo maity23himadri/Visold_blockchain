@@ -31,7 +31,7 @@ from visold.crypto.ecc import ECPoint, pub_to_address
 from visold.crypto.hashing import sha256
 from visold.kernel.config import Config
 from visold.kernel.logging_setup import log
-from visold.kernel.units import to_satoshi
+from visold.kernel.units import gas_fee_to_sat, to_satoshi
 from visold.vm.frame import VVMResult, _ReentrancyGuard, _VMFrame
 from visold.vm.opcodes import Op, _GAS, _GAS_REFUND_DENOMINATOR
 from visold.vm.precompiles import VVMPrecompiles
@@ -45,8 +45,8 @@ if TYPE_CHECKING:  # annotation-only references (no runtime import, no cycle)
 # on x86 vs ARM for certain decimal values.  Use round() (half-even) once,
 # matching gas_fee_to_sat() which is already used everywhere else.
 def _gas_price_to_sat(gas_price_vsd: float) -> int:
-    """Convert a VSD-per-gas float to integer satoshi-per-gas deterministically."""
-    return int(round(gas_price_vsd * Config.SATOSHI_PER_VSD))
+    """Convert a VSD-per-gas value to non-negative integer satoshi-per-gas."""
+    return gas_fee_to_sat(1, gas_price_vsd)
 
 
 def _difficulty_to_vm_uint(difficulty) -> int:
@@ -107,6 +107,8 @@ def _chan_recover_address(msg_hash_b: bytes,
             return ""
         y_sq = (pow(x, 3, P) + 7) % P
         y    = pow(y_sq, (P + 1) // 4, P)
+        if pow(y, 2, P) != y_sq:
+            return ""
         if (y % 2) != (recovery_id % 2):
             y = P - y
         R_pt     = ECPoint(x, y)
@@ -167,11 +169,15 @@ class VVMEngine:
                call_value: int, gas_limit: int,
                block_ctx, tx,
                origin: Optional[str] = None,
+               depth: int = 0,
+               reentrance_guard: Optional[_ReentrancyGuard] = None,
                parent_storage_writes: Optional[dict] = None,
                parent_storage_tags: Optional[dict] = None,
                parent_storage_tag_orig: Optional[dict] = None,
                parent_balance_deltas: Optional[dict] = None,
                parent_create_nonce_deltas: Optional[dict] = None,
+               parent_pending_deployments: Optional[list] = None,
+               parent_self_destruct_transfers: Optional[list] = None,
                deployed_address: Optional[str] = None) -> 'VVMResult':
         """
         Execute a contract deployment.
@@ -189,9 +195,18 @@ class VVMEngine:
           until the top-level transaction commits.
         deployed_address: deterministic address override used by CREATE2.
         """
+        if not isinstance(gas_limit, int) or isinstance(gas_limit, bool) or gas_limit < 0:
+            return VVMResult(success=False, gas_used=0,
+                             revert_reason="invalid negative gas_limit")
         if gas_limit > Config.VVM_TX_GAS_CAP:
             return VVMResult(success=False, gas_used=gas_limit,
                              revert_reason="gas_limit exceeds cap")
+        if not isinstance(call_value, int) or isinstance(call_value, bool) or call_value < 0:
+            return VVMResult(success=False, gas_used=0,
+                             revert_reason="invalid negative call_value")
+        if depth > Config.VVM_MAX_CALL_DEPTH:
+            return VVMResult(success=False, gas_used=0,
+                             revert_reason="max call depth exceeded")
 
         # Derive deterministic contract address unless CREATE2 supplied the
         # already-computed deterministic destination.
@@ -214,9 +229,17 @@ class VVMEngine:
             return VVMResult(success=False, gas_used=gas_limit,
                              revert_reason="insufficient gas for deploy base cost")
 
-        # SC-FIX-1: Fresh reentrancy guard per top-level execution
-        guard = _ReentrancyGuard()
-        guard.enter(contract_addr)
+        # SC-FIX-1: Reuse parent reentrancy guard for nested CREATE/CREATE2,
+        # or create a fresh guard for top-level deployments.
+        guard = reentrance_guard if reentrance_guard is not None else _ReentrancyGuard()
+        try:
+            guard.enter(contract_addr)
+        except RuntimeError as re_err:
+            return VVMResult(
+                success=False,
+                gas_used=base_gas,
+                revert_reason=str(re_err)[:256],
+            )
 
         # SC-V73-FIX-4: use deterministic int conversion (not float * 1e8)
         frame = _VMFrame(
@@ -229,7 +252,7 @@ class VVMEngine:
             gas_limit     = gas_limit - base_gas,
             storage_ref   = self._storage,
             is_static     = False,
-            depth         = 0,
+            depth         = depth,
             gas_price     = _gas_price_to_sat(tx.gas_price),
             block_ctx     = block_ctx,
             execution_id  = getattr(tx, "tx_id", ""),
@@ -249,6 +272,10 @@ class VVMEngine:
             frame.balance_deltas = dict(parent_balance_deltas)
         if parent_create_nonce_deltas:
             frame.create_nonce_deltas = dict(parent_create_nonce_deltas)
+        if parent_pending_deployments:
+            frame.pending_deployments = list(parent_pending_deployments)
+        if parent_self_destruct_transfers:
+            frame.self_destruct_transfers = list(parent_self_destruct_transfers)
         if call_value > 0 and not parent_balance_deltas:
             frame.balance_deltas[contract_addr] = (
                 frame.balance_deltas.get(contract_addr, 0) + int(call_value)
@@ -280,6 +307,7 @@ class VVMEngine:
             return VVMResult(
                 success=False,
                 gas_used=min(gas_used_raw, gas_limit),
+                return_data=frame.output,
                 revert_reason=frame.output.decode("utf-8", errors="replace")
                               if frame.output else "Reverted",
             )
@@ -341,18 +369,24 @@ class VVMEngine:
         Execute a message call against an existing contract.
         Returns VVMResult.
         """
+        if not isinstance(gas_limit, int) or isinstance(gas_limit, bool) or gas_limit < 0:
+            return VVMResult(success=False, gas_used=0,
+                             revert_reason="invalid negative gas_limit")
         if gas_limit > Config.VVM_TX_GAS_CAP:
             return VVMResult(success=False, gas_used=gas_limit,
                              revert_reason="gas_limit exceeds cap")
+        if not isinstance(call_value, int) or isinstance(call_value, bool) or call_value < 0:
+            return VVMResult(success=False, gas_used=0,
+                             revert_reason="invalid negative call_value")
 
         contract_rec = self._storage.get_contract(contract)
         if not contract_rec:
-            return VVMResult(success=False, gas_used=21000,
+            return VVMResult(success=False, gas_used=min(21000, gas_limit),
                              revert_reason=f"Contract {contract} not found")
 
         runtime_code = self._storage.get_contract_code(contract_rec["code_hash"])
         if runtime_code is None:
-            return VVMResult(success=False, gas_used=21000,
+            return VVMResult(success=False, gas_used=min(21000, gas_limit),
                              revert_reason="Contract code missing from storage")
 
         # SC-FIX-1: Fresh reentrancy guard per top-level execution
@@ -436,13 +470,19 @@ class VVMEngine:
         drops all sstore() calls. The VVMResult reflects what WOULD happen
         including gas_used, return_data, logs, and revert_reason.
         """
+        if not isinstance(gas_limit, int) or isinstance(gas_limit, bool) or gas_limit < 0:
+            return VVMResult(success=False, gas_used=0,
+                             revert_reason="invalid negative gas_limit")
+        if not isinstance(call_value, int) or isinstance(call_value, bool) or call_value < 0:
+            return VVMResult(success=False, gas_used=0,
+                             revert_reason="invalid negative call_value")
         contract_rec = self._storage.get_contract(contract)
         if not contract_rec:
-            return VVMResult(success=False, gas_used=21000,
+            return VVMResult(success=False, gas_used=min(21000, gas_limit),
                              revert_reason=f"Contract {contract} not found")
         runtime_code = self._storage.get_contract_code(contract_rec["code_hash"])
         if runtime_code is None:
-            return VVMResult(success=False, gas_used=21000,
+            return VVMResult(success=False, gas_used=min(21000, gas_limit),
                              revert_reason="Contract code missing from storage")
 
         class _SimTx:
@@ -466,12 +506,20 @@ class VVMEngine:
                 return self._real.get_balance(addr)
             def get_balance_sat(self, addr):
                 return self._real.get_balance_sat(addr)
+            def get_nonce(self, addr):
+                return self._real.get_nonce(addr)
             def get_role(self, addr):
                 return self._real.get_role(addr)
             def get_all_by_role(self, role):
                 return self._real.get_all_by_role(role)
             def get_block(self, idx):
                 return self._real.get_block(idx)
+            def begin_state_channel_journal(self):
+                return {}
+            def end_state_channel_journal(self, journal):
+                pass
+            def restore_state_channel_journal(self, journal):
+                pass
 
         sim_storage = _SimStorage(self._storage)
         guard = _ReentrancyGuard()
@@ -486,7 +534,7 @@ class VVMEngine:
             call_value       = call_value,
             gas_limit        = min(gas_limit, Config.VVM_TX_GAS_CAP),
             storage_ref      = sim_storage,  # type: ignore[arg-type]
-            is_static        = True,   # prevent any state mutation path
+            is_static        = False,  # dry-run discards writes via _SimStorage & journal
             depth            = 0,
             gas_price        = 0,      # dry-run: no tx, no gas price
             block_ctx        = block_ctx,
@@ -495,8 +543,13 @@ class VVMEngine:
         )
         if call_value > 0:
             frame.balance_deltas[contract] = int(call_value)
-        self._execute(frame)
-        guard.exit(contract)
+        state_channel_journal = self._storage.begin_state_channel_journal()
+        try:
+            self._execute(frame)
+        finally:
+            guard.exit(contract)
+            self._storage.end_state_channel_journal(state_channel_journal)
+            self._storage.restore_state_channel_journal(state_channel_journal)
         gas_used_raw = frame.gas_limit - frame.gas_remaining
         capped_refund = min(frame.gas_refund, gas_used_raw // _GAS_REFUND_DENOMINATOR)
         gas_used = max(0, gas_used_raw - capped_refund)
@@ -553,6 +606,41 @@ class VVMEngine:
         # Add 10% buffer for safety (storage warm/cold variance)
         return min(int(hi * 1.1), Config.VVM_TX_GAS_CAP)
 
+    def _has_contract_record(self, addr: str) -> bool:
+        has_rec = getattr(self._storage, "has_contract_record", None)
+        if callable(has_rec):
+            return bool(has_rec(addr))
+        if self._storage.get_contract(addr) is not None:
+            return True
+        try:
+            if getattr(self._storage, "_pgx_enabled", False):
+                row = self._storage._pg_fetchrow(
+                    "SELECT 1 AS present FROM contract_accounts WHERE address=$1",
+                    addr)
+                return row is not None
+            conn_fn = getattr(self._storage, "_conn", None)
+            if callable(conn_fn):
+                row = conn_fn().execute(
+                    "SELECT 1 FROM contract_accounts WHERE address=?",
+                    (addr,)).fetchone()
+                return row is not None
+        except Exception:
+            pass
+        return False
+
+    def _effective_balance_sat(
+        self, frame: '_VMFrame', addr: str,
+        balance_deltas: Optional[dict] = None,
+    ) -> int:
+        deltas = frame.balance_deltas if balance_deltas is None else balance_deltas
+        bal = self._storage.get_balance_sat(addr) + int(deltas.get(addr, 0))
+        for sd_src, sd_dst, sd_amt in frame.self_destruct_transfers:
+            if sd_src == addr:
+                bal -= int(sd_amt)
+            if sd_dst == addr:
+                bal += int(sd_amt)
+        return bal
+
     # ── Internal CALL (contract-to-contract) ─────────────────────────────────
     def _internal_call(self, *, caller_frame: '_VMFrame',
                        callee_addr: str, calldata: bytes,
@@ -566,8 +654,10 @@ class VVMEngine:
         Writes are merged into caller_frame on success only.
         """
         if caller_frame.depth >= Config.VVM_MAX_CALL_DEPTH:
+            caller_frame.return_buffer = b""
             return False, b""
-        if is_static and call_value != 0:
+        if is_static and not (is_delegate and not is_callcode) and call_value != 0:
+            caller_frame.return_buffer = b""
             return False, b""
 
         # ── SC-FIX-1: Reentrancy guard check ─────────────────────────────────
@@ -577,6 +667,7 @@ class VVMEngine:
                 guard.enter(callee_addr)
             except RuntimeError as re_err:
                 log.debug(f"VVM reentrancy blocked: {re_err}")
+                caller_frame.return_buffer = b""
                 return False, str(re_err).encode()[:256]
 
         # Build a tentative balance overlay.  A nested transfer becomes part
@@ -585,11 +676,12 @@ class VVMEngine:
         pending_balance_deltas = dict(caller_frame.balance_deltas)
         if not is_delegate and call_value > 0:
             source = caller_frame.address
-            effective = (self._storage.get_balance_sat(source) +
-                         int(pending_balance_deltas.get(source, 0)))
+            effective = self._effective_balance_sat(
+                caller_frame, source, pending_balance_deltas)
             if effective < call_value:
                 if guard is not None:
                     guard.exit(callee_addr)
+                caller_frame.return_buffer = b""
                 return False, b""
             pending_balance_deltas[source] = (
                 pending_balance_deltas.get(source, 0) - int(call_value)
@@ -604,27 +696,29 @@ class VVMEngine:
         # moves and pending_balance_deltas is left unchanged.
         if is_callcode and call_value > 0:
             source = caller_frame.address
-            effective = (self._storage.get_balance_sat(source) +
-                         int(pending_balance_deltas.get(source, 0)))
+            effective = self._effective_balance_sat(
+                caller_frame, source, pending_balance_deltas)
             if effective < call_value:
                 if guard is not None:
                     guard.exit(callee_addr)
+                caller_frame.return_buffer = b""
                 return False, b""
 
         # ── Precompile dispatch ────────────────────────────────────────────────
         if VVMPrecompiles.is_precompile(callee_addr):
             child_gas = min(gas, caller_frame.gas_remaining)
-            caller_frame._use_gas(child_gas // 64)
-            ok, ret, gas_used = VVMPrecompiles.execute(
-                callee_addr, calldata, child_gas)
-            caller_frame.gas_remaining = max(
-                0, caller_frame.gas_remaining - gas_used)
-            caller_frame.return_buffer = ret
-            if ok:
-                caller_frame.balance_deltas = pending_balance_deltas
-            if guard is not None:
-                guard.exit(callee_addr)
-            return ok, ret
+            try:
+                ok, ret, gas_used = VVMPrecompiles.execute(
+                    callee_addr, calldata, child_gas)
+                gas_used = min(max(0, int(gas_used)), child_gas)
+                caller_frame._use_gas(gas_used)
+                caller_frame.return_buffer = ret
+                if ok:
+                    caller_frame.balance_deltas = pending_balance_deltas
+                return ok, ret
+            finally:
+                if guard is not None:
+                    guard.exit(callee_addr)
 
         # A contract created earlier in this top-level transaction is not yet
         # persisted.  Overlay pending deployments on committed storage so CALL
@@ -647,11 +741,13 @@ class VVMEngine:
             # Calling an EOA or non-existent address is a successful no-code
             # call.  Attached value still transfers to that address.
             caller_frame.balance_deltas = pending_balance_deltas
+            caller_frame.return_buffer = b""
             if guard is not None:
                 guard.exit(callee_addr)
             return True, b""
 
         if runtime_code is None:
+            caller_frame.return_buffer = b""
             if guard is not None:
                 guard.exit(callee_addr)
             return False, b""
@@ -687,7 +783,7 @@ class VVMEngine:
             gas_price     = caller_frame.gas_price_wei,
             block_ctx     = caller_frame.block_ctx,
             execution_id  = caller_frame.execution_id,
-            return_buffer = caller_frame.return_buffer,
+            return_buffer = b"",
             reentrance_guard = guard,
         )
         # Pre-populate child with parent's write buffer so it sees parent writes.
@@ -696,6 +792,9 @@ class VVMEngine:
         child._storage_tags  = dict(caller_frame._storage_tags)
         child._storage_tag_orig = dict(caller_frame._storage_tag_orig)
         child.balance_deltas = pending_balance_deltas
+        child.pending_deployments = list(caller_frame.pending_deployments)
+        child.create_nonce_deltas = dict(caller_frame.create_nonce_deltas)
+        child.self_destruct_transfers = list(caller_frame.self_destruct_transfers)
 
         # State-channel opcodes perform direct persistent mutations rather than
         # using the frame-local storage/balance overlays above.  A nested CALL
@@ -757,9 +856,10 @@ class VVMEngine:
         caller_frame.touched_contracts.update(child.touched_contracts)
         caller_frame.logs.extend(child.logs)
         caller_frame.gas_refund  += child.gas_refund
-        caller_frame.self_destruct_transfers.extend(child.self_destruct_transfers)
-        # SC-V73-FIX-2: propagate deferred deployments from child to parent
-        caller_frame.pending_deployments.extend(child.pending_deployments)
+        caller_frame.self_destruct_transfers = list(child.self_destruct_transfers)
+        # SC-V73-FIX-2: propagate deferred deployments and CREATE nonces from child to parent
+        caller_frame.pending_deployments = list(child.pending_deployments)
+        caller_frame.create_nonce_deltas = dict(child.create_nonce_deltas)
         caller_frame.return_buffer = child.output
         return True, child.output
 
@@ -781,6 +881,26 @@ class VVMEngine:
     def _run(self, f: '_VMFrame'):  # noqa: C901 (complexity accepted for perf)
         W = _VMFrame.UINT256_MAX
         code = f.code
+        valid_jumpdests = None
+
+        def _get_valid_jumpdests() -> set:
+            nonlocal valid_jumpdests
+            if valid_jumpdests is None:
+                dests = set()
+                i = 0
+                n = len(code)
+                while i < n:
+                    op_b = code[i]
+                    if Op.PUSH1 <= op_b <= Op.PUSH32:
+                        i += 1 + (op_b - Op.PUSH1 + 1)
+                    elif Op.RMOV_R0 <= op_b <= Op.RMOV_R7:
+                        i += 2
+                    else:
+                        if op_b == Op.JUMPDEST:
+                            dests.add(i)
+                        i += 1
+                valid_jumpdests = dests
+            return valid_jumpdests
 
         while f.pc < len(code) and not f.stopped and not f.reverted:
             op = code[f.pc]
@@ -906,8 +1026,7 @@ class VVMEngine:
                 # SC-FIX-6: use integer satoshi path (never float balance math).
                 # Include the execution-local value-transfer overlay so a
                 # nested CALL/CREATE is immediately visible to BALANCE.
-                bal_sat = (self._storage.get_balance_sat(addr_str)
-                           + int(f.balance_deltas.get(addr_str, 0)))
+                bal_sat = self._effective_balance_sat(f, addr_str)
                 if bal_sat < 0:
                     raise RuntimeError(f"negative execution balance for {addr_str}")
                 f.push(bal_sat, Op.VTYPE_SATOSHI)
@@ -959,8 +1078,7 @@ class VVMEngine:
                     pass  # EVM: no-op, no gas beyond opcode base
                 else:
                     safe_size = min(size, f._SAFE_OFFSET_CAP)
-                    mem_cost  = f._mem_expand(dst, safe_size)
-                    f._use_gas(mem_cost + 3 * ((safe_size + 31) // 32))
+                    f._mem_expand(dst, safe_size, extra_gas=3 * ((safe_size + 31) // 32))
                     cd_len    = len(f.calldata)
                     safe_src  = min(src, cd_len)  # clamp to valid calldata range
                     end       = min(safe_src + safe_size, cd_len)
@@ -980,8 +1098,7 @@ class VVMEngine:
                     pass
                 else:
                     safe_size = min(size, f._SAFE_OFFSET_CAP)
-                    mem_cost  = f._mem_expand(dst, safe_size)
-                    f._use_gas(mem_cost + 3 * ((safe_size + 31) // 32))
+                    f._mem_expand(dst, safe_size, extra_gas=3 * ((safe_size + 31) // 32))
                     code_len  = len(f.code)
                     safe_src  = min(src, code_len)
                     end       = min(safe_src + safe_size, code_len)
@@ -998,13 +1115,13 @@ class VVMEngine:
                 pd = next((d for d in reversed(f.pending_deployments)
                            if d.get("address") == addr_str), None)
                 if pd is not None:
-                    code = bytes(pd.get("code_bytes") or b"")
-                    f.push(len(code))
+                    ext_code = bytes(pd.get("code_bytes") or b"")
+                    f.push(len(ext_code))
                 else:
                     c = self._storage.get_contract(addr_str)
                     if c:
-                        code = self._storage.get_contract_code(c["code_hash"]) or b""
-                        f.push(len(code) if code else 0)
+                        ext_code = self._storage.get_contract_code(c["code_hash"]) or b""
+                        f.push(len(ext_code) if ext_code else 0)
                     else:
                         f.push(0)
             elif op == Op.EXTCODECOPY:
@@ -1025,8 +1142,7 @@ class VVMEngine:
                     pass
                 else:
                     safe_size = min(size, f._SAFE_OFFSET_CAP)
-                    mem_cost  = f._mem_expand(dst, safe_size)
-                    f._use_gas(mem_cost + 3 * ((safe_size + 31) // 32))
+                    f._mem_expand(dst, safe_size, extra_gas=3 * ((safe_size + 31) // 32))
                     ext_len   = len(ext_code)
                     safe_src  = min(src, ext_len)
                     end       = min(safe_src + safe_size, ext_len)
@@ -1052,8 +1168,7 @@ class VVMEngine:
                 if src + size > rb_len:
                     raise RuntimeError("RETURNDATACOPY out of bounds")
                 safe_size = min(size, f._SAFE_OFFSET_CAP)
-                mem_cost  = f._mem_expand(dst, safe_size)
-                f._use_gas(mem_cost + 3 * ((safe_size + 31) // 32))
+                f._mem_expand(dst, safe_size, extra_gas=3 * ((safe_size + 31) // 32))
                 safe_src  = min(src, f._SAFE_OFFSET_CAP)
                 data      = f.return_buffer[safe_src:safe_src + safe_size]
                 safe_dst  = min(dst, f._SAFE_OFFSET_CAP)
@@ -1126,8 +1241,7 @@ class VVMEngine:
             elif op == Op.SELFBALANCE:
                 # Use the same integer satoshi path as BALANCE and include the
                 # execution-local value-transfer overlay.
-                bal_sat = (self._storage.get_balance_sat(f.address)
-                           + int(f.balance_deltas.get(f.address, 0)))
+                bal_sat = self._effective_balance_sat(f, f.address)
                 if bal_sat < 0:
                     raise RuntimeError(f"negative execution balance for {f.address}")
                 f.push(bal_sat, Op.VTYPE_SATOSHI)
@@ -1155,18 +1269,18 @@ class VVMEngine:
             elif op == Op.JUMP:
                 dest = f.pop()
                 # dest is uint256; clamp to _SAFE_OFFSET_CAP before any
-                # bytes/list index operation to prevent ssize_t overflow.
+                # set/bounds check.
                 safe_dest = dest if dest <= f._SAFE_OFFSET_CAP else len(code)
-                if safe_dest >= len(code) or code[safe_dest] != Op.JUMPDEST:
+                if safe_dest not in _get_valid_jumpdests():
                     raise RuntimeError(f"Invalid JUMP destination {dest}")
                 f.pc = safe_dest
             elif op == Op.JUMPI:
                 dest, cond = f.pop(), f.pop()
                 if cond:
                     # dest is uint256; clamp to _SAFE_OFFSET_CAP before
-                    # bytes indexing to prevent ssize_t overflow.
+                    # set/bounds check.
                     safe_dest = dest if dest <= f._SAFE_OFFSET_CAP else len(code)
-                    if safe_dest >= len(code) or code[safe_dest] != Op.JUMPDEST:
+                    if safe_dest not in _get_valid_jumpdests():
                         raise RuntimeError(f"Invalid JUMPI destination {dest}")
                     f.pc = safe_dest
             elif op == Op.PC:
@@ -1228,8 +1342,7 @@ class VVMEngine:
                 addr_str = f._int_to_addr(addr_int)
                 # Integer satoshi path, including the same execution-local
                 # value-transfer overlay used by BALANCE.
-                bal_sat = (self._storage.get_balance_sat(addr_str)
-                           + int(f.balance_deltas.get(addr_str, 0)))
+                bal_sat = self._effective_balance_sat(f, addr_str)
                 if bal_sat < 0:
                     raise RuntimeError(f"negative execution balance for {addr_str}")
                 f.push(bal_sat, Op.VTYPE_SATOSHI)
@@ -1270,7 +1383,10 @@ class VVMEngine:
                 init_code = f.mslice(offset, size)
                 f._use_gas(32 * ((len(init_code) + 31) // 32))
                 child_gas = f.gas_remaining - f.gas_remaining // 64
-                f._use_gas(f.gas_remaining // 64)
+                if f.depth >= Config.VVM_MAX_CALL_DEPTH:
+                    f.return_buffer = b""
+                    f.push(0)
+                    continue
 
                 # CREATE is deterministic in Visold, but repeated execution of
                 # the same CREATE site must still produce distinct addresses.
@@ -1290,20 +1406,23 @@ class VVMEngine:
                     f"{f.address}:{f.execution_id}:"
                     f"{_StubTx.tx_id}:{create_seq}".encode()
                 )[:36]
+                _addr_in_db = self._has_contract_record(create_addr)
                 occupied = (
-                    self._storage.get_contract(create_addr) is not None
+                    _addr_in_db
                     or self._storage.get_nonce(create_addr) > 0
                     or any(d.get("address") == create_addr
                            for d in f.pending_deployments)
                 )
                 if occupied:
+                    f.return_buffer = b""
                     f.push(0)
                     continue
                 pending_balance_deltas = dict(f.balance_deltas)
                 if value > 0:
-                    effective = (self._storage.get_balance_sat(f.address) +
-                                 int(pending_balance_deltas.get(f.address, 0)))
+                    effective = self._effective_balance_sat(
+                        f, f.address, pending_balance_deltas)
                     if effective < value:
+                        f.return_buffer = b""
                         f.push(0)
                         gas_used_child = 0
                     else:
@@ -1325,11 +1444,15 @@ class VVMEngine:
                         block_ctx           = f.block_ctx,
                         tx                  = _StubTx(),
                         origin              = f.origin,
+                        depth               = f.depth + 1,
+                        reentrance_guard    = f.reentrance_guard,
                         parent_storage_writes = dict(f.storage_writes),
                         parent_storage_tags   = dict(f._storage_tags),
                         parent_storage_tag_orig = dict(f._storage_tag_orig),
                         parent_balance_deltas = pending_balance_deltas,
                         parent_create_nonce_deltas = dict(f.create_nonce_deltas),
+                        parent_pending_deployments = list(f.pending_deployments),
+                        parent_self_destruct_transfers = list(f.self_destruct_transfers),
                         deployed_address     = create_addr,
                     )
                     if sub_result.success and sub_result.contract_addr:
@@ -1345,25 +1468,27 @@ class VVMEngine:
                         f.create_nonce_deltas = dict(sub_result.create_nonce_deltas)
                         f.touched_contracts.update(sub_result.touched_contracts)
                         f.logs.extend(sub_result.logs)
-                        f.self_destruct_transfers.extend(sub_result.self_destruct_transfers)
+                        f.self_destruct_transfers = list(sub_result.self_destruct_transfers)
                         code_hash = sha256(sub_result.return_data)
-                        f.pending_deployments.append({
-                            "address":       sub_result.contract_addr,
-                            "code_hash":     code_hash,
-                            "code_bytes":    sub_result.return_data,
-                            "creator":       f.address,
-                            "created_at":    f.block_ctx.timestamp if f.block_ctx else 0,
-                            "contract_name": "",
-                        })
-                        f.pending_deployments.extend(sub_result.pending_deployments)
+                        f.pending_deployments = list(sub_result.pending_deployments)
+                        existing_addrs = {d.get("address") for d in f.pending_deployments}
+                        if sub_result.contract_addr not in existing_addrs:
+                            f.pending_deployments.append({
+                                "address":       sub_result.contract_addr,
+                                "code_hash":     code_hash,
+                                "code_bytes":    sub_result.return_data,
+                                "creator":       f.address,
+                                "created_at":    f.block_ctx.timestamp if f.block_ctx else 0,
+                                "contract_name": "",
+                            })
+                        f.return_buffer = b""
                         f.push(f._addr_to_int(sub_result.contract_addr))
                     else:
+                        f.return_buffer = sub_result.return_data
                         f.push(0)
                     gas_used_child = sub_result.gas_used
 
-                if f.gas_remaining < gas_used_child:
-                    raise RuntimeError("Out of gas")
-                f.gas_remaining -= gas_used_child
+                f._use_gas(gas_used_child)
 
             # SC-FIX-5: CREATE2 — deterministic contract deployment via salt
             # SC-V73-FIX-2 + SC-V73-FIX-6: same deferred-deployment fix as CREATE.
@@ -1374,20 +1499,25 @@ class VVMEngine:
                 init_code = f.mslice(offset, size)
                 f._use_gas(6 * ((len(init_code) + 31) // 32))
                 child_gas = f.gas_remaining - f.gas_remaining // 64
-                f._use_gas(f.gas_remaining // 64)
+                if f.depth >= Config.VVM_MAX_CALL_DEPTH:
+                    f.return_buffer = b""
+                    f.push(0)
+                    continue
 
                 salt_bytes  = salt.to_bytes(32, 'big')
                 code_hash   = hashlib.sha256(init_code).hexdigest()
                 addr_input  = b"VSDc2" + f.address.encode() + salt_bytes + code_hash.encode()
                 contract2_addr = "VSDc" + hashlib.sha256(addr_input).hexdigest()[:36]
 
+                _addr2_in_db = self._has_contract_record(contract2_addr)
                 occupied2 = (
-                    self._storage.get_contract(contract2_addr) is not None
+                    _addr2_in_db
                     or self._storage.get_nonce(contract2_addr) > 0
                     or any(d.get("address") == contract2_addr
                            for d in f.pending_deployments)
                 )
                 if occupied2:
+                    f.return_buffer = b""
                     f.push(0)
                     continue
 
@@ -1397,9 +1527,10 @@ class VVMEngine:
 
                 pending_balance_deltas2 = dict(f.balance_deltas)
                 if value > 0:
-                    effective2 = (self._storage.get_balance_sat(f.address) +
-                                  int(pending_balance_deltas2.get(f.address, 0)))
+                    effective2 = self._effective_balance_sat(
+                        f, f.address, pending_balance_deltas2)
                     if effective2 < value:
+                        f.return_buffer = b""
                         f.push(0)
                         gas2_child = 0
                     else:
@@ -1421,11 +1552,15 @@ class VVMEngine:
                         block_ctx           = f.block_ctx,
                         tx                  = _StubTx2(),
                         origin              = f.origin,
+                        depth               = f.depth + 1,
+                        reentrance_guard    = f.reentrance_guard,
                         parent_storage_writes = dict(f.storage_writes),
                         parent_storage_tags   = dict(f._storage_tags),
                         parent_storage_tag_orig = dict(f._storage_tag_orig),
                         parent_balance_deltas = pending_balance_deltas2,
                         parent_create_nonce_deltas = dict(f.create_nonce_deltas),
+                        parent_pending_deployments = list(f.pending_deployments),
+                        parent_self_destruct_transfers = list(f.self_destruct_transfers),
                         deployed_address      = contract2_addr,
                     )
                     if sub_result2.success and sub_result2.contract_addr:
@@ -1438,27 +1573,30 @@ class VVMEngine:
                             {k: v for k, v in sub_result2.storage_tag_orig.items()
                              if k not in f._storage_tag_orig})
                         f.balance_deltas = dict(sub_result2.balance_deltas)
+                        f.create_nonce_deltas = dict(sub_result2.create_nonce_deltas)
                         f.touched_contracts.update(sub_result2.touched_contracts)
                         f.logs.extend(sub_result2.logs)
-                        f.self_destruct_transfers.extend(sub_result2.self_destruct_transfers)
+                        f.self_destruct_transfers = list(sub_result2.self_destruct_transfers)
                         code_hash_hex = sha256(sub_result2.return_data)
-                        f.pending_deployments.append({
-                            "address":       contract2_addr,
-                            "code_hash":     code_hash_hex,
-                            "code_bytes":    sub_result2.return_data,
-                            "creator":       f.address,
-                            "created_at":    f.block_ctx.timestamp if f.block_ctx else 0,
-                            "contract_name": "",
-                        })
-                        f.pending_deployments.extend(sub_result2.pending_deployments)
+                        f.pending_deployments = list(sub_result2.pending_deployments)
+                        existing_addrs2 = {d.get("address") for d in f.pending_deployments}
+                        if contract2_addr not in existing_addrs2:
+                            f.pending_deployments.append({
+                                "address":       contract2_addr,
+                                "code_hash":     code_hash_hex,
+                                "code_bytes":    sub_result2.return_data,
+                                "creator":       f.address,
+                                "created_at":    f.block_ctx.timestamp if f.block_ctx else 0,
+                                "contract_name": "",
+                            })
+                        f.return_buffer = b""
                         f.push(f._addr_to_int(contract2_addr))
                     else:
+                        f.return_buffer = sub_result2.return_data
                         f.push(0)
                     gas2_child = sub_result2.gas_used
 
-                if f.gas_remaining < gas2_child:
-                    raise RuntimeError("Out of gas")
-                f.gas_remaining -= gas2_child
+                f._use_gas(gas2_child)
 
             elif op == Op.CALL or op == Op.CALLCODE:
                 gas_param = f.pop()
@@ -1470,7 +1608,6 @@ class VVMEngine:
                 out_size  = f.pop()
                 calldata_ = f.mslice(in_off, in_size)
                 child_gas = min(gas_param, f.gas_remaining - f.gas_remaining // 64)
-                f._use_gas(f.gas_remaining // 64)
                 callee = f._int_to_addr(addr_int)
                 is_callcode = (op == Op.CALLCODE)
                 # CALLCODE runs the callee's code in the caller's storage context,
@@ -1490,8 +1627,7 @@ class VVMEngine:
                 # Write return data to output memory
                 if ret and out_size > 0:
                     copy_size = min(len(ret), out_size)
-                    mem_cost = f._mem_expand(out_off, out_size)
-                    f._use_gas(mem_cost)
+                    f._mem_expand(out_off, out_size)
                     # SC-FIX-MEM-2: clamp out_off before using as slice index.
                     # out_off was popped from the stack as uint256; without this
                     # clamp a large but valid-looking offset passes _mem_expand
@@ -1512,7 +1648,6 @@ class VVMEngine:
                 out_size  = f.pop()
                 calldata_ = f.mslice(in_off, in_size)
                 child_gas = min(gas_param, f.gas_remaining - f.gas_remaining // 64)
-                f._use_gas(f.gas_remaining // 64)
                 callee = f._int_to_addr(addr_int)
                 ok, ret = self._internal_call(
                     caller_frame = f,
@@ -1525,8 +1660,7 @@ class VVMEngine:
                 )
                 if ret and out_size > 0:
                     copy_size = min(len(ret), out_size)
-                    mem_cost = f._mem_expand(out_off, out_size)
-                    f._use_gas(mem_cost)
+                    f._mem_expand(out_off, out_size)
                     # SC-FIX-MEM-2: clamp out_off (same fix as CALL above).
                     safe_out_off = min(out_off & f._UINT256_MAX_MEM, f._SAFE_OFFSET_CAP)
                     f.memory[safe_out_off:safe_out_off + copy_size] = ret[:copy_size]
@@ -1541,7 +1675,6 @@ class VVMEngine:
                 out_size  = f.pop()
                 calldata_ = f.mslice(in_off, in_size)
                 child_gas = min(gas_param, f.gas_remaining - f.gas_remaining // 64)
-                f._use_gas(f.gas_remaining // 64)
                 callee = f._int_to_addr(addr_int)
                 ok, ret = self._internal_call(
                     caller_frame = f,
@@ -1553,8 +1686,7 @@ class VVMEngine:
                 )
                 if ret and out_size > 0:
                     copy_size = min(len(ret), out_size)
-                    mem_cost = f._mem_expand(out_off, out_size)
-                    f._use_gas(mem_cost)
+                    f._mem_expand(out_off, out_size)
                     # SC-FIX-MEM-2: clamp out_off (same fix as CALL/DELEGATECALL).
                     safe_out_off = min(out_off & f._UINT256_MAX_MEM, f._SAFE_OFFSET_CAP)
                     f.memory[safe_out_off:safe_out_off + copy_size] = ret[:copy_size]
@@ -1582,9 +1714,7 @@ class VVMEngine:
                 # Not including call_value here would make the transfer amount wrong
                 # whenever a contract self-destructs in the same call that received
                 # value (e.g. a one-shot payment-then-destroy pattern).
-                db_balance_sat   = self._storage.get_balance_sat(f.address)
-                pending_delta_sat = int(f.balance_deltas.get(f.address, 0))
-                own_balance_sat  = db_balance_sat + pending_delta_sat
+                own_balance_sat  = self._effective_balance_sat(f, f.address)
                 if own_balance_sat < 0:
                     raise RuntimeError("SELFDESTRUCT source balance became negative")
                 # A contract can be reached more than once during one
@@ -1659,6 +1789,7 @@ class VVMEngine:
                 old_reg = f.registers[rn]
                 f.registers[rn] = f.stack[-1] & _VMFrame.UINT256_MAX
                 f.stack[-1] = old_reg    # old_reg is already masked
+                f._stack_tags[-1] = Op.VTYPE_UINT
 
             # RCLEAR  (0xE8): zero all 8 registers atomically.
             # Useful as a security hygiene op before returning from a sensitive
@@ -1811,8 +1942,8 @@ class VVMEngine:
                     # Edge case: zero deposit
                     elif deposit_sat == 0:
                         f.push(0)
-                    # Edge case: insufficient balance
-                    elif self._storage.get_balance_sat(caller_str) < deposit_sat:
+                    # Edge case: insufficient effective balance
+                    elif self._effective_balance_sat(f, caller_str) < deposit_sat:
                         f.push(0)
                     else:
                         # Clamp timeout to sane range [10, 50_000]
@@ -1965,76 +2096,77 @@ class VVMEngine:
                     caller_str = f._int_to_addr(f._addr_to_int(f.caller))
                     if caller_str not in (ch["opener"], ch["counterparty"]):
                         _chan_dispute_fail()
+                    else:
 
-                    def _validate_and_raise_dispute():
-                        # Sequence must strictly advance the currently accepted
-                        # dispute state.  This is meaningful for both the first
-                        # OPEN->DISPUTED transition and later challenges.
-                        if seq_no <= int(ch.get("dispute_seq", 0) or 0):
-                            return False
-                        if bal_caller < 0 or bal_counter < 0:
-                            return False
-                        if bal_caller + bal_counter != ch["total_deposit_sat"]:
-                            return False
-                        if caller_str == ch["opener"]:
-                            signer_addr = ch["counterparty"]
-                            bal_opener = bal_caller
-                            bal_ctr = bal_counter
-                        else:
-                            signer_addr = ch["opener"]
-                            bal_opener = bal_counter
-                            bal_ctr = bal_caller
-                        msg_hash_b = _chan_state_msg(
-                            channel_id, seq_no, bal_opener, bal_ctr)
-                        recovered = ""
-                        for v_try in (27, 28):
-                            r = sig_r & _VMFrame.UINT256_MAX
-                            s = sig_s & _VMFrame.UINT256_MAX
-                            addr_try = _chan_recover_address(
-                                msg_hash_b, v_try, r, s)
-                            if addr_try == signer_addr:
-                                recovered = addr_try
-                                break
-                        if recovered != signer_addr:
-                            return False
-                        return self._storage.raise_dispute(
-                            channel_id, seq_no, bal_opener, bal_ctr, cur_h)
-
-                    if ch["status"] == "DISPUTED":
-                        timeout_expired = (
-                            cur_h >= ch["dispute_height"] + ch["timeout_blocks"])
-                        if timeout_expired:
-                            # Extra gas for force-close (settle balances).
-                            # Once timeout has elapsed, no later challenge is
-                            # accepted; settlement uses the latest state that
-                            # successfully advanced dispute_seq.
-                            f._use_gas(2000)
-                            ok = self._storage.force_close_channel(
-                                channel_id, cur_h)
-                            if not ok:
-                                _chan_dispute_fail()
+                        def _validate_and_raise_dispute():
+                            # Sequence must strictly advance the currently accepted
+                            # dispute state.  This is meaningful for both the first
+                            # OPEN->DISPUTED transition and later challenges.
+                            if seq_no <= int(ch.get("dispute_seq", 0) or 0):
+                                return False
+                            if bal_caller < 0 or bal_counter < 0:
+                                return False
+                            if bal_caller + bal_counter != ch["total_deposit_sat"]:
+                                return False
+                            if caller_str == ch["opener"]:
+                                signer_addr = ch["counterparty"]
+                                bal_opener = bal_caller
+                                bal_ctr = bal_counter
                             else:
-                                self._storage._record_state_channel_balance_before(ch["opener"])
-                                self._storage._record_state_channel_balance_before(ch["counterparty"])
-                                self._storage.credit_sat(
-                                    ch["opener"],
-                                    ch["dispute_bal_opener"])
-                                self._storage.credit_sat(
-                                    ch["counterparty"],
-                                    ch["dispute_bal_counter"])
-                                f.push(1, Op.VTYPE_BOOL)  # 1 = force-closed
+                                signer_addr = ch["opener"]
+                                bal_opener = bal_counter
+                                bal_ctr = bal_caller
+                            msg_hash_b = _chan_state_msg(
+                                channel_id, seq_no, bal_opener, bal_ctr)
+                            recovered = ""
+                            for v_try in (27, 28):
+                                r = sig_r & _VMFrame.UINT256_MAX
+                                s = sig_s & _VMFrame.UINT256_MAX
+                                addr_try = _chan_recover_address(
+                                    msg_hash_b, v_try, r, s)
+                                if addr_try == signer_addr:
+                                    recovered = addr_try
+                                    break
+                            if recovered != signer_addr:
+                                return False
+                            return self._storage.raise_dispute(
+                                channel_id, seq_no, bal_opener, bal_ctr, cur_h)
+
+                        if ch["status"] == "DISPUTED":
+                            timeout_expired = (
+                                cur_h >= ch["dispute_height"] + ch["timeout_blocks"])
+                            if timeout_expired:
+                                # Extra gas for force-close (settle balances).
+                                # Once timeout has elapsed, no later challenge is
+                                # accepted; settlement uses the latest state that
+                                # successfully advanced dispute_seq.
+                                f._use_gas(2000)
+                                ok = self._storage.force_close_channel(
+                                    channel_id, cur_h)
+                                if not ok:
+                                    _chan_dispute_fail()
+                                else:
+                                    self._storage._record_state_channel_balance_before(ch["opener"])
+                                    self._storage._record_state_channel_balance_before(ch["counterparty"])
+                                    self._storage.credit_sat(
+                                        ch["opener"],
+                                        ch["dispute_bal_opener"])
+                                    self._storage.credit_sat(
+                                        ch["counterparty"],
+                                        ch["dispute_bal_counter"])
+                                    f.push(1, Op.VTYPE_BOOL)  # 1 = force-closed
+                            else:
+                                # Challenge window: a newer valid counterparty-
+                                # signed state supersedes the stale dispute.
+                                if _validate_and_raise_dispute():
+                                    f.push(2, Op.VTYPE_BOOL)
+                                else:
+                                    _chan_dispute_fail()
                         else:
-                            # Challenge window: a newer valid counterparty-
-                            # signed state supersedes the stale dispute.
                             if _validate_and_raise_dispute():
                                 f.push(2, Op.VTYPE_BOOL)
                             else:
                                 _chan_dispute_fail()
-                    else:
-                        if _validate_and_raise_dispute():
-                            f.push(2, Op.VTYPE_BOOL)
-                        else:
-                            _chan_dispute_fail()
 
             else:
                 raise RuntimeError(f"Unknown opcode 0x{op:02X}")

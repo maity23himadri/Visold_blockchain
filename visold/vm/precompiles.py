@@ -159,8 +159,8 @@ class VVMPrecompiles:
             elif address == cls.L2_VERIFIER:
                 return cls._l2_verifier(calldata, gas_limit)
             else:
-                # Unknown precompile address — fail gracefully
-                return False, b"unknown precompile", 21000
+                # Unknown precompile address — fail gracefully within gas_limit
+                return False, b"unknown precompile", min(21000, max(0, int(gas_limit)))
         except Exception as e:
             log.debug(f"Precompile {address}: execution error: {e}")
             return False, str(e).encode()[:256], gas_limit
@@ -196,6 +196,8 @@ class VVMPrecompiles:
     def _modexp(calldata: bytes, gas_limit: int) -> Tuple[bool, bytes, int]:
         """EIP-198 modular exponentiation: base^exp mod modulus."""
         if len(calldata) < 96:
+            if 200 > gas_limit:
+                return False, b"", gas_limit
             return True, b"\x00", 200  # empty inputs → zero
         b_len = int.from_bytes(calldata[0:32],  "big")
         e_len = int.from_bytes(calldata[32:64], "big")
@@ -203,11 +205,16 @@ class VVMPrecompiles:
         # Safety: cap at 1 KB each to prevent DoS
         if b_len > 1024 or e_len > 1024 or m_len > 1024:
             return False, b"", gas_limit
-        data = calldata[96:]
-        base = int.from_bytes(data[:b_len],                  "big") if b_len else 0
-        exp  = int.from_bytes(data[b_len:b_len+e_len],       "big") if e_len else 0
-        mod  = int.from_bytes(data[b_len+e_len:b_len+e_len+m_len], "big") if m_len else 0
+        total_data_len = b_len + e_len + m_len
+        data = calldata[96:96 + total_data_len]
+        if len(data) < total_data_len:
+            data = data.ljust(total_data_len, b"\x00")
+        base = int.from_bytes(data[:b_len],                         "big") if b_len else 0
+        exp  = int.from_bytes(data[b_len:b_len+e_len],              "big") if e_len else 0
+        mod  = int.from_bytes(data[b_len+e_len:total_data_len],     "big") if m_len else 0
         if mod == 0:
+            if 200 > gas_limit:
+                return False, b"", gas_limit
             return True, b"\x00" * max(m_len, 1), 200
         # EIP-2565 gas formula (simplified)
         multiplication_complexity = ((max(b_len, m_len) + 7) // 8) ** 2
@@ -358,7 +365,11 @@ class VVMPrecompiles:
             zk_proof   = bytes.fromhex(payload.get("zk_proof", ""))
         except Exception:
             return False, b"\x00" + b"FLDS", base_gas
-        if len(prev_root) != 64 or len(new_root) != 64 or len(batch_hash) != 64:
+        _HEX_CHARS = frozenset("0123456789abcdefABCDEF")
+        if (len(prev_root) != 64 or len(new_root) != 64 or len(batch_hash) != 64
+                or not all(c in _HEX_CHARS for c in prev_root)
+                or not all(c in _HEX_CHARS for c in new_root)
+                or not all(c in _HEX_CHARS for c in batch_hash)):
             return False, b"\x00" + b"ROOT", base_gas
         # Size-scaled portion of gas.
         gas = base_gas + per_byte * len(zk_proof)

@@ -24,7 +24,7 @@ Defines: ContractEventIndex
 Origin: visold_vsd_.py L21961-22091
 """
 
-from typing import TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 
 from visold.kernel.logging_setup import log
 
@@ -58,8 +58,10 @@ class ContractEventIndex:
             topic0       TEXT    NOT NULL DEFAULT '',
             topic1       TEXT    NOT NULL DEFAULT '',
             topic2       TEXT    NOT NULL DEFAULT '',
+            topic3       TEXT    NOT NULL DEFAULT '',
             log_data     TEXT    NOT NULL DEFAULT '',
-            log_index    INTEGER NOT NULL DEFAULT 0
+            log_index    INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(tx_id, log_index)
         )
 
     Indexes on (contract, block_idx), (topic0, block_idx).
@@ -74,8 +76,10 @@ class ContractEventIndex:
             topic0    TEXT    NOT NULL DEFAULT '',
             topic1    TEXT    NOT NULL DEFAULT '',
             topic2    TEXT    NOT NULL DEFAULT '',
+            topic3    TEXT    NOT NULL DEFAULT '',
             log_data  TEXT    NOT NULL DEFAULT '',
-            log_index INTEGER NOT NULL DEFAULT 0
+            log_index INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(tx_id, log_index)
         );
         CREATE INDEX IF NOT EXISTS cei_contract_block
             ON contract_event_index(contract, block_idx);
@@ -93,15 +97,38 @@ class ContractEventIndex:
         try:
             c = self._storage._conn()
             c.executescript(self._TABLE_SQL)
+            cols = {
+                row[1]
+                for row in c.execute("PRAGMA table_info(contract_event_index)").fetchall()
+            }
+            if "topic3" not in cols:
+                c.execute(
+                    "ALTER TABLE contract_event_index "
+                    "ADD COLUMN topic3 TEXT NOT NULL DEFAULT ''"
+                )
+            # Deduplicate legacy rows before enforcing UNIQUE(tx_id, log_index)
+            c.execute(
+                """DELETE FROM contract_event_index
+                   WHERE id NOT IN (
+                       SELECT MIN(id)
+                       FROM contract_event_index
+                       GROUP BY tx_id, log_index
+                   )"""
+            )
+            c.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS cei_tx_log_unique
+                   ON contract_event_index(tx_id, log_index)"""
+            )
             c.commit()
         except Exception as e:
             log.debug(f"ContractEventIndex: init error: {e}")
 
     def index_logs(self, tx_id: str, block_idx: int,
-                   contract_addr: str, logs: list):
+                   contract_addr: str, logs: list,
+                   log_index_offset: Optional[int] = None):
         """
         Index all log entries from a single VVM transaction.
-        Called atomically from save_vvm_receipt().
+        Idempotent on tx_id and preserves block-level execution order.
 
         logs: list of dicts with keys 'address', 'topics', 'data'
         """
@@ -109,19 +136,41 @@ class ContractEventIndex:
             return
         try:
             c = self._storage._conn()
+            if log_index_offset is None:
+                existing = c.execute(
+                    "SELECT MIN(log_index) FROM contract_event_index "
+                    "WHERE block_idx=? AND tx_id=?",
+                    (block_idx, tx_id),
+                ).fetchone()
+                if existing is not None and existing[0] is not None:
+                    base_idx = int(existing[0])
+                else:
+                    max_row = c.execute(
+                        "SELECT COALESCE(MAX(log_index), -1) + 1 "
+                        "FROM contract_event_index WHERE block_idx=?",
+                        (block_idx,),
+                    ).fetchone()
+                    base_idx = int(max_row[0]) if max_row and max_row[0] is not None else 0
+            else:
+                base_idx = int(log_index_offset)
+
+            # Remove any prior rows for tx_id so re-indexing is idempotent
+            c.execute("DELETE FROM contract_event_index WHERE tx_id=?", (tx_id,))
+
             for i, entry in enumerate(logs):
-                addr    = entry.get("address", contract_addr)
-                topics  = entry.get("topics", [])
+                addr   = entry.get("address", contract_addr)
+                topics = entry.get("topics", [])
                 t0 = topics[0] if len(topics) > 0 else ""
                 t1 = topics[1] if len(topics) > 1 else ""
                 t2 = topics[2] if len(topics) > 2 else ""
-                data    = entry.get("data", "")
+                t3 = topics[3] if len(topics) > 3 else ""
+                data   = entry.get("data", "")
                 c.execute(
-                    """INSERT INTO contract_event_index
-                       (block_idx, tx_id, contract, topic0, topic1, topic2,
+                    """INSERT OR REPLACE INTO contract_event_index
+                       (block_idx, tx_id, contract, topic0, topic1, topic2, topic3,
                         log_data, log_index)
-                       VALUES (?,?,?,?,?,?,?,?)""",
-                    (block_idx, tx_id, addr, t0, t1, t2, data, i)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (block_idx, tx_id, addr, t0, t1, t2, t3, data, base_idx + i)
                 )
             c.commit()
         except Exception as e:
@@ -134,11 +183,11 @@ class ContractEventIndex:
         try:
             c = self._storage._conn()
             rows = c.execute(
-                """SELECT block_idx, tx_id, topic0, topic1, topic2,
+                """SELECT block_idx, tx_id, topic0, topic1, topic2, topic3,
                           log_data, log_index
                    FROM contract_event_index
                    WHERE contract=? AND block_idx>=? AND block_idx<=?
-                   ORDER BY block_idx, log_index""",
+                   ORDER BY block_idx, log_index, id""",
                 (contract, from_block, to_block)
             ).fetchall()
             return [dict(r) for r in rows]
@@ -153,11 +202,11 @@ class ContractEventIndex:
         try:
             c = self._storage._conn()
             rows = c.execute(
-                """SELECT block_idx, tx_id, contract, topic0, topic1, topic2,
+                """SELECT block_idx, tx_id, contract, topic0, topic1, topic2, topic3,
                           log_data, log_index
                    FROM contract_event_index
                    WHERE topic0=? AND block_idx>=? AND block_idx<=?
-                   ORDER BY block_idx, log_index""",
+                   ORDER BY block_idx, log_index, id""",
                 (topic0, from_block, to_block)
             ).fetchall()
             return [dict(r) for r in rows]

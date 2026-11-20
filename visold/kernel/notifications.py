@@ -22,9 +22,23 @@
 Origin: visold_vsd_.py L3636, L3641, L3653-3690, L3693-3711, L3714-3733
 """
 
+import re
 import threading
 from collections import deque
 from datetime import datetime
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+
+
+def _sanitize_notif_text(value: object, max_len: int = 0) -> str:
+    """Strip ANSI escape sequences and control characters for single-line TUI rows."""
+    text = str(value) if value is not None else ""
+    text = _ANSI_ESCAPE_RE.sub("", text)
+    text = _CONTROL_CHAR_RE.sub(" ", text).strip()
+    if max_len > 0:
+        return text[:max_len]
+    return text
 
 
 # Ring-buffer for the "Recent Activity" panel + scrollable Activity tab.
@@ -104,8 +118,9 @@ def _push_block_notif(height: int, miner: str, source: str = "network") -> None:
     try:
         ts      = datetime.now().strftime('%H:%M:%S')
         origin  = "YOU" if source == "local" else "NET"
-        mshort  = (miner[:12] + "...") if len(miner) > 12 else miner
-        entry   = f'[{ts}|INF] ⛏ Block #{height} mined [{origin}] by {mshort}'
+        clean_miner = _sanitize_notif_text(miner)
+        mshort  = (clean_miner[:12] + "...") if len(clean_miner) > 12 else clean_miner
+        entry   = f'[{ts}|INF] ⛏ Block #{int(height)} mined [{origin}] by {mshort}'
         with _notify_buf_lock:
             _notify_buf.append(entry)
     except Exception:
@@ -123,10 +138,8 @@ def _push_incoming_transfer_notif(sender_label: str, sender_address: str,
     """
     try:
         ts = datetime.now().strftime("%H:%M:%S")
-        label = str(sender_label or "").replace("\n", " ").replace("\r", " ")
-        address = str(sender_address or "").replace("\n", " ").replace("\r", " ")
-        label = label[:32]
-        address = address[:24]
+        label = _sanitize_notif_text(sender_label or "", max_len=32)
+        address = _sanitize_notif_text(sender_address or "", max_len=24)
         entry = (f"[{ts}|INF] ↓ Incoming transfer: {label} ({address}) sent you "
                  f"{float(amount_vsd):.8f} VSD — NOT CONFIRMED")
         with _notify_buf_lock:
@@ -145,7 +158,8 @@ def _push_peer_notif(event: str, ip: str, port: int) -> None:
     """
     try:
         ts    = datetime.now().strftime('%H:%M:%S')
-        addr  = f"{ip}:{port}"
+        clean_ip = _sanitize_notif_text(ip, max_len=64)
+        addr  = f"{clean_ip}:{int(port)}"
         if event == "connected":
             entry = f'[{ts}|INF] ● Peer connected: {addr}'
         else:
@@ -169,9 +183,10 @@ def _push_sync_request_notif(peer_id: str, from_idx: int, to_idx: int,
     """
     try:
         ts    = datetime.now().strftime('%H:%M:%S')
-        pid   = (peer_id[:12] + "…") if peer_id and len(peer_id) > 12 else (peer_id or "?")
+        clean_pid = _sanitize_notif_text(peer_id or "")
+        pid   = (clean_pid[:12] + "…") if clean_pid and len(clean_pid) > 12 else (clean_pid or "?")
         entry = (f'[{ts}|INF] ⇄ Sync req from {pid}: '
-                 f'blocks {from_idx}-{to_idx} (served {blocks_sent})')
+                 f'blocks {int(from_idx)}-{int(to_idx)} (served {int(blocks_sent)})')
         with _notify_buf_lock:
             _notify_buf.append(entry)
     except Exception:

@@ -120,7 +120,7 @@ class VVMAssembler:
 
         # Pull every name from Op that maps to an int opcode
         for name in dir(Op):
-            if name.startswith("_"):
+            if name.startswith("_") or name.startswith("VTYPE_"):
                 continue
             val = getattr(Op, name)
             if not isinstance(val, int):
@@ -241,12 +241,29 @@ class VVMAssembler:
                 # silently use it instead of raising an error.  This handles
                 # the common "PUSH1 256" mistake without breaking the contract.
                 if val_int < 0:
-                    # Two's-complement: compute signed value in the requested
-                    # width (same as _int_to_bytes) then check it fits.
-                    val_masked = val_int & ((1 << (operand_bytes * 8)) - 1)
-                    fits_in_requested = True   # masking always fits
-                    actual_bytes = operand_bytes
-                    val_int = val_masked
+                    # Two's-complement signed range for n bytes is [-(2^(8n-1)), 2^(8n-1)-1].
+                    min_signed = -(1 << (operand_bytes * 8 - 1))
+                    if val_int < min_signed:
+                        actual_bytes = None
+                        for n in range(operand_bytes + 1, 33):
+                            if val_int >= -(1 << (n * 8 - 1)):
+                                actual_bytes = n
+                                break
+                        if actual_bytes is None:
+                            errors.append(
+                                f"Line {lineno}: value {val_int} exceeds "
+                                f"maximum 32-byte signed PUSH operand range")
+                            continue
+                        upgraded_mnem = f"PUSH{actual_bytes}"
+                        warnings.append(
+                            f"Line {lineno}: {mnem} operand {val_int} does "
+                            f"not fit in {operand_bytes} byte(s) (signed); "
+                            f"upgraded to {upgraded_mnem}")
+                        opcode = Op.PUSH1 + (actual_bytes - 1)
+                        operand_bytes = actual_bytes
+                    else:
+                        actual_bytes = operand_bytes
+                    val_int = val_int & ((1 << (actual_bytes * 8)) - 1)
                 else:
                     fits_in_requested = val_int < (1 << (operand_bytes * 8))
                     if not fits_in_requested:
@@ -499,11 +516,16 @@ class VVMAssembler:
     @staticmethod
     def _parse_literal(raw: str, lineno: int):
         """Return (int_value, error_string_or_None)."""
+        if raw.startswith("Op.VTYPE_"):
+            attr = raw[3:]
+            val = getattr(Op, attr, None)
+            if isinstance(val, int):
+                return val, None
         if VVMAssembler._RE_HEX_LIT.match(raw):
             return int(raw, 16), None
         if VVMAssembler._RE_DEC_LIT.match(raw):
             return int(raw, 10), None
-        return None, f"Line {lineno}: invalid literal '{raw}' (expected 0x… hex or decimal)"
+        return None, f"Line {lineno}: invalid literal '{raw}' (expected 0x… hex, decimal, or Op.VTYPE_*)"
 
     @staticmethod
     def _int_to_bytes(value: int, n_bytes: int) -> bytes:

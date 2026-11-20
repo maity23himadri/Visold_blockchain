@@ -218,8 +218,12 @@ class MultiSignalConfirmationWindow:
         """
         key = (report.kind.value, report.affected_addr or "")
         now = time.time()
+        cutoff = now - self.WINDOW_SECS
         with self._lock:
-            recent = list(self._windows[key])
+            buf = self._windows[key]
+            while buf and buf[0].detected_at < cutoff:
+                buf.popleft()
+            recent = [r for r in buf if r.detected_at >= cutoff]
 
         if not recent:
             return report.confidence
@@ -552,7 +556,7 @@ class RiskScoringEngine:
         agg_confidence: float,
         freq_penalty: float,
     ) -> RiskScore:
-        z = abs(report.z_score)
+        z = report.z_score
 
         # Component 1: Confidence [0, 30]
         c_score = agg_confidence * self.W_CONFIDENCE

@@ -24,7 +24,9 @@ Defines: MetricsCollector
 Origin: visold_vsd_.py L5586-5661, L5665
 """
 
+import math
 import re
+import statistics
 import threading
 from collections import deque
 from typing import Dict
@@ -60,11 +62,23 @@ class MetricsCollector:
             raise ValueError(f"Metric name '{name}' is empty after sanitization")
         return sanitized
 
+    @staticmethod
+    def _validate_number(value: float, *, allow_negative: bool = True) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"Metric value must be a real number, got {type(value).__name__}")
+        fval = float(value)
+        if not math.isfinite(fval):
+            raise ValueError(f"Metric value must be finite, got {value!r}")
+        if not allow_negative and fval < 0.0:
+            raise ValueError(f"Metric value must be non-negative, got {value!r}")
+        return fval
+
     # ── Gauge (set absolute value) ────────────────────────────────────────────
     def set_gauge(self, name: str, value: float):
         name = self._sanitize_metric_name(name)
+        fval = self._validate_number(value, allow_negative=True)
         with self._lock:
-            self._gauges[name] = value
+            self._gauges[name] = fval
 
     def get_gauge(self, name: str, default: float = 0.0) -> float:
         name = self._sanitize_metric_name(name)
@@ -74,8 +88,9 @@ class MetricsCollector:
     # ── Counter (increment) ───────────────────────────────────────────────────
     def inc(self, name: str, amount: float = 1.0):
         name = self._sanitize_metric_name(name)
+        famt = self._validate_number(amount, allow_negative=False)
         with self._lock:
-            self._counters[name] = self._counters.get(name, 0.0) + amount
+            self._counters[name] = self._counters.get(name, 0.0) + famt
 
     def get_counter(self, name: str) -> float:
         name = self._sanitize_metric_name(name)
@@ -84,8 +99,9 @@ class MetricsCollector:
 
     # ── Block time histogram ───────────────────────────────────────────────────
     def record_block_time(self, seconds: float):
+        fsec = self._validate_number(seconds, allow_negative=False)
         with self._lock:
-            self._block_times.append(seconds)
+            self._block_times.append(fsec)
 
     def avg_block_time(self) -> float:
         with self._lock:
@@ -101,12 +117,15 @@ class MetricsCollector:
                 lines.append(f"# TYPE visold_{name} gauge")
                 lines.append(f"visold_{name} {val}")
             for name, val in self._counters.items():
-                lines.append(f"# TYPE visold_{name} counter")
-                lines.append(f"visold_{name}_total {val}")
+                metric_name = name if name.endswith("_total") else f"{name}_total"
+                lines.append(f"# TYPE visold_{metric_name} counter")
+                lines.append(f"visold_{metric_name} {val}")
             if self._block_times:
-                avg = sum(self._block_times) / len(self._block_times)
+                med = statistics.median(self._block_times)
+                total_sec = sum(self._block_times)
                 lines.append("# TYPE visold_block_time_seconds summary")
-                lines.append(f"visold_block_time_seconds{{quantile=\"0.5\"}} {avg:.3f}")
+                lines.append(f'visold_block_time_seconds{{quantile="0.5"}} {med:.3f}')
+                lines.append(f"visold_block_time_seconds_sum {total_sec:.3f}")
                 lines.append(f"visold_block_time_seconds_count {len(self._block_times)}")
         return "\n".join(lines) + "\n"
 

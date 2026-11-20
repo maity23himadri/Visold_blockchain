@@ -72,10 +72,16 @@ class RoleManager:
                float(getattr(Config, "MIN_TX_FEE_SAT", 1000)) / 100_000_000)
         # Auto-derive nonce the same way send_transaction does.
         try:
-            chain_nonce = self.storage.get_nonce(sender)
-            pending_count = len(
-                self.blockchain.mempool._pending_nonces.get(sender, set()))
-            nonce = chain_nonce + pending_count
+            mempool = getattr(self.blockchain, "mempool", None)
+            if mempool is not None and callable(getattr(mempool, "next_nonce", None)):
+                nonce = mempool.next_nonce(sender)
+            else:
+                chain_nonce = self.storage.get_nonce(sender)
+                pending = (mempool._pending_nonces.get(sender, set())
+                           if mempool is not None else set())
+                nonce = chain_nonce
+                while nonce in pending:
+                    nonce += 1
         except Exception:
             nonce = 0
 
@@ -113,6 +119,8 @@ class RoleManager:
         # registration — top-ups (additive stake on an existing miner role)
         # may be any positive amount.
         _existing_for_min_check = self.storage.get_role(addr)
+        if _existing_for_min_check and _existing_for_min_check.get("slashed"):
+            return False, "Address is slashed and cannot register as a miner."
         _is_initial = not (_existing_for_min_check
                            and _existing_for_min_check.get("role") == "miner")
         if _is_initial and stake_sat < Config.MIN_MINER_STAKE:
@@ -131,10 +139,16 @@ class RoleManager:
         # Without this, a user could submit the same stake twice back-to-back
         # because the first tx hasn't been mined yet and the preflight still
         # sees the full balance as free.
-        pending_reg_sat, _pending_xfer_sat, pending_fee_sat = \
+        if self.blockchain is None or self.state_engine is None:
+            return False, ("RoleManager not wired to blockchain/state_engine — "
+                           "node still initializing, try again in a moment.")
+        pending_reg_sat, pending_xfer_sat, pending_fee_sat = (
             self.blockchain.mempool.pending_outflow_sat(addr)
+            if getattr(self.blockchain, "mempool", None) is not None
+            else (0, 0, 0)
+        )
         spendable_sat = (balance_sat - current_stake_sat
-                         - pending_reg_sat - pending_fee_sat)
+                         - pending_reg_sat - pending_xfer_sat - pending_fee_sat)
         fee_sat = Transaction(sender=addr, receiver="", amount=float(stake),
                               fee=0.0, memo="miner",
                               tx_type=Transaction.TYPE_REGISTER).compute_fee_sat()
@@ -176,6 +190,8 @@ class RoleManager:
         # (additive stake on an existing investor role) may be any
         # positive amount, mirroring register_miner's behaviour.
         _existing_for_min_check = self.storage.get_role(addr)
+        if _existing_for_min_check and _existing_for_min_check.get("slashed"):
+            return False, "Address is slashed and cannot register as an investor."
         _is_initial = not (_existing_for_min_check
                            and _existing_for_min_check.get("role") == "investor")
         if _is_initial and stake_sat < Config.MIN_INVESTOR_STAKE:
@@ -192,10 +208,16 @@ class RoleManager:
         # v7.2.x FIX: see register_miner — subtract pending mempool stake
         # and pending fees so a second stake can't race past the preflight
         # while the first one is still in the pool.
-        pending_reg_sat, _pending_xfer_sat, pending_fee_sat = \
+        if self.blockchain is None or self.state_engine is None:
+            return False, ("RoleManager not wired to blockchain/state_engine — "
+                           "node still initializing, try again in a moment.")
+        pending_reg_sat, pending_xfer_sat, pending_fee_sat = (
             self.blockchain.mempool.pending_outflow_sat(addr)
+            if getattr(self.blockchain, "mempool", None) is not None
+            else (0, 0, 0)
+        )
         spendable_sat = (balance_sat - current_stake_sat
-                         - pending_reg_sat - pending_fee_sat)
+                         - pending_reg_sat - pending_xfer_sat - pending_fee_sat)
         fee_sat = Transaction(sender=addr, receiver="", amount=float(stake),
                               fee=0.0, memo="investor",
                               tx_type=Transaction.TYPE_REGISTER).compute_fee_sat()

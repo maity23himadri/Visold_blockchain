@@ -153,15 +153,36 @@ class CapabilityRouter:
 
     def record_peer_capabilities(self, peer_id: str, caps: List[str]):
         """Record capabilities advertised by a peer."""
+        if not isinstance(peer_id, str) or not peer_id:
+            return
+        if not isinstance(caps, (list, tuple, set)):
+            log.debug("CapabilityRouter: ignoring non-sequence capabilities payload")
+            return
+        raw_items = list(caps)[:32]
+        cap_set = {
+            c.strip() for c in raw_items
+            if isinstance(c, str) and 0 < len(c.strip()) <= 64
+        }
         with self._lock:
-            cap_set = set(caps)
-            self._peer_caps[peer_id] = cap_set
+            old_caps = self._peer_caps.get(peer_id, set())
+            dropped = old_caps - cap_set
+            for old_cap in dropped:
+                peers_for_cap = self._cap_index.get(old_cap)
+                if peers_for_cap is not None:
+                    peers_for_cap.discard(peer_id)
+                    if not peers_for_cap:
+                        self._cap_index.pop(old_cap, None)
+            if cap_set:
+                self._peer_caps[peer_id] = cap_set
+            else:
+                self._peer_caps.pop(peer_id, None)
             for cap in cap_set:
                 self._cap_index[cap].add(peer_id)
         try:
             c = self._storage._conn()
             now = int(time.time())
-            for cap in caps:
+            c.execute("DELETE FROM peer_capabilities WHERE peer_id=?", (peer_id,))
+            for cap in cap_set:
                 c.execute("""
                     INSERT OR REPLACE INTO peer_capabilities
                     (peer_id, capability, updated_at) VALUES (?,?,?)
@@ -211,7 +232,11 @@ class CapabilityRouter:
         with self._lock:
             caps = self._peer_caps.pop(peer_id, set())
             for cap in caps:
-                self._cap_index[cap].discard(peer_id)
+                peers_for_cap = self._cap_index.get(cap)
+                if peers_for_cap is not None:
+                    peers_for_cap.discard(peer_id)
+                    if not peers_for_cap:
+                        self._cap_index.pop(cap, None)
         try:
             self._storage._conn().execute(
                 "DELETE FROM peer_capabilities WHERE peer_id=?", (peer_id,))

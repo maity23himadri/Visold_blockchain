@@ -26,7 +26,11 @@ Origin: visold_vsd_.py L49242-49274, L49277-49279, L49283-49332, L49335-49371, L
 
 import hashlib
 import json
+import math
 import time
+
+from visold.kernel.units import from_satoshi, to_satoshi
+from visold.ledger.addressing import is_valid_protocol_address
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -147,11 +151,13 @@ class Coinbase:
             "tx_type":   RewardConfig.TX_TYPE_REWARD,
             "sender":    RewardConfig.COINBASE_SENDER,
             "receiver":  self.miner_address,
-            "amount":    int(self.amount),
-            "fee":       0,
+            "amount":    from_satoshi(int(self.amount)),
+            "fee":       0.0,
             "nonce":     int(self.height),
             "timestamp": int(self.timestamp),
-            "signature": "",
+            "pub_hex":   "",
+            "sig_hex":   "",
+            "memo":      f"coinbase:{int(self.height)}",
             "data": json.dumps({
                 "subsidy":     int(self.subsidy),
                 "fees":        int(self.fees),
@@ -172,13 +178,13 @@ def build_coinbase(miner_address, height, subsidy, fees,
     validated; callers never need to sanity-check the result."""
     if not isinstance(miner_address, str) or not miner_address:
         raise RewardError("coinbase: miner_address must be non-empty str")
-    if not miner_address.startswith(("VSD", "vsd")):
-        raise RewardError("coinbase: miner_address is not a Visold address")
-    if not isinstance(height, int) or height < 0:
+    if not is_valid_protocol_address(miner_address, allow_contract=False):
+        raise RewardError("coinbase: miner_address is not a valid Visold wallet address")
+    if isinstance(height, bool) or not isinstance(height, int) or height < 0:
         raise RewardError("coinbase: height must be a non-negative int")
-    if not isinstance(subsidy, int) or subsidy < 0:
+    if isinstance(subsidy, bool) or not isinstance(subsidy, int) or subsidy < 0:
         raise RewardError("coinbase: subsidy must be a non-negative int")
-    if not isinstance(fees, int) or fees < 0:
+    if isinstance(fees, bool) or not isinstance(fees, int) or fees < 0:
         raise RewardError("coinbase: fees must be a non-negative int")
     if fees > RewardConfig.MAX_FEES_PER_BLOCK:
         raise RewardError(
@@ -187,6 +193,19 @@ def build_coinbase(miner_address, height, subsidy, fees,
     if consensus not in ("pow", "pos"):
         raise RewardError(
             "coinbase: consensus must be pow|pos, got {!r}".format(consensus))
+    if not isinstance(extra_nonce, (bytes, bytearray)):
+        raise RewardError("coinbase: extra_nonce must be bytes or bytearray")
+
+    if timestamp is None:
+        ts_int = int(time.time())
+    else:
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+            raise RewardError("coinbase: timestamp must be a finite number")
+        if isinstance(timestamp, float) and not math.isfinite(timestamp):
+            raise RewardError("coinbase: timestamp must be a finite number")
+        if timestamp < 0:
+            raise RewardError("coinbase: timestamp must be non-negative")
+        ts_int = int(timestamp)
 
     total = subsidy + fees
     if total > RewardConfig.MAX_COINBASE_OUTPUT:
@@ -201,7 +220,7 @@ def build_coinbase(miner_address, height, subsidy, fees,
         fees            = int(fees),
         consensus       = consensus,
         extra_nonce_hex = extra_nonce.hex() if extra_nonce else "",
-        timestamp       = int(timestamp if timestamp is not None else time.time()),
+        timestamp       = ts_int,
     )
 
 
@@ -219,30 +238,43 @@ def compute_tx_fee(tx, utxo_lookup):
 
     inputs_total  = 0
     outputs_total = 0
+    tx_id = _tx_id(tx)
 
     for tin in _tx_inputs(tx):
-        utxo = utxo_lookup(tin["prev_txid"], int(tin["prev_vout"]))
+        if not isinstance(tin, dict) or "prev_txid" not in tin or "prev_vout" not in tin:
+            raise RewardError(f"tx {tx_id}: malformed input record")
+        prev_vout = _require_strict_int(tin["prev_vout"], f"tx {tx_id} input prev_vout")
+        if prev_vout < 0:
+            raise RewardError(f"tx {tx_id}: negative input prev_vout")
+        utxo = utxo_lookup(tin["prev_txid"], prev_vout)
         if utxo is None:
             raise RewardError(
                 "tx {}: spends missing utxo {}:{}".format(
-                    _tx_id(tx), tin["prev_txid"], tin["prev_vout"]))
-        inputs_total += int(utxo["amount"])
+                    tx_id, tin["prev_txid"], prev_vout))
+        if not isinstance(utxo, dict) or "amount" not in utxo:
+            raise RewardError(f"tx {tx_id}: malformed utxo record")
+        in_amt = _require_strict_int(utxo["amount"], f"tx {tx_id} input amount")
+        if in_amt < 0:
+            raise RewardError(f"tx {tx_id}: negative input amount")
+        inputs_total += in_amt
 
     for tout in _tx_outputs(tx):
-        amt = int(tout["amount"])
+        if not isinstance(tout, dict) or "amount" not in tout:
+            raise RewardError(f"tx {tx_id}: malformed output record")
+        amt = _require_strict_int(tout["amount"], f"tx {tx_id} output amount")
         if amt < 0:
-            raise RewardError("tx {}: negative output amount".format(_tx_id(tx)))
+            raise RewardError("tx {}: negative output amount".format(tx_id))
         outputs_total += amt
 
     fee = inputs_total - outputs_total
     if fee < 0:
         raise RewardError(
             "tx {}: outputs ({}) exceed inputs ({}) — negative fee".format(
-                _tx_id(tx), outputs_total, inputs_total))
+                tx_id, outputs_total, inputs_total))
     if fee > RewardConfig.MAX_FEE_PER_TX:
         raise RewardError(
             "tx {}: fee {} exceeds MAX_FEE_PER_TX {} — likely user error "
-            "or attack".format(_tx_id(tx), fee, RewardConfig.MAX_FEE_PER_TX))
+            "or attack".format(tx_id, fee, RewardConfig.MAX_FEE_PER_TX))
     return fee
 
 
@@ -286,8 +318,12 @@ def validate_block_rewards(block, expected_subsidy, chain_tip_height,
     cb = txs[0]
     if not _is_coinbase_like(cb):
         raise RewardError("block tx[0] is not a coinbase")
-    if _tx_signature(cb):
-        raise RewardError("coinbase must have empty signature")
+    if _g(cb, "tx_type") != RewardConfig.TX_TYPE_REWARD:
+        raise RewardError(
+            "coinbase tx_type must be {!r}, got {!r}".format(
+                RewardConfig.TX_TYPE_REWARD, _g(cb, "tx_type")))
+    if _tx_signature(cb) or _g(cb, "pub_hex", ""):
+        raise RewardError("coinbase must have empty signature and pub_hex")
     if _tx_sender(cb) != RewardConfig.COINBASE_SENDER:
         raise RewardError(
             "coinbase sender must be {!r}, got {!r}".format(
@@ -302,14 +338,17 @@ def validate_block_rewards(block, expected_subsidy, chain_tip_height,
 
     # Decode coinbase payload
     payload = _decode_coinbase_data(cb)
-    subsidy_claim = int(payload.get("subsidy", -1))
-    fees_claim    = int(payload.get("fees", -1))
+    if "subsidy" not in payload or "fees" not in payload:
+        raise RewardError("coinbase data must include 'subsidy' and 'fees'")
+    subsidy_claim = _require_strict_int(payload["subsidy"], "coinbase subsidy")
+    fees_claim    = _require_strict_int(payload["fees"], "coinbase fees")
 
     # R4
-    if subsidy_claim != int(expected_subsidy):
+    expected_sub_int = _require_strict_int(expected_subsidy, "expected_subsidy")
+    if subsidy_claim != expected_sub_int:
         raise RewardError(
             "coinbase subsidy claim {} != expected {} for height {}".format(
-                subsidy_claim, expected_subsidy,
+                subsidy_claim, expected_sub_int,
                 getattr(block, "height", getattr(block, "index", "?"))))
 
     # R5 (only when utxo_lookup is available)
@@ -326,7 +365,7 @@ def validate_block_rewards(block, expected_subsidy, chain_tip_height,
                     fees_claim))
 
     # R6
-    total_out = int(_tx_amount(cb))
+    total_out = _tx_amount(cb)
     if total_out != subsidy_claim + fees_claim:
         raise RewardError(
             "coinbase amount {} != subsidy+fees ({}+{})".format(
@@ -338,16 +377,16 @@ def validate_block_rewards(block, expected_subsidy, chain_tip_height,
 
     # R7
     receiver = _tx_receiver(cb)
-    if (not isinstance(receiver, str)
-            or not receiver
-            or not receiver.startswith(("VSD", "vsd"))):
+    if not is_valid_protocol_address(receiver, allow_contract=False):
         raise RewardError(
-            "coinbase receiver is not a Visold address: {!r}".format(receiver))
+            "coinbase receiver is not a valid Visold wallet address: {!r}".format(receiver))
 
     # R8
-    claimed_height = int(_tx_nonce(cb))
-    block_height   = int(getattr(block, "height",
-                                 getattr(block, "index", -1)))
+    claimed_height = _tx_nonce(cb)
+    raw_block_height = getattr(block, "height", None)
+    if raw_block_height is None:
+        raw_block_height = getattr(block, "index", None)
+    block_height = _require_strict_int(raw_block_height, "block height")
     if claimed_height != block_height:
         raise RewardError(
             "coinbase nonce {} != block height {}".format(
@@ -366,25 +405,44 @@ def assert_inputs_mature(tx, utxo_lookup, chain_tip_height):
     if _is_coinbase_like(tx):
         return  # coinbase has no inputs
 
+    tx_id = _tx_id(tx)
     for tin in _tx_inputs(tx):
-        utxo = utxo_lookup(tin["prev_txid"], int(tin["prev_vout"]))
+        if not isinstance(tin, dict) or "prev_txid" not in tin or "prev_vout" not in tin:
+            raise RewardError(f"tx {tx_id}: malformed input record")
+        prev_vout = _require_strict_int(tin["prev_vout"], f"tx {tx_id} input prev_vout")
+        if prev_vout < 0:
+            raise RewardError(f"tx {tx_id}: negative input prev_vout")
+        utxo = utxo_lookup(tin["prev_txid"], prev_vout)
         if utxo is None:
             # Double-spend / missing utxo is handled elsewhere; do not mask
             # it as a maturity error.
             continue
+        if not isinstance(utxo, dict):
+            raise RewardError(f"tx {tx_id}: malformed utxo record")
         if not utxo.get("is_coinbase"):
             continue
-        created = int(utxo["height"])
+        if "height" not in utxo:
+            raise RewardError(f"tx {tx_id}: coinbase utxo missing height")
+        created = _require_strict_int(utxo["height"], f"tx {tx_id} utxo height")
         confirmations = chain_tip_height - created + 1
         if confirmations < RewardConfig.COINBASE_MATURITY:
             raise RewardError(
                 "tx {}: spends immature coinbase {}:{} "
                 "(confirmations={}, required={})".format(
-                    _tx_id(tx), tin["prev_txid"], tin["prev_vout"],
+                    tx_id, tin["prev_txid"], prev_vout,
                     confirmations, RewardConfig.COINBASE_MATURITY))
 
 
 # ── Helpers: tolerate both attribute-style (Transaction) and dict-style txs
+def _require_strict_int(value, label: str) -> int:
+    """Require an exact int (rejecting bool, float, str, None) or raise RewardError."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RewardError(
+            f"{label} must be an integer, got {type(value).__name__}"
+        )
+    return value
+
+
 def _g(tx, name, default=None):
     if isinstance(tx, dict):
         return tx.get(name, default)
@@ -411,21 +469,48 @@ def _tx_sender(tx):    return str(_g(tx, "sender", ""))
 def _tx_receiver(tx):  return str(_g(tx, "receiver", ""))
 
 
-def _tx_amount(tx):    return int(_g(tx, "amount", 0) or 0)
+def _tx_amount(tx):
+    if isinstance(tx, Coinbase):
+        return int(tx.amount)
+    raw = _g(tx, "amount", None)
+    if raw is None:
+        raise RewardError("coinbase missing amount")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise RewardError("coinbase amount must be numeric")
+    try:
+        return to_satoshi(raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RewardError(f"invalid coinbase amount: {exc}") from exc
 
 
-def _tx_nonce(tx):     return int(_g(tx, "nonce", 0) or 0)
+def _tx_nonce(tx):
+    raw = _g(tx, "nonce", None)
+    if raw is None:
+        raise RewardError("coinbase missing nonce")
+    return _require_strict_int(raw, "coinbase.nonce")
 
 
-def _tx_signature(tx): return str(_g(tx, "signature", "") or "")
+def _tx_signature(tx):
+    return str(_g(tx, "sig_hex", "") or _g(tx, "signature", "") or "")
 
 
 def _decode_coinbase_data(cb):
-    raw = _g(cb, "data", "") or ""
-    if not raw:
+    raw = _g(cb, "data", "")
+    if raw is None or raw == "":
         return {}
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, (str, bytes, bytearray)):
+        raise RewardError(
+            f"coinbase data field must be a JSON string, got {type(raw).__name__}"
+        )
     try:
-        return json.loads(raw)
+        decoded = json.loads(raw)
     except Exception as e:
         raise RewardError(
             "coinbase data field is not valid JSON: {}".format(e))
+    if not isinstance(decoded, dict):
+        raise RewardError(
+            f"coinbase data JSON must be an object, got {type(decoded).__name__}"
+        )
+    return decoded

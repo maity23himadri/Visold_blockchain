@@ -112,6 +112,8 @@ def _rfc6979_nonce(priv: int, msg: bytes) -> int:
 
 def _vrf_point_to_bytes(pt: ECPoint) -> bytes:
     """Compressed SEC encoding of a secp256k1 point (02/03 prefix)."""
+    if pt is None or pt.is_inf():
+        raise ValueError("Cannot encode point at infinity")
     prefix = b'\x02' if (pt.y & 1) == 0 else b'\x03'
     return prefix + pt.x.to_bytes(32, 'big')
 
@@ -172,8 +174,7 @@ def _vrf_challenge(pub_bytes: bytes, H: ECPoint, Gamma: ECPoint,
                    U: ECPoint, V: ECPoint) -> int:
     """ECVRF_challenge_generation: hash five secp256k1 points to a 128-bit int."""
     def enc(pt: ECPoint) -> bytes:
-        prefix = b'\x02' if (pt.y & 1) == 0 else b'\x03'
-        return prefix + pt.x.to_bytes(32, 'big')
+        return _vrf_point_to_bytes(pt)
 
     data = (_VRF_SUITE + b"\x02"
             + pub_bytes
@@ -205,6 +206,11 @@ def vrf_prove(priv: int, alpha: bytes) -> tuple:
      10. beta  = SHA256(SUITE || 0x03 || compress(Gamma))
     """
     N = _SECP256K1_N
+    if isinstance(priv, bool) or not isinstance(priv, int) or not (1 <= priv < N):
+        raise ValueError("VRF private key must be an integer in [1, N-1]")
+    if not isinstance(alpha, (bytes, bytearray, memoryview)):
+        raise TypeError("VRF alpha must be bytes-like")
+    alpha = bytes(alpha)
 
     # Step 1: public key via cryptography library (no hand-rolled math)
     pub_pt    = _vrf_scalar_mul_G(priv)
@@ -265,6 +271,10 @@ def vrf_verify(pub_hex: str, alpha: bytes, proof: bytes, beta: bytes) -> bool:
 
         # 1. Decode public key (secp256k1, consistent with wallet)
         pub_pt    = pub_from_hex(pub_hex)
+        if pub_pt.is_inf() or not (0 <= pub_pt.x < _SECP256K1_P and 0 <= pub_pt.y < _SECP256K1_P):
+            return False
+        if pow(pub_pt.y, 2, _SECP256K1_P) != (pow(pub_pt.x, 3, _SECP256K1_P) + 7) % _SECP256K1_P:
+            return False
         pub_bytes = _vrf_point_to_bytes(pub_pt)
 
         # 2. Decode proof
@@ -280,6 +290,8 @@ def vrf_verify(pub_hex: str, alpha: bytes, proof: bytes, beta: bytes) -> bool:
             return False
         P   = _SECP256K1_P
         gx  = int.from_bytes(gamma_bytes[1:], 'big')
+        if not (0 < gx < P):
+            return False
         gy2 = (pow(gx, 3, P) + 7) % P              # secp256k1: y² = x³ + 7
         gy  = pow(gy2, (P + 1) // 4, P)
         if pow(gy, 2, P) != gy2 % P:

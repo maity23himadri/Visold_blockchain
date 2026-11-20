@@ -292,7 +292,7 @@ class Storage:
                 return int(rows[0]["s"]) if rows else 0
             cur = self._conn().cursor()
             cur.execute(
-                "SELECT COALESCE(SUM(CAST(stake * ? AS INTEGER)),0) "
+                "SELECT COALESCE(SUM(CAST(ROUND(stake * ?) AS INTEGER)),0) "
                 "FROM roles WHERE slashed=0", (Config.SATOSHI_PER_VSD,))
             row = cur.fetchone()
             return int(row[0]) if row else 0
@@ -309,7 +309,7 @@ class Storage:
                 return int(rows[0]["s"]) if rows else 0
             cur = self._conn().cursor()
             cur.execute(
-                "SELECT COALESCE(SUM(CAST(stake * ? AS INTEGER)),0) "
+                "SELECT COALESCE(SUM(CAST(ROUND(stake * ?) AS INTEGER)),0) "
                 "FROM roles WHERE slashed=1", (Config.SATOSHI_PER_VSD,))
             row = cur.fetchone()
             return int(row[0]) if row else 0
@@ -1191,9 +1191,27 @@ class Storage:
                 except Exception as exc:
                     raise RuntimeError(
                         f"PGX recovery could not remove uncommitted RocksDB block #{height}") from exc
-            rocks_tip = int(self._rocks.tip_height())
             rb = self._rocks.get_block(canonical_tip) if canonical_tip >= 0 else None
-            rocks_hash = str(rb.get("block_hash", "")) if rb else ""
+            rh = self._rocks.get_header(canonical_tip) if (canonical_tip >= 0 and rb is None) else None
+            rocks_hash = (
+                str(rb.get("block_hash", "")) if rb is not None
+                else (str(rh.get("block_hash", "")) if rh is not None else "")
+            )
+            try:
+                meta_batch = self._rocks.new_batch()
+                if canonical_tip >= 0:
+                    self._rocks.put_meta(meta_batch, _META_CHAIN_TIP, _u64(canonical_tip))
+                    self._rocks.put_meta(
+                        meta_batch, _META_TIP_HASH, rocks_hash.encode("ascii"))
+                else:
+                    self._rocks.delete_meta(meta_batch, _META_CHAIN_TIP)
+                    self._rocks.delete_meta(meta_batch, _META_TIP_HASH)
+                self._rocks.commit(meta_batch, sync=True)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"PGX recovery could not rewind RocksDB tip metadata to #{canonical_tip}"
+                ) from exc
+            rocks_tip = int(self._rocks.tip_height())
 
         if rocks_tip < canonical_tip:
             raise RuntimeError(
@@ -1219,80 +1237,99 @@ class Storage:
             return
 
         self._commit_lock.acquire()
-
-        async def _start():
-            conn = await self._pg._pool.acquire()
-            tx = conn.transaction()
-            await tx.start()
-            return conn, tx
-
-        conn, tx = self._pg.run(_start())
+        committed = False
+        conn = None
+        tx = None
+        conn_released = False
         state = {
-            "conn": conn,
-            "tx": tx,
+            "conn": None,
+            "tx": None,
             "commit": False,
             "rocks_changes": [],
             "after_commit": [],
             "pending_tip": None,
         }
-        self._pgx_block_local.conn = conn
-        self._pgx_block_local.state = state
-        committed = False
         try:
-            yield state
-            if not state.get("commit"):
-                self._pg.run(tx.rollback())
-                self._pg.run(self._pg._pool.release(conn))
-                self._pgx_restore_rocks_changes(state.get("rocks_changes", []))
-                return
-
-            expected = state.get("pending_tip")
-            try:
-                self._pg.run(tx.commit())
-                committed = True
-            except BaseException as commit_exc:
-                # asyncpg cannot always distinguish "server committed, client
-                # lost response" from "server rolled back". Resolve using the
-                # durable canonical marker before deciding whether RocksDB may
-                # be deleted. Never delete on an unknown outcome.
+            async def _start():
+                c = await self._pg._pool.acquire()
                 try:
-                    self._pg.run(self._pg._pool.release(conn))
-                except Exception:
-                    pass
-                self._pgx_block_local.conn = None
-                self._pgx_block_local.state = None
-                if expected is not None and self._pgx_resolve_commit_outcome(
-                        expected[0], expected[1]):
-                    committed = True
-                else:
-                    state["commit_exception_is_ambiguous"] = True
-                    log.error(
-                        "PGX transaction COMMIT outcome is ambiguous at #%s; "
-                        "leaving RocksDB intact for startup reconciliation: %s",
-                        expected[0] if expected else "?", commit_exc)
+                    t = c.transaction()
+                    await t.start()
+                    return c, t
+                except BaseException:
+                    try:
+                        await self._pg._pool.release(c)
+                    except Exception:
+                        pass
                     raise
-            else:
-                try:
-                    self._pg.run(self._pg._pool.release(conn))
-                except Exception:
-                    pass
-        except BaseException:
-            if not committed:
-                try:
-                    # If control reached here after a normal-body exception,
-                    # the transaction is still open.  A failed rollback is
-                    # harmless because RocksDB cleanup below is conditional.
+
+            conn, tx = self._pg.run(_start())
+            state["conn"] = conn
+            state["tx"] = tx
+            self._pgx_block_local.conn = conn
+            self._pgx_block_local.state = state
+            try:
+                yield state
+                if not state.get("commit"):
                     self._pg.run(tx.rollback())
-                except Exception:
-                    pass
-                try:
-                    self._pg.run(self._pg._pool.release(conn))
-                except Exception:
-                    pass
-                # Do not perform cleanup after an ambiguous COMMIT outcome.
-                if state.get("commit_exception_is_ambiguous") is not True:
+                    try:
+                        self._pg.run(self._pg._pool.release(conn))
+                    finally:
+                        conn_released = True
                     self._pgx_restore_rocks_changes(state.get("rocks_changes", []))
-            raise
+                    return
+
+                expected = state.get("pending_tip")
+                try:
+                    self._pg.run(tx.commit())
+                    committed = True
+                except BaseException as commit_exc:
+                    # asyncpg cannot always distinguish "server committed, client
+                    # lost response" from "server rolled back". Resolve using the
+                    # durable canonical marker before deciding whether RocksDB may
+                    # be deleted. Never delete on an unknown outcome.
+                    try:
+                        self._pg.run(self._pg._pool.release(conn))
+                    except Exception:
+                        pass
+                    finally:
+                        conn_released = True
+                    self._pgx_block_local.conn = None
+                    self._pgx_block_local.state = None
+                    if expected is not None and self._pgx_resolve_commit_outcome(
+                            expected[0], expected[1]):
+                        committed = True
+                    else:
+                        state["commit_exception_is_ambiguous"] = True
+                        log.error(
+                            "PGX transaction COMMIT outcome is ambiguous at #%s; "
+                            "leaving RocksDB intact for startup reconciliation: %s",
+                            expected[0] if expected else "?", commit_exc)
+                        raise
+                else:
+                    try:
+                        self._pg.run(self._pg._pool.release(conn))
+                    except Exception:
+                        pass
+                    finally:
+                        conn_released = True
+            except BaseException:
+                if not committed:
+                    if tx is not None and not conn_released:
+                        try:
+                            self._pg.run(tx.rollback())
+                        except Exception:
+                            pass
+                    if conn is not None and not conn_released:
+                        try:
+                            self._pg.run(self._pg._pool.release(conn))
+                        except Exception:
+                            pass
+                        conn_released = True
+                    # Do not perform cleanup after an ambiguous COMMIT outcome.
+                    if state.get("commit_exception_is_ambiguous") is not True:
+                        self._pgx_restore_rocks_changes(state.get("rocks_changes", []))
+                raise
         finally:
             self._pgx_block_local.conn = None
             self._pgx_block_local.state = None
@@ -1410,8 +1447,12 @@ class Storage:
         """
         if not journal:
             return
-        channels = journal.get("channels", journal if "channels" not in journal else {})
-        accounts = journal.get("accounts", {})
+        if "channels" in journal or "accounts" in journal:
+            channels = journal.get("channels") or {}
+            accounts = journal.get("accounts") or {}
+        else:
+            channels = journal
+            accounts = {}
 
         # Restore database state first.  Account restoration intentionally uses
         # Storage.restore_accounts(), which keeps the PG/SQLite/cache projections
@@ -1498,40 +1539,58 @@ class Storage:
                     log.warning("state-channel aux restore failed: %s", exc)
             self._pgx_after_commit(_mirror_channels)
             return
-            return
 
-        c = self._conn()
-        try:
-            for channel_id, previous in channels.items():
-                c.execute("DELETE FROM state_channels WHERE channel_id=?",
-                          (str(channel_id),))
-                if previous is not None:
-                    c.execute(
-                        """INSERT INTO state_channels
-                           (channel_id, contract_addr, opener, counterparty,
-                            total_deposit_sat, opener_deposit_sat, timeout_blocks,
-                            open_height, status, dispute_seq, dispute_bal_opener,
-                            dispute_bal_counter, dispute_height, closed_height)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (str(previous.get("channel_id", channel_id)),
-                         str(previous.get("contract_addr", "")),
-                         str(previous.get("opener", "")),
-                         str(previous.get("counterparty", "")),
-                         int(previous.get("total_deposit_sat", 0)),
-                         int(previous.get("opener_deposit_sat", 0)),
-                         int(previous.get("timeout_blocks", 100)),
-                         int(previous.get("open_height", 0)),
-                         str(previous.get("status", "OPEN")),
-                         int(previous.get("dispute_seq", 0)),
-                         int(previous.get("dispute_bal_opener", 0)),
-                         int(previous.get("dispute_bal_counter", 0)),
-                         int(previous.get("dispute_height", 0)),
-                         int(previous.get("closed_height", 0))))
-            c.commit()
+        with self._sqlite_api_lock:
+            c = self._conn()
+            in_atomic = c.atomic_active()
+            sp_name = "sp_restore_state_channel_journal"
+            if in_atomic:
+                c.execute(f"SAVEPOINT {sp_name}")
+            try:
+                for channel_id, previous in channels.items():
+                    c.execute("DELETE FROM state_channels WHERE channel_id=?",
+                              (str(channel_id),))
+                    if previous is not None:
+                        c.execute(
+                            """INSERT INTO state_channels
+                               (channel_id, contract_addr, opener, counterparty,
+                                total_deposit_sat, opener_deposit_sat, timeout_blocks,
+                                open_height, status, dispute_seq, dispute_bal_opener,
+                                dispute_bal_counter, dispute_height, closed_height)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (str(previous.get("channel_id", channel_id)),
+                             str(previous.get("contract_addr", "")),
+                             str(previous.get("opener", "")),
+                             str(previous.get("counterparty", "")),
+                             int(previous.get("total_deposit_sat", 0)),
+                             int(previous.get("opener_deposit_sat", 0)),
+                             int(previous.get("timeout_blocks", 100)),
+                             int(previous.get("open_height", 0)),
+                             str(previous.get("status", "OPEN")),
+                             int(previous.get("dispute_seq", 0)),
+                             int(previous.get("dispute_bal_opener", 0)),
+                             int(previous.get("dispute_bal_counter", 0)),
+                             int(previous.get("dispute_height", 0)),
+                             int(previous.get("closed_height", 0))))
+                if in_atomic:
+                    c.execute(f"RELEASE SAVEPOINT {sp_name}")
+                else:
+                    c.commit()
+            except BaseException:
+                if in_atomic:
+                    try:
+                        c.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                        c.execute(f"RELEASE SAVEPOINT {sp_name}")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        c.rollback()
+                    except Exception:
+                        pass
+                raise
+        if not in_atomic:
             self._maybe_checkpoint()
-        except Exception:
-            c.rollback()
-            raise
 
     # ╔════════════════════════════════════════════════════════════════════════╗
     # ║  BALANCES / NONCES   (PostgreSQL accounts table + Redis cache)         ║
@@ -1880,6 +1939,31 @@ class Storage:
 
     def _save_block_sqlite(self, block):
         c = self._conn()
+        height = int(block.index)
+        bhash = str(block.block_hash)
+        existing_row = c.execute(
+            "SELECT block_hash FROM blocks WHERE idx=?", (height,)
+        ).fetchone()
+        if existing_row is not None:
+            current_hash = str(existing_row["block_hash"] or "")
+            if current_hash and current_hash != bhash:
+                raise ValueError(
+                    f"SQLite save_block hash conflict at height {height}: "
+                    f"canonical={current_hash}, incoming={bhash}"
+                )
+        else:
+            tip_row = c.execute("SELECT MAX(idx) AS h FROM blocks").fetchone()
+            canonical_tip = (
+                int(tip_row["h"])
+                if tip_row and tip_row["h"] is not None
+                else -1
+            )
+            if height != canonical_tip + 1:
+                raise ValueError(
+                    f"SQLite save_block requires canonical append at "
+                    f"{canonical_tip + 1}, received height {height}"
+                )
+
         if self._block_db.enabled:
             self._block_db.put_block(block)
             data_json_col = ""
@@ -1896,7 +1980,7 @@ class Storage:
         c.execute(
             "CREATE TABLE IF NOT EXISTS tx_replay_guard (tx_id TEXT PRIMARY KEY)")
         for tx in block.transactions:
-            c.execute("""INSERT OR REPLACE INTO transactions
+            c.execute("""INSERT OR IGNORE INTO transactions
                 (tx_id,block_idx,sender,receiver,amount,fee,timestamp,data_json)
                 VALUES (?,?,?,?,?,?,?,?)""",
                 (tx.tx_id, block.index, tx.sender, tx.receiver, tx.amount,
@@ -2065,78 +2149,76 @@ class Storage:
                 self._rocks.delete_block(batch, idx, bhash)
                 for tx_id in tx_ids:
                     self._rocks.delete_tx_loc(batch, tx_id)
+                rewound_tip: Optional[int] = None
+                rewound_hash: str = ""
                 # Keep the canonical tip metadata consistent with the actual
                 # highest stored block. Only rewind when the deleted block is
-                # the current RocksDB tip; never disturb a different tip.
-                if current_tip == idx:
-                    if idx > 0:
-                        prev = self._rocks.get_block(idx - 1)
-                        if prev is not None:
-                            self._rocks.put_meta(
-                                batch, _META_CHAIN_TIP, _u64(idx - 1))
-                            self._rocks.put_meta(
-                                batch, _META_TIP_HASH,
-                                str(prev.get("block_hash", "")).encode("ascii"))
-                        else:
-                            self._rocks.delete_meta(batch, _META_CHAIN_TIP)
-                            self._rocks.delete_meta(batch, _META_TIP_HASH)
+                # the current RocksDB tip (or matches _pgx_canonical_tip).
+                if current_tip == idx or self._pgx_canonical_tip == idx:
+                    if idx > 0 and prev is not None:
+                        rewound_tip = idx - 1
+                        rewound_hash = str(prev.get("block_hash", ""))
+                        self._rocks.put_meta(
+                            batch, _META_CHAIN_TIP, _u64(rewound_tip))
+                        self._rocks.put_meta(
+                            batch, _META_TIP_HASH,
+                            rewound_hash.encode("ascii"))
                     else:
-                        # No genesis remains; let Blockchain.height() perform
-                        # its existing deterministic genesis self-heal.
+                        rewound_tip = -1
+                        rewound_hash = ""
                         self._rocks.delete_meta(batch, _META_CHAIN_TIP)
                         self._rocks.delete_meta(batch, _META_TIP_HASH)
                 self._rocks.commit(batch, sync=True)
 
             # PG metadata is canonical transaction projection in pgx mode.
-            # Keep transaction rows and replay guards in one PG transaction.
-            if replay_ids:
-                try:
-                    async def _cleanup_pgx():
-                        async with self._pg._pool.acquire() as c:
-                            async with c.transaction():
-                                await c.execute(
-                                    "DELETE FROM transactions WHERE block_idx=$1",
-                                    idx)
+            # Keep transaction rows, replay guards, and canonical tip marker
+            # updates in one PG transaction.
+            try:
+                async def _cleanup_pgx():
+                    async with self._pg._pool.acquire() as c:
+                        async with c.transaction():
+                            await c.execute(
+                                "DELETE FROM transactions WHERE block_idx=$1",
+                                idx)
+                            if replay_ids:
                                 await c.executemany(
                                     "DELETE FROM tx_replay_guard WHERE tx_id=$1",
                                     [(tx_id,) for tx_id in replay_ids])
-                                if replay_ids:
-                                    await c.execute(
-                                        "DELETE FROM vvm_receipts WHERE block_idx=$1",
-                                        idx)
                                 await c.execute(
-                                    "DELETE FROM node_meta WHERE key=$1",
-                                    f"block_apply:{idx}")
+                                    "DELETE FROM vvm_receipts WHERE block_idx=$1",
+                                    idx)
+                            await c.execute(
+                                "DELETE FROM node_meta WHERE key=$1",
+                                f"block_apply:{idx}")
+                            await c.execute(
+                                "DELETE FROM node_meta WHERE key=$1",
+                                f"block_role_undo:{idx}")
+                            await c.execute(
+                                "DELETE FROM node_meta WHERE key=$1",
+                                f"bft_validator_snapshot:{idx}")
+                            if rewound_tip is not None:
                                 await c.execute(
-                                    "DELETE FROM node_meta WHERE key=$1",
-                                    f"block_role_undo:{idx}")
+                                    """INSERT INTO node_meta (key, value) VALUES ($1,$2)
+                                       ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""",
+                                    "canonical_tip_height", str(rewound_tip))
                                 await c.execute(
-                                    "DELETE FROM node_meta WHERE key=$1",
-                                    f"bft_validator_snapshot:{idx}")
-                    self._pg.run(_cleanup_pgx())
-                except Exception as exc:
-                    # Do not silently claim rollback succeeded when the PG
-                    # canonical projection could not be cleaned. The RocksDB
-                    # block has already been removed; this is a hard consistency
-                    # failure that must be surfaced to the caller.
-                    log.error(
-                        "delete_block(%d): PG canonical cleanup failed: %s",
-                        idx, exc)
-                    return False
-            else:
-                try:
-                    self._pg_exec("DELETE FROM transactions WHERE block_idx=$1", idx)
-                    self._pg_exec("DELETE FROM node_meta WHERE key=$1",
-                                  f"block_apply:{idx}")
-                    self._pg_exec("DELETE FROM node_meta WHERE key=$1",
-                                  f"block_role_undo:{idx}")
-                    self._pg_exec("DELETE FROM node_meta WHERE key=$1",
-                                  f"bft_validator_snapshot:{idx}")
-                except Exception as exc:
-                    log.error(
-                        "delete_block(%d): PG transaction cleanup failed: %s",
-                        idx, exc)
-                    return False
+                                    """INSERT INTO node_meta (key, value) VALUES ($1,$2)
+                                       ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""",
+                                    "canonical_tip_hash", rewound_hash)
+                self._pg.run(_cleanup_pgx())
+            except Exception as exc:
+                # Do not silently claim rollback succeeded when the PG
+                # canonical projection could not be cleaned. The RocksDB
+                # block has already been removed; this is a hard consistency
+                # failure that must be surfaced to the caller.
+                log.error(
+                    "delete_block(%d): PG canonical cleanup failed: %s",
+                    idx, exc)
+                return False
+
+            if rewound_tip is not None:
+                self._pgx_canonical_tip = rewound_tip
+                self._pgx_canonical_tip_hash = rewound_hash
 
             # The auxiliary SQLite DB is deliberately *not* the PGX VVM receipt
             # store.  vvm_receipts is canonical in PostgreSQL and is not mirrored
@@ -2225,12 +2307,15 @@ class Storage:
         return data
 
     def get_block(self, idx: int) -> Optional['Block']:
+        idx = int(idx)
+        if idx < 0:
+            return None
         if self._pgx_enabled:
             active = self._pgx_active_state()
             canonical_tip = (int(active["pending_tip"][0])
                               if active is not None and active.get("pending_tip")
                               else int(self._pgx_canonical_tip))
-            if int(idx) > canonical_tip:
+            if idx > canonical_tip:
                 return None
             d = self._rocks.get_block(idx)
             return Block.from_dict(d) if d else None
@@ -2255,6 +2340,29 @@ class Storage:
             return None
         data = self._normalize_persisted_block_dict(json.loads(row["data_json"]))
         return Block.from_dict(data)
+
+    def get_blocks_at_height(self, idx: int) -> List['Block']:
+        """Return all known blocks at height `idx` (canonical plus any
+        non-canonical blocks referenced by validator votes at that height)."""
+        blocks: List['Block'] = []
+        seen_hashes: set = set()
+        canonical = self.get_block(idx)
+        if canonical is not None:
+            blocks.append(canonical)
+            seen_hashes.add(canonical.block_hash)
+        try:
+            votes = self.get_validator_votes_at_height(int(idx))
+        except Exception:
+            votes = []
+        for vote in votes or []:
+            bhash = str(vote.get("block_hash", ""))
+            if not bhash or bhash in seen_hashes:
+                continue
+            alt = self.get_block_by_hash(bhash)
+            if alt is not None and int(getattr(alt, "index", idx)) == int(idx):
+                blocks.append(alt)
+                seen_hashes.add(bhash)
+        return blocks
 
     def get_block_hash(self, idx: int) -> Optional[str]:
         """Return the canonical block hash without deserializing a Block object."""
@@ -2298,11 +2406,18 @@ class Storage:
         Missing heights are omitted in the same way as the old per-height
         ``get_block()`` loop.
         """
-        start_idx = int(start_idx)
+        start_idx = max(0, int(start_idx))
         end_idx = int(end_idx)
         if end_idx < start_idx:
             return []
         if self._pgx_enabled:
+            active = self._pgx_active_state()
+            canonical_tip = (int(active["pending_tip"][0])
+                              if active is not None and active.get("pending_tip")
+                              else int(self._pgx_canonical_tip))
+            end_idx = min(end_idx, canonical_tip)
+            if end_idx < start_idx:
+                return []
             out = []
             for idx in range(start_idx, end_idx + 1):
                 hdr = self._rocks.get_header(idx)
@@ -2325,16 +2440,24 @@ class Storage:
         MTP consensus check. Missing heights are omitted exactly as the old
         per-height get_block() loop did.
         """
-        start_idx = int(start_idx)
+        start_idx = max(0, int(start_idx))
         end_idx = int(end_idx)
         if end_idx < start_idx:
             return []
         if self._pgx_enabled:
-            rows = self._pg_fetch(
-                "SELECT idx, timestamp FROM blocks "
-                "WHERE idx >= $1 AND idx <= $2 ORDER BY idx",
-                start_idx, end_idx)
-            return [int(r["timestamp"]) for r in rows]
+            active = self._pgx_active_state()
+            canonical_tip = (int(active["pending_tip"][0])
+                              if active is not None and active.get("pending_tip")
+                              else int(self._pgx_canonical_tip))
+            end_idx = min(end_idx, canonical_tip)
+            if end_idx < start_idx:
+                return []
+            out = []
+            for idx in range(start_idx, end_idx + 1):
+                hdr = self._rocks.get_header(idx)
+                if hdr:
+                    out.append(int(hdr.get("timestamp", 0)))
+            return out
         rows = self._conn().execute(
             "SELECT timestamp FROM blocks WHERE idx >= ? AND idx <= ? ORDER BY idx",
             (start_idx, end_idx)).fetchall()
@@ -2343,7 +2466,7 @@ class Storage:
     def get_block_by_hash(self, h: str) -> Optional['Block']:
         if self._pgx_enabled:
             d = self._rocks.get_block_by_hash(h)
-            if not d:
+            if not d or str(d.get("block_hash", "")) != str(h):
                 return None
             active = self._pgx_active_state()
             canonical_tip = (int(active["pending_tip"][0])
@@ -2432,10 +2555,12 @@ class Storage:
         return row["h"] if row and row["h"] is not None else -1
 
     def get_last_n_blocks(self, n: int) -> List['Block']:
+        n = max(0, int(n))
+        if n == 0:
+            return []
         if self._pgx_enabled:
-            n = max(0, int(n))
             tip = self.chain_height()
-            if n == 0 or tip < 0:
+            if tip < 0:
                 return []
             out = []
             for h in range(tip, max(-1, tip - n), -1):
@@ -2445,15 +2570,29 @@ class Storage:
             out.reverse()
             return out
         if self._block_db.enabled:
-            ds = self._block_db.get_last_n_blocks(n)
-            if ds:
-                return [Block.from_dict(d) for d in ds]
+            rows = self._conn().execute(
+                "SELECT idx, block_hash, data_json FROM blocks "
+                "ORDER BY idx DESC LIMIT ?",
+                (n,)).fetchall()
+            out = []
+            for r in reversed(rows):
+                d = self._block_db.get_block_by_height(int(r["idx"]))
+                if d is not None:
+                    if str(d.get("block_hash", "")) == str(r["block_hash"] or ""):
+                        out.append(Block.from_dict(d))
+                elif r["data_json"]:
+                    data = self._normalize_persisted_block_dict(
+                        json.loads(r["data_json"]))
+                    out.append(Block.from_dict(data))
+            return out
         rows = self._conn().execute(
             "SELECT data_json FROM blocks ORDER BY idx DESC LIMIT ?", (n,)).fetchall()
         out = []
         for r in reversed(rows):
             if r["data_json"]:
-                out.append(Block.from_dict(json.loads(r["data_json"])))
+                data = self._normalize_persisted_block_dict(
+                    json.loads(r["data_json"]))
+                out.append(Block.from_dict(data))
         return out
 
     # ╔════════════════════════════════════════════════════════════════════════╗
@@ -2850,7 +2989,8 @@ class Storage:
                           (CASE WHEN slashed THEN 1 ELSE 0 END) AS slashed,
                           registered_at
                      FROM validators
-                    WHERE role=$1 AND slashed=FALSE""", role)
+                    WHERE role=$1 AND slashed=FALSE
+                    ORDER BY address ASC""", role)
             out = []
             for r in rows:
                 d = dict(r)
@@ -2858,7 +2998,9 @@ class Storage:
                 out.append(d)
             return out
         rows = self._conn().execute(
-            "SELECT * FROM roles WHERE role=? AND slashed=0", (role,)).fetchall()
+            "SELECT * FROM roles WHERE role=? AND slashed=0 ORDER BY address ASC",
+            (role,),
+        ).fetchall()
         return [dict(r) for r in rows]
 
     def get_all_roles(self) -> List[dict]:
@@ -2908,6 +3050,47 @@ class Storage:
         self._conn().commit()
         return int(getattr(cur, "rowcount", 0) or 0) == 1
 
+    def get_rate_defection_state(self) -> Optional[dict]:
+        raw = self.get_meta("rate_defection_state")
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def set_rate_defection_state(self, payload: dict) -> None:
+        self.set_meta("rate_defection_state", json.dumps(payload))
+
+    def slash_with_rate(self, address: str, rate: float) -> bool:
+        """Apply graduated rate-defection slash (0.0 < rate <= 1.0) to a role/validator."""
+        try:
+            pct = max(0.0, min(1.0, float(rate)))
+        except (TypeError, ValueError):
+            return False
+        factor = max(0.0, 1.0 - pct)
+        mark_slashed = pct >= 1.0
+        if self._pgx_enabled:
+            status = self._pg_exec(
+                """UPDATE validators
+                      SET slashed=(slashed OR $3),
+                          stake_sat=FLOOR(stake_sat * $2)::BIGINT
+                    WHERE address=$1""",
+                address, factor, mark_slashed)
+            try:
+                return int(str(status).rsplit(" ", 1)[-1]) >= 1
+            except Exception:
+                return False
+        cur = self._conn().execute(
+            """UPDATE roles
+                  SET slashed=CASE WHEN ? THEN 1 ELSE slashed END,
+                      stake=stake * ?
+                WHERE address=?""",
+            (1 if mark_slashed else 0, factor, address))
+        self._conn().commit()
+        return int(getattr(cur, "rowcount", 0) or 0) >= 1
+
     def get_validators(self) -> List[dict]:
         """Return the exact validator snapshot for the canonical tip.
 
@@ -2934,11 +3117,14 @@ class Storage:
                 f"validator snapshot unavailable at canonical tip {height}")
         out = []
         for item in snapshot:
+            stake_sat = int(item.get("stake_sat", 0))
+            if stake_sat <= 0:
+                continue
             address = str(item["address"])
             role = self.get_role(address)
             out.append({
                 "address": address,
-                "stake_sat": int(item.get("stake_sat", 0)),
+                "stake_sat": stake_sat,
                 "slashed": bool(role and role.get("slashed", False)),
             })
         return out
@@ -3023,7 +3209,7 @@ class Storage:
 
     def mempool_add(self, tx: 'Transaction'):
         payload = json.dumps(tx.to_dict())
-        fee_sat = int(to_satoshi(tx.compute_fee()))
+        fee_sat = int(tx.compute_fee_sat())
         if self._pgx_enabled:
             self._cache.mempool_add(tx.tx_id, fee_sat, payload.encode())
             try:
@@ -3039,7 +3225,7 @@ class Storage:
         self._conn().execute(
             """INSERT OR IGNORE INTO mempool (tx_id,fee,timestamp,data_json)
                VALUES (?,?,?,?)""",
-            (tx.tx_id, tx.compute_fee(), tx.timestamp, payload))
+            (tx.tx_id, from_satoshi(fee_sat), tx.timestamp, payload))
         self._conn().commit()
 
     def mempool_remove(self, tx_id: str):
@@ -3137,6 +3323,8 @@ class Storage:
         the first claim in canonical transaction order owns the name forever
         unless a future transfer/expiry protocol is added explicitly.
         """
+        if isinstance(user_id, str):
+            user_id = user_id.strip().casefold()
         if self._pgx_enabled:
             self._pg_exec(
                 """INSERT INTO name_claims
@@ -3223,6 +3411,8 @@ class Storage:
 
     def save_identity(self, user_id: str, peer_id: str, wallet_addr: str,
                       pub_hex: str, multiaddrs: List[str]):
+        if isinstance(user_id, str):
+            user_id = user_id.strip().casefold()
         if self._pgx_enabled:
             self._pg_exec(
                 """INSERT INTO identities
@@ -3251,22 +3441,26 @@ class Storage:
         The legacy identities table is treated as a liveness/directory cache.
         It can never create ownership and cannot override name_claims.
         """
+        if isinstance(user_id, str):
+            user_id = user_id.strip().casefold()
         claim = self.resolve_name_claim(user_id)
         if not claim:
             return None
+        canonical_uid = claim.get("user_id") or user_id
         if self._pgx_enabled:
             row = self._pg_fetchrow(
-                "SELECT * FROM identities WHERE user_id=$1", user_id)
+                "SELECT * FROM identities WHERE user_id=$1", canonical_uid)
         else:
             row = self._conn().execute(
-                "SELECT * FROM identities WHERE user_id=?", (user_id,)).fetchone()
+                "SELECT * FROM identities WHERE user_id=?",
+                (canonical_uid,)).fetchone()
         if row:
             d = dict(row)
             try: d["multiaddrs"] = json.loads(d.get("multiaddrs") or "[]")
             except Exception: d["multiaddrs"] = []
         else:
             d = {
-                "user_id": user_id,
+                "user_id": canonical_uid,
                 "peer_id": sha256(claim["pub_hex"].encode()),
                 "wallet_addr": claim["wallet_addr"],
                 "pub_hex": claim["pub_hex"],
@@ -3275,7 +3469,7 @@ class Storage:
             }
         # Canonical fields always win over mutable directory metadata.
         d.update({
-            "user_id": user_id,
+            "user_id": canonical_uid,
             "wallet_addr": claim["wallet_addr"],
             "pub_hex": claim["pub_hex"],
             "registered_height": claim["registered_height"],
@@ -3300,10 +3494,16 @@ class Storage:
         try:
             with self._aux_lock:
                 self._conn().execute(
-                    """INSERT OR REPLACE INTO peers
+                    """INSERT INTO peers
                        (peer_id, ip, port, last_seen, reputation, fail_count,
                         blacklisted, ban_score, tls_fp)
-                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                       VALUES (?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(peer_id) DO UPDATE SET
+                           ip=excluded.ip,
+                           port=excluded.port,
+                           last_seen=excluded.last_seen,
+                           reputation=excluded.reputation,
+                           fail_count=0""",
                     (peer_id, ip, int(port), int(last_seen),
                      float(reputation), int(fail_count),
                      int(blacklisted), int(ban_score), tls_fp or ""))
@@ -3522,6 +3722,24 @@ class Storage:
             "UPDATE peers SET blacklisted=1 WHERE peer_id=?", (peer_id,))
         self._conn().commit()
 
+    def is_peer_blacklisted(self, peer_id: str) -> bool:
+        """Return True if peer_id is blacklisted (fail-closed on storage error)."""
+        if not peer_id:
+            return False
+        try:
+            if self._pgx_enabled:
+                row = self._pg_fetchrow(
+                    "SELECT blacklisted FROM peers WHERE peer_id=$1", peer_id)
+                return bool(row and row["blacklisted"])
+            row = self._conn().execute(
+                "SELECT blacklisted FROM peers WHERE peer_id=?",
+                (peer_id,)).fetchone()
+            return bool(row and row["blacklisted"])
+        except Exception as exc:
+            log.debug("Peer blacklist lookup failed for %s: %s; failing closed",
+                      str(peer_id)[:12], exc)
+            return True
+
     def peer_count(self) -> int:
         if self._pgx_enabled:
             row = self._pg_fetchrow(
@@ -3628,26 +3846,49 @@ class Storage:
                 self._pgx_after_commit(self._mirror_balance_to_aux, addr, bal)
         else:
             # ── SQLite: single commit at the end ──────────────────────
-            c = self._conn()
-            for addr, bal in bal_updates.items():
-                c.execute(
-                    "INSERT OR REPLACE INTO balances (address, balance) "
-                    "VALUES (?,?)", (addr, int(bal)))
-            for addr, nonce in non_updates.items():
-                c.execute(
-                    "INSERT OR REPLACE INTO account_nonces (address, nonce) "
-                    "VALUES (?,?)", (addr, int(nonce)))
-            for addr, vol_d in vol_deltas.items():
-                row = c.execute(
-                    "SELECT volume FROM ht_volume WHERE address=?",
-                    (addr,)).fetchone()
-                cur_vol = int(row["volume"]) if row else 0
-                c.execute(
-                    "INSERT OR REPLACE INTO ht_volume "
-                    "(address, volume, updated) VALUES (?,?,?)",
-                    (addr, cur_vol + int(vol_d), int(time.time())))
-            c.commit()
-            self._maybe_checkpoint()
+            with self._sqlite_api_lock:
+                c = self._conn()
+                in_atomic = c.atomic_active()
+                sp_name = "sp_flush_block_batch"
+                if in_atomic:
+                    c.execute(f"SAVEPOINT {sp_name}")
+                try:
+                    for addr, bal in bal_updates.items():
+                        c.execute(
+                            "INSERT OR REPLACE INTO balances (address, balance) "
+                            "VALUES (?,?)", (addr, int(bal)))
+                    for addr, nonce in non_updates.items():
+                        c.execute(
+                            "INSERT OR REPLACE INTO account_nonces (address, nonce) "
+                            "VALUES (?,?)", (addr, int(nonce)))
+                    for addr, vol_d in vol_deltas.items():
+                        row = c.execute(
+                            "SELECT volume FROM ht_volume WHERE address=?",
+                            (addr,)).fetchone()
+                        cur_vol = int(row["volume"]) if row else 0
+                        c.execute(
+                            "INSERT OR REPLACE INTO ht_volume "
+                            "(address, volume, updated) VALUES (?,?,?)",
+                            (addr, cur_vol + int(vol_d), int(time.time())))
+                    if in_atomic:
+                        c.execute(f"RELEASE SAVEPOINT {sp_name}")
+                    else:
+                        c.commit()
+                except BaseException:
+                    if in_atomic:
+                        try:
+                            c.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                            c.execute(f"RELEASE SAVEPOINT {sp_name}")
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            c.rollback()
+                        except Exception:
+                            pass
+                    raise
+            if not in_atomic:
+                self._maybe_checkpoint()
 
     def get_peer_tls_fp(self, peer_id: str) -> Optional[str]:
         if self._pgx_enabled:
@@ -3666,6 +3907,14 @@ class Storage:
             self._pg_exec(
                 "UPDATE peers SET tls_fp=$2, updated_at=now() WHERE peer_id=$1",
                 peer_id, fingerprint)
+            try:
+                with self._aux_lock:
+                    self._conn().execute(
+                        "UPDATE peers SET tls_fp=? WHERE peer_id=?",
+                        (fingerprint, peer_id))
+                    self._conn().commit()
+            except Exception:
+                pass
             return
         self._conn().execute(
             "UPDATE peers SET tls_fp=? WHERE peer_id=?", (fingerprint, peer_id))
@@ -3689,8 +3938,9 @@ class Storage:
         if self._pgx_enabled:
             row = self._pg_fetchrow(
                 """UPDATE peers SET
-                       ban_score   = ban_score + $2,
-                       blacklisted = (ban_score + $2) >= $3,
+                       ban_score   = COALESCE(ban_score, 0) + $2,
+                       blacklisted = COALESCE(blacklisted, FALSE)
+                                     OR ((COALESCE(ban_score, 0) + $2) >= $3),
                        updated_at  = now()
                     WHERE peer_id=$1
                    RETURNING ban_score, blacklisted""",
@@ -3707,20 +3957,21 @@ class Storage:
                     self._conn().commit()
             except Exception:
                 pass
-            if bl:
+            if bl and new_score >= Config.PEER_BAN_SCORE_THRESHOLD:
                 log.warning(f"Peer {peer_id[:12]} auto-banned (ban_score={new_score})")
             return new_score
         row = self._conn().execute(
-            "SELECT ban_score FROM peers WHERE peer_id=?", (peer_id,)).fetchone()
+            "SELECT ban_score, blacklisted FROM peers WHERE peer_id=?", (peer_id,)).fetchone()
         if not row:
             return 0
         new_score = (row["ban_score"] or 0) + points
-        blacklisted = 1 if new_score >= Config.PEER_BAN_SCORE_THRESHOLD else 0
+        was_blacklisted = bool(row["blacklisted"])
+        blacklisted = 1 if (was_blacklisted or new_score >= Config.PEER_BAN_SCORE_THRESHOLD) else 0
         self._conn().execute(
             "UPDATE peers SET ban_score=?, blacklisted=? WHERE peer_id=?",
             (new_score, blacklisted, peer_id))
         self._conn().commit()
-        if blacklisted:
+        if blacklisted and not was_blacklisted:
             log.warning(f"Peer {peer_id[:12]} auto-banned (ban_score={new_score})")
         return new_score
 
@@ -4075,29 +4326,49 @@ class Storage:
                 pass
             return code_hash
 
-        c = self._conn()
-        try:
-            row = c.execute(
-                "SELECT code_hash FROM contract_accounts WHERE address=?",
-                (address,)).fetchone()
-            if row:
-                code_hash = row["code_hash"]
-            c.execute(
-                "DELETE FROM contract_storage WHERE contract_addr=?",
-                (address,))
-            c.execute(
-                "DELETE FROM contract_storage_tags WHERE contract_addr=?",
-                (address,))
-            c.execute(
-                "DELETE FROM contract_accounts WHERE address=?",
-                (address,))
-            c.commit()
-            self._maybe_checkpoint()
-            return code_hash
-        except Exception as exc:
-            c.rollback()
-            log.error("remove_contract(%s) failed: %s", address[:16], exc)
-            return None
+        with self._sqlite_api_lock:
+            c = self._conn()
+            in_atomic = c.atomic_active()
+            sp_name = "sp_remove_contract"
+            if in_atomic:
+                c.execute(f"SAVEPOINT {sp_name}")
+            try:
+                row = c.execute(
+                    "SELECT code_hash FROM contract_accounts WHERE address=?",
+                    (address,)).fetchone()
+                if row:
+                    code_hash = row["code_hash"]
+                c.execute(
+                    "DELETE FROM contract_storage WHERE contract_addr=?",
+                    (address,))
+                c.execute(
+                    "DELETE FROM contract_storage_tags WHERE contract_addr=?",
+                    (address,))
+                c.execute(
+                    "DELETE FROM contract_accounts WHERE address=?",
+                    (address,))
+                if in_atomic:
+                    c.execute(f"RELEASE SAVEPOINT {sp_name}")
+                else:
+                    c.commit()
+                    self._maybe_checkpoint()
+                return code_hash
+            except Exception as exc:
+                if in_atomic:
+                    try:
+                        c.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                        c.execute(f"RELEASE SAVEPOINT {sp_name}")
+                    except Exception:
+                        pass
+                    log.error("remove_contract(%s) failed inside atomic block: %s",
+                              address[:16], exc)
+                    raise
+                try:
+                    c.rollback()
+                except Exception:
+                    pass
+                log.error("remove_contract(%s) failed: %s", address[:16], exc)
+                return None
 
     # ── AUDIT-FIX (Batch D): Native State Channel Storage API ─────────────────
     # Moved here from Blockchain, where every one of these six methods called
@@ -4702,10 +4973,15 @@ class Storage:
     def increment_cumulative_issued_sat(self, amount_sat: int) -> None:
         """AUDIT-FIX-16: add amount_sat (must be new issuance, not a
         transfer) to the running cumulative-issuance counter."""
-        if amount_sat == 0:
+        amount = int(amount_sat)
+        if amount < 0:
+            raise ValueError(
+                f"increment_cumulative_issued_sat requires non-negative amount, got {amount}"
+            )
+        if amount == 0:
             return
         self.set_meta("cumulative_issued_sat",
-                      str(self.get_cumulative_issued_sat() + int(amount_sat)))
+                      str(self.get_cumulative_issued_sat() + amount))
 
     def set_meta_batch(self, values: Dict[str, str]):
         """Atomically upsert a group of node metadata values.
@@ -4941,28 +5217,24 @@ class Storage:
                 c.commit(); deleted["transactions"] = len(ids)
         if meta_cutoff > 0:
             rows = c.execute(
-                "SELECT key FROM node_meta WHERE key LIKE 'proto_sig:%' LIMIT ?",
-                (self.PRUNE_BATCH_SIZE,)).fetchall()
-            prunable = []
-            for r in rows:
-                try:
-                    hh = int(r["key"].split(":")[1])
-                    if hh < meta_cutoff: prunable.append(r["key"])
-                except (IndexError, ValueError): pass
+                "SELECT key FROM node_meta WHERE key LIKE 'proto_sig:%' "
+                "AND SUBSTR(key, 11) != '' AND SUBSTR(key, 11) NOT GLOB '*[^0-9]*' "
+                "AND CAST(SUBSTR(key, 11) AS INTEGER) < ? LIMIT ?",
+                (meta_cutoff, self.PRUNE_BATCH_SIZE),
+            ).fetchall()
+            prunable = [r["key"] for r in rows]
             if prunable:
                 c.executemany("DELETE FROM node_meta WHERE key=?",
                               [(k,) for k in prunable])
                 c.commit(); deleted["node_meta_signals"] = len(prunable)
         if apply_cutoff > 0:
             rows = c.execute(
-                "SELECT key FROM node_meta WHERE key LIKE 'block_apply:%' LIMIT ?",
-                (self.PRUNE_BATCH_SIZE,)).fetchall()
-            prunable_apply = []
-            for r in rows:
-                try:
-                    hh = int(r["key"].split(":")[1])
-                    if hh < apply_cutoff: prunable_apply.append(r["key"])
-                except (IndexError, ValueError): pass
+                "SELECT key FROM node_meta WHERE key LIKE 'block_apply:%' "
+                "AND SUBSTR(key, 13) != '' AND SUBSTR(key, 13) NOT GLOB '*[^0-9]*' "
+                "AND CAST(SUBSTR(key, 13) AS INTEGER) < ? LIMIT ?",
+                (apply_cutoff, self.PRUNE_BATCH_SIZE),
+            ).fetchall()
+            prunable_apply = [r["key"] for r in rows]
             if prunable_apply:
                 c.executemany("DELETE FROM node_meta WHERE key=?",
                               [(k,) for k in prunable_apply])
@@ -5119,6 +5391,7 @@ class Storage:
                 self._conn().commit()
         except Exception:
             pass
+        self.set_meta("cumulative_issued_sat", "0")
 
     def restore_snapshot_state(self, payload: dict) -> None:
         """Replace canonical state from a verified snapshot payload.
@@ -5266,6 +5539,7 @@ class Storage:
                         await c.execute("DELETE FROM contract_accounts")
                         await c.execute("DELETE FROM name_claims")
                         await c.execute("DELETE FROM state_channels")
+                        await c.execute("DELETE FROM vvm_receipts")
 
                         if balances:
                             await c.executemany(
@@ -5346,18 +5620,39 @@ class Storage:
                     self._cache.cache_balance(address, sat)
             except Exception:
                 pass
+            try:
+                with self._aux_lock:
+                    aux_c = self._conn()
+                    has_ei = aux_c.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='contract_event_index'"
+                    ).fetchone()
+                    if has_ei:
+                        aux_c.execute("DELETE FROM contract_event_index")
+                        aux_c.commit()
+            except Exception as _aux_e:
+                log.warning("restore_snapshot_state: aux contract_event_index clear failed: %s", _aux_e)
             return
 
         # Legacy SQLite: one transaction covers the complete state replacement.
         c = self._conn()
         with self._sqlite_api_lock:
+            if c.atomic_active():
+                raise RuntimeError(
+                    "cannot restore snapshot state during another SQLite atomic block"
+                )
+            c.rollback()
             c.execute("BEGIN")
             try:
                 for table in (
                     "balances", "account_nonces", "contract_accounts", "roles",
                     "name_claims", "state_channels", "contract_storage", "contract_storage_tags",
+                    "vvm_receipts",
                 ):
                     c.execute(f"DELETE FROM {table}")
+                if c.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='contract_event_index'"
+                ).fetchone():
+                    c.execute("DELETE FROM contract_event_index")
 
                 c.executemany(
                     "INSERT INTO balances (address,balance) VALUES (?,?)",
@@ -5555,24 +5850,46 @@ class Storage:
                             pass
                     self._pgx_after_commit(_delete_shadow)
             return
-        c = self._conn()
-        for addr, (bal, nonce, vol, existed) in snap.items():
-            if existed:
-                c.execute(
-                    "INSERT OR REPLACE INTO balances (address, balance) VALUES (?,?)",
-                    (addr, bal))
-                c.execute(
-                    "INSERT OR REPLACE INTO account_nonces (address, nonce) VALUES (?,?)",
-                    (addr, nonce))
-                c.execute(
-                    """INSERT OR REPLACE INTO ht_volume (address, volume, updated)
-                       VALUES (?,?,?)""",
-                    (addr, vol, int(time.time())))
-            else:
-                c.execute("DELETE FROM balances      WHERE address=?", (addr,))
-                c.execute("DELETE FROM account_nonces WHERE address=?", (addr,))
-                c.execute("DELETE FROM ht_volume     WHERE address=?", (addr,))
-        c.commit()
+        with self._sqlite_api_lock:
+            c = self._conn()
+            in_atomic = c.atomic_active()
+            sp_name = "sp_restore_accounts"
+            if in_atomic:
+                c.execute(f"SAVEPOINT {sp_name}")
+            try:
+                for addr, (bal, nonce, vol, existed) in snap.items():
+                    if existed:
+                        c.execute(
+                            "INSERT OR REPLACE INTO balances (address, balance) VALUES (?,?)",
+                            (addr, bal))
+                        c.execute(
+                            "INSERT OR REPLACE INTO account_nonces (address, nonce) VALUES (?,?)",
+                            (addr, nonce))
+                        c.execute(
+                            """INSERT OR REPLACE INTO ht_volume (address, volume, updated)
+                               VALUES (?,?,?)""",
+                            (addr, vol, int(time.time())))
+                    else:
+                        c.execute("DELETE FROM balances      WHERE address=?", (addr,))
+                        c.execute("DELETE FROM account_nonces WHERE address=?", (addr,))
+                        c.execute("DELETE FROM ht_volume     WHERE address=?", (addr,))
+                if in_atomic:
+                    c.execute(f"RELEASE SAVEPOINT {sp_name}")
+                else:
+                    c.commit()
+            except BaseException:
+                if in_atomic:
+                    try:
+                        c.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                        c.execute(f"RELEASE SAVEPOINT {sp_name}")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        c.rollback()
+                    except Exception:
+                        pass
+                raise
 
     # ╔════════════════════════════════════════════════════════════════════════╗
     # ║  ROLE SNAPSHOT / RESTORE (v7.2.0)                                      ║

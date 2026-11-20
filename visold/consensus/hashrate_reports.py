@@ -72,12 +72,14 @@ def verify_hashrate_report(report: Any, *, now: Optional[float] = None,
         raw_hps = report.get("hashrate")
         raw_ts = report.get("ts")
         raw_seq = report.get("seq")
-        if isinstance(raw_hps, bool) or isinstance(raw_ts, bool) or isinstance(raw_seq, bool):
+        raw_version = report.get("version", 0)
+        if (isinstance(raw_hps, bool) or isinstance(raw_ts, bool)
+                or isinstance(raw_seq, bool) or isinstance(raw_version, bool)):
             return False
         hps = float(raw_hps)
         issued_at = int(raw_ts)
         sequence = int(raw_seq)
-        version = int(report.get("version", 0))
+        version = int(raw_version)
         node_id = str(report.get("node_id", ""))
         pub_hex = str(report.get("pub_hex", ""))
         if (version != 1 or not math.isfinite(hps) or hps <= 0.0
@@ -86,6 +88,8 @@ def verify_hashrate_report(report: Any, *, now: Optional[float] = None,
         if str(issued_at) != str(raw_ts).strip() or str(sequence) != str(raw_seq).strip():
             return False
         if len(node_id) != 64 or len(pub_hex) != 66:
+            return False
+        if pub_hex != pub_hex.lower():
             return False
         if hashlib.sha256(pub_hex.encode("ascii")).hexdigest() != node_id:
             return False

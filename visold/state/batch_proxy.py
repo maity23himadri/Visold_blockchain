@@ -103,6 +103,10 @@ class _StorageBatchProxy:
     def get_balance_sat(self, address: str) -> int:
         return self._ensure_bal(address)
 
+    def _panic_cb(self):
+        cb = getattr(self._real, "_hc_panic_cb", None)
+        return cb if cb is not None else _hc_panic_cb
+
     def credit_sat(self, address: str, amount_sat: int):
         # AUDIT-FIX-K1 (hardened invariant checks bypassed during real block
         # application): apply_hardened_overlay() monkey-patches
@@ -115,7 +119,7 @@ class _StorageBatchProxy:
         # _hc_panic_cb and _hc_inv are module-level singletons, not
         # something that exists only via monkey-patching, so call them
         # directly here -- same checks hardened_credit_sat applies.
-        _hc_panic_cb.assert_writable(f"credit_sat({address[:16]}, {amount_sat})")
+        self._panic_cb().assert_writable(f"credit_sat({address[:16]}, {amount_sat})")
         _hc_inv.assert_credit_safe(address, amount_sat, context="pre-credit (batch proxy)")
         # AUDIT-FIX-10 (unauthorized minting, defense in depth): a negative
         # "credit" is an unguarded debit. This should never be reachable now
@@ -139,7 +143,7 @@ class _StorageBatchProxy:
     def debit_sat(self, address: str, amount_sat: int) -> bool:
         # AUDIT-FIX-K1: mirror hardened_debit_sat's checks -- see credit_sat
         # above for why this proxy needs its own copy of them.
-        _hc_panic_cb.assert_writable(f"debit_sat({address[:16]}, {amount_sat})")
+        self._panic_cb().assert_writable(f"debit_sat({address[:16]}, {amount_sat})")
         _pre_bal = self._ensure_bal(address)
         _hc_inv.assert_balance_non_negative(
             address, _pre_bal, context="pre-debit (batch proxy)")
@@ -164,7 +168,7 @@ class _StorageBatchProxy:
         # (e.g. a logic bug) rather than trusting the pre-check alone.
         _post_bal = self._balances[address]
         if _post_bal < 0:
-            _hc_panic_cb.record_failure(
+            self._panic_cb().record_failure(
                 "post_debit_negative",
                 InvariantViolation(
                     f"Post-debit balance negative (batch proxy): "
@@ -259,8 +263,12 @@ class _StorageBatchProxy:
         """
         if not journal:
             return
-        channels = journal.get("channels", journal if "channels" not in journal else {})
-        accounts = journal.get("accounts", {})
+        if "channels" in journal or "accounts" in journal:
+            channels = journal.get("channels") or {}
+            accounts = journal.get("accounts") or {}
+        else:
+            channels = journal
+            accounts = {}
 
         if channels:
             self._real.restore_state_channel_journal(

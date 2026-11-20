@@ -25,6 +25,7 @@ Origin: visold_vsd_.py L31001-31138
 """
 
 import hashlib
+import ipaddress
 import threading
 from collections import OrderedDict
 from typing import List
@@ -45,13 +46,25 @@ class KBucket:
         self.MAX_NODES_PER_SUBNET = max(2, k // 5)
 
     def _subnet(self, ip: str) -> str:
-        """Extract /24 (IPv4) or /48 (IPv6) subnet prefix."""
+        """Extract canonical /24 (IPv4) or /48 (IPv6) subnet prefix."""
         try:
-            if ':' in ip:
-                return ':'.join(ip.split(':')[:3])
-            return '.'.join(ip.split('.')[:3])
+            raw = str(ip or "").strip()
+            if not raw:
+                return ""
+            if raw.startswith("[") and raw.endswith("]"):
+                raw = raw[1:-1]
+            if "%" in raw:
+                raw = raw.split("%", 1)[0]
+            addr = ipaddress.ip_address(raw)
+            if addr.version == 6 and addr.ipv4_mapped is not None:
+                addr = addr.ipv4_mapped
+            if addr.version == 6:
+                return str(ipaddress.IPv6Network((addr, 48), strict=False))
+            return str(ipaddress.IPv4Network((addr, 24), strict=False))
         except Exception:
-            return ip
+            if ':' in str(ip):
+                return ':'.join(str(ip).split(':')[:3])
+            return '.'.join(str(ip).split('.')[:3])
 
     def add(self, peer_id: str, info: dict):
         if peer_id in self.nodes:
@@ -150,14 +163,24 @@ class KademliaRouter:
                 b.remove(peer_id)
 
     def get_closest(self, target_id: str, k: int = Config.KAD_K) -> List[dict]:
+        if k <= 0:
+            return []
         with self._lock:
             idx = self._bucket_idx(target_id)
             results = []
+            seen_ids = set()
             for offset in range(Config.KAD_BITS):
-                for delta in [offset, -offset]:
+                deltas = (0,) if offset == 0 else (offset, -offset)
+                for delta in deltas:
                     i = idx + delta
                     if 0 <= i < Config.KAD_BITS:
-                        results.extend(self.buckets[i].get_all())
+                        for info in self.buckets[i].get_all():
+                            pid = info.get("peer_id")
+                            if pid is not None:
+                                if pid in seen_ids:
+                                    continue
+                                seen_ids.add(pid)
+                            results.append(info)
         target_int = self._to_160bit_int(target_id)
         def xor_dist(info):
             pid = info.get("peer_id", "")

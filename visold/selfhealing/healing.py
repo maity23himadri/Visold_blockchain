@@ -430,8 +430,13 @@ class HealingActionLayer:
 
         try:
             # Mark validator as slashed in storage (existing method)
-            self._storage.slash_validator(validator_addr)
-            log.warning(f"[HAL] Validator {validator_addr[:24]} SLASHED")
+            slashed = bool(self._storage.slash_validator(validator_addr))
+            if slashed:
+                log.warning(f"[HAL] Validator {validator_addr[:24]} SLASHED")
+            else:
+                log.warning(
+                    f"[HAL] Validator {validator_addr[:24]} NOT slashed "
+                    f"(unknown, already slashed, or storage failure)")
         except Exception as exc:
             log.error(f"[HAL] storage.slash_validator failed: {exc}")
 
@@ -565,11 +570,17 @@ class HealingActionLayer:
                 "before any block can trigger an anomaly-driven rollback.")
             return
 
-        ok, msg = self._rollback.execute(
-            target_height=target_height,
-            flagged_addresses=flagged,
-            replay_safe=True,
-        )
+        _risk_obj = getattr(decision, "risk_score", None)
+        _risk_val = getattr(_risk_obj, "value", None)
+        _exec_kwargs = {
+            "target_height": target_height,
+            "flagged_addresses": flagged,
+            "replay_safe": True,
+        }
+        if _risk_val is not None:
+            _exec_kwargs["risk_score"] = float(_risk_val)
+
+        ok, msg = self._rollback.execute(**_exec_kwargs)
 
         if ok:
             log.critical(

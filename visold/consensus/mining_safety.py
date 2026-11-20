@@ -210,9 +210,14 @@ class MiningSafetyGuard:
         # us waiting forever for the wait cap to expire.
         last_kick = time.time()
         while time.time() < deadline:
-            if stop_event.is_set():
-                return False, "stop event"
-            time.sleep(probe)
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            if stop_event is not None:
+                if stop_event.wait(min(probe, remaining)):
+                    return False, "stop event"
+            else:
+                time.sleep(min(probe, remaining))
             synced, lh, bh = self.is_synced()
             if synced:
                 log.info(f"[MiningSafety] Sync converged — local={lh}, "

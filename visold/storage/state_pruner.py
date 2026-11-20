@@ -96,24 +96,76 @@ class StatePruner:
         cutoff = max(0, current_height - Config.STATE_PRUNE_KEEP_SNAPSHOTS)
         pruned = 0
         try:
-            c = self._storage._conn()
-            # Prune state snapshot markers stored in node_meta
-            rows = c.execute(
-                "SELECT key FROM node_meta WHERE key LIKE 'state_snapshot:%' LIMIT 500"
-            ).fetchall()
-            to_delete = []
-            for r in rows:
-                try:
-                    h = int(r["key"].split(":")[1])
-                    if h < cutoff:
-                        to_delete.append(r["key"])
-                except (IndexError, ValueError):
-                    pass
-            if to_delete:
-                c.executemany("DELETE FROM node_meta WHERE key=?",
-                              [(k,) for k in to_delete])
-                c.commit()
-                pruned = len(to_delete)
+            if getattr(self._storage, "_pgx_enabled", False):
+                rows = self._storage._pg_fetch(
+                    """SELECT key FROM node_meta
+                       WHERE key LIKE 'state_snapshot:%'
+                         AND SUBSTRING(key FROM 16) ~ '^[0-9]+$'
+                         AND CAST(SUBSTRING(key FROM 16) AS BIGINT) < $1
+                       ORDER BY CAST(SUBSTRING(key FROM 16) AS BIGINT) ASC
+                       LIMIT 500""",
+                    cutoff,
+                )
+                to_delete = []
+                for r in rows:
+                    try:
+                        h = int(r["key"].split(":")[1])
+                        if h < cutoff:
+                            to_delete.append(r["key"])
+                    except (IndexError, ValueError):
+                        pass
+                if to_delete:
+                    self._storage._pg_exec(
+                        "DELETE FROM node_meta WHERE key = ANY($1::text[])",
+                        to_delete,
+                    )
+                    pruned = len(to_delete)
+
+                    def _mirror_delete(keys=list(to_delete)):
+                        try:
+                            with self._storage._aux_lock:
+                                c = self._storage._conn()
+                                c.executemany(
+                                    "DELETE FROM node_meta WHERE key=?",
+                                    [(k,) for k in keys],
+                                )
+                                c.commit()
+                        except Exception:
+                            pass
+
+                    after_commit = getattr(self._storage, "_pgx_after_commit", None)
+                    if callable(after_commit):
+                        after_commit(_mirror_delete)
+                    else:
+                        _mirror_delete()
+            else:
+                c = self._storage._conn()
+                # Prune state snapshot markers stored in node_meta, ordered by
+                # numeric height so newer keys never starve older ones.
+                rows = c.execute(
+                    """SELECT key FROM node_meta
+                       WHERE key LIKE 'state_snapshot:%'
+                         AND SUBSTR(key, 16) != ''
+                         AND SUBSTR(key, 16) NOT GLOB '*[^0-9]*'
+                         AND CAST(SUBSTR(key, 16) AS INTEGER) < ?
+                       ORDER BY CAST(SUBSTR(key, 16) AS INTEGER) ASC
+                       LIMIT 500""",
+                    (cutoff,),
+                ).fetchall()
+                to_delete = []
+                for r in rows:
+                    try:
+                        h = int(r["key"].split(":")[1])
+                        if h < cutoff:
+                            to_delete.append(r["key"])
+                    except (IndexError, ValueError):
+                        pass
+                if to_delete:
+                    c.executemany("DELETE FROM node_meta WHERE key=?",
+                                  [(k,) for k in to_delete])
+                    c.commit()
+                    pruned = len(to_delete)
+
             # Record the pruning watermark
             self._storage.set_meta("state_pruned_until", str(cutoff))
             metrics.set_gauge("state_pruned_until_height", float(cutoff))

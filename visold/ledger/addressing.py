@@ -5,12 +5,11 @@ that an address has a known private key or that a contract exists.
 """
 from __future__ import annotations
 
-import string
 from typing import Iterable
 
 from visold.crypto.base58 import b58decode, b58encode
 
-_HEX = frozenset(string.hexdigits)
+_HEX = frozenset("0123456789abcdef")
 
 
 def is_canonical_wallet_address(address: str) -> bool:
@@ -18,7 +17,7 @@ def is_canonical_wallet_address(address: str) -> bool:
     if not isinstance(address, str) or not address.startswith("VSD"):
         return False
     suffix = address[3:]
-    if not suffix:
+    if not (20 <= len(suffix) <= 28):
         return False
     try:
         raw = b58decode(suffix)
@@ -28,7 +27,7 @@ def is_canonical_wallet_address(address: str) -> bool:
 
 
 def is_canonical_contract_address(address: str) -> bool:
-    """Return True for deterministic VVM addresses: ``VSDc`` + 36 hex chars."""
+    """Return True for deterministic VVM addresses: ``VSDc`` + 36 lowercase hex chars."""
     if not isinstance(address, str) or len(address) != 40 or not address.startswith("VSDc"):
         return False
     return all(ch in _HEX for ch in address[4:])

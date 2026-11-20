@@ -226,10 +226,9 @@ class InputDiagnostics:
                 state["enter_seen"] = True
         # Do not log characters, byte values, secret lengths, or actual text.
         if kind == "secret":
-            if has_enter or has_edit or calls % 8 == 0:
+            if has_enter:
                 self.event("secret_input_activity", read_id=read_id,
-                           chunk_received=True, enter_like=has_enter,
-                           editing_control_seen=has_edit)
+                           chunk_received=True, enter_like=True)
         elif has_enter or has_edit or calls % 8 == 0:
             self.event("input_bytes_received", read_id=read_id,
                        chunk_size=len(chunk), total_bytes=total,
@@ -248,11 +247,11 @@ class InputDiagnostics:
                 "elapsed_s": round(time.monotonic() - state["started"], 1),
                 "state": state.get("state"),
                 "polls": state.get("polls", 0),
-                "ready": state.get("ready", 0),
-                "read_calls": state.get("read_calls", 0),
                 "enter_seen": state.get("enter_seen", False),
             }
             if kind != "secret":
+                base["ready"] = state.get("ready", 0)
+                base["read_calls"] = state.get("read_calls", 0)
                 base["bytes_read"] = state.get("bytes_read", 0)
             state["last_heartbeat"] = time.monotonic()
         base.update(fields)
@@ -276,11 +275,11 @@ class InputDiagnostics:
             if operation_type == "read":
                 data.update({
                     "polls": state.get("polls", 0),
-                    "ready": state.get("ready", 0),
-                    "read_calls": state.get("read_calls", 0),
                     "enter_seen": state.get("enter_seen", False),
                 })
                 if state.get("kind") != "secret":
+                    data["ready"] = state.get("ready", 0)
+                    data["read_calls"] = state.get("read_calls", 0)
                     data["bytes_read"] = state.get("bytes_read", 0)
         data.update(fields)
         event_name = "input_read_finished" if operation_type == "read" else "ui_activity_finished"
@@ -323,11 +322,11 @@ class InputDiagnostics:
                     if state.get("operation_type") == "read":
                         snapshot.update({
                             "polls": state.get("polls", 0),
-                            "ready": state.get("ready", 0),
-                            "read_calls": state.get("read_calls", 0),
                             "enter_seen": state.get("enter_seen", False),
                         })
                         if state.get("kind") != "secret":
+                            snapshot["ready"] = state.get("ready", 0)
+                            snapshot["read_calls"] = state.get("read_calls", 0)
                             snapshot["bytes_read"] = state.get("bytes_read", 0)
                     snapshots.append(snapshot)
             for snapshot in snapshots:

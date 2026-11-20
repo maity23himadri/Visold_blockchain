@@ -26,6 +26,7 @@ Origin: visold_vsd_.py L5983-5997, L6000-6078, L6081-6732
 
 import hashlib
 import json
+import math
 import re
 import secrets
 import threading
@@ -148,6 +149,22 @@ class UpgradeProposal:
 
     @classmethod
     def from_db_row(cls, row: dict) -> 'UpgradeProposal':
+        raw_thr = row["threshold"]
+        try:
+            thr = float(raw_thr) if raw_thr is not None and not isinstance(raw_thr, bool) else Config.FORK_SIGNAL_THRESHOLD
+        except (TypeError, ValueError):
+            thr = Config.FORK_SIGNAL_THRESHOLD
+        if not math.isfinite(thr) or not (0.0 < thr <= 1.0):
+            thr = Config.FORK_SIGNAL_THRESHOLD
+
+        raw_rw = row["rollback_window"]
+        try:
+            rw = int(raw_rw) if raw_rw is not None and not isinstance(raw_rw, bool) else Config.GOVERNANCE_ROLLBACK_WINDOW
+        except (TypeError, ValueError):
+            rw = Config.GOVERNANCE_ROLLBACK_WINDOW
+        if rw < 0:
+            rw = Config.GOVERNANCE_ROLLBACK_WINDOW
+
         return cls(
             version             = row["version"],
             phase               = UpgradePhase(row["phase"]),
@@ -155,8 +172,8 @@ class UpgradeProposal:
             signal_end_height   = row["signal_end_height"],
             lock_in_height      = row["lock_in_height"],
             activation_height   = row["activation_height"],
-            threshold           = row["threshold"],
-            rollback_window     = row["rollback_window"],
+            threshold           = thr,
+            rollback_window     = rw,
             disabled            = bool(row["disabled"]),
         )
 
@@ -289,6 +306,12 @@ class GovernanceEngine:
                 self._proposals[p.version] = p
                 if p.disabled:
                     self._blacklist.add(p.version)
+            active_versions = [
+                p.version for p in self._proposals.values()
+                if p.phase == UpgradePhase.ACTIVE and not p.disabled
+            ]
+            target_ver = max([Config.PROTOCOL_VERSION] + active_versions)
+            self.proto_mgr.restore_version(target_ver)
             if self._proposals:
                 log.info(
                     f"GovernanceEngine: loaded {len(self._proposals)} proposal(s) "
@@ -317,6 +340,26 @@ class GovernanceEngine:
         Returns (True, description) on success, (False, reason) on failure.
         """
         with self._lock:
+            if isinstance(version, bool) or not isinstance(version, int):
+                return False, f"Invalid version {version!r}: must be an integer"
+            if isinstance(signal_start_height, bool) or not isinstance(signal_start_height, int) or signal_start_height < 0:
+                return False, (
+                    f"Invalid signal_start_height {signal_start_height!r}: "
+                    f"must be a non-negative integer")
+
+            thr = threshold if threshold is not None else Config.FORK_SIGNAL_THRESHOLD
+            if isinstance(thr, bool) or not isinstance(thr, (int, float)):
+                return False, f"Invalid threshold {thr!r}: must be a finite number"
+            thr = float(thr)
+            if not math.isfinite(thr) or not (0.5 <= thr <= 1.0):
+                return False, (
+                    f"Invalid threshold {thr!r}: must be finite and within [0.5, 1.0]")
+
+            rw = rollback_window if rollback_window is not None else Config.GOVERNANCE_ROLLBACK_WINDOW
+            if isinstance(rw, bool) or not isinstance(rw, int) or rw < 0:
+                return False, (
+                    f"Invalid rollback_window {rw!r}: must be a non-negative integer")
+
             current = self.proto_mgr.current_version()
             if version != current + 1:
                 return False, (
@@ -360,8 +403,6 @@ class GovernanceEngine:
                         f"height {last_activation}.  Minimum spacing: "
                         f"{self._MIN_UPGRADE_SPACING_BLOCKS} blocks.")
 
-            thr = threshold if threshold is not None else Config.FORK_SIGNAL_THRESHOLD
-            rw  = rollback_window if rollback_window is not None else Config.GOVERNANCE_ROLLBACK_WINDOW
             win = Config.FORK_SIGNAL_WINDOW
             sig_end = signal_start_height + win
 
@@ -452,6 +493,13 @@ class GovernanceEngine:
         Hard fork guard: always reject versions more than 1 ahead.
         """
         with self._lock:
+            if isinstance(proto_ver, bool) or not isinstance(proto_ver, int):
+                return False, f"Invalid block protocol_version type: {type(proto_ver).__name__}"
+            if proto_ver < Config.PROTOCOL_VERSION:
+                return False, (
+                    f"Block protocol_version {proto_ver} rejected: "
+                    f"below minimum supported version ({Config.PROTOCOL_VERSION})")
+
             current = self.proto_mgr.current_version()
 
             # Hard-fork guard: reject versions far in the future
@@ -472,6 +520,7 @@ class GovernanceEngine:
                 proposal.version
                 for proposal in self._proposals.values()
                 if proposal.phase == UpgradePhase.ACTIVE
+                   and not proposal.disabled
                    and block_height >= proposal.activation_height
             ]
             if active_versions_reached:
@@ -559,25 +608,38 @@ class GovernanceEngine:
             try/except to prevent float overflow crashing the node.
         """
 
+        def _walk_branch(tip: 'Block'):
+            """
+            Yield up to 500 blocks along ``tip``'s own ancestry chain
+            (starting with ``tip`` itself and walking ``prev_hash`` via
+            ``storage.get_block_by_hash``).
+
+            AUDIT-FIX-K5: capped at 500 blocks to prevent unbounded O(height)
+            storage scans via the ``forkchoice`` RPC method.
+            """
+            blk = tip
+            count = 0
+            seen_hashes = set()
+            while blk is not None and int(blk.index) >= 0 and count < 500:
+                blk_hash = str(getattr(blk, "block_hash", "") or "")
+                if blk_hash:
+                    if blk_hash in seen_hashes:
+                        break
+                    seen_hashes.add(blk_hash)
+                yield blk
+                count += 1
+                if int(blk.index) == 0:
+                    break
+                prev_hash = str(getattr(blk, "prev_hash", "") or "")
+                if not prev_hash or prev_hash == "0" * 64:
+                    break
+                blk = storage.get_block_by_hash(prev_hash)
+
         def _finalized_height(tip: 'Block') -> int:
             """Walk backward from tip to find the highest finalized block."""
-            idx   = tip.index
-            count = 0
-            # AUDIT-FIX-K5: capped at 500, matching _cumulative_pow below.
-            # This closure previously had no cap at all -- it walked all
-            # the way to genesis if no finalized block was ever found.
-            # fork_choice is reachable via the "forkchoice" RPC method
-            # (bearer-token-authenticated but not admin-only), so if BFT
-            # finality ever stalls, repeated calls become an unbounded
-            # O(chain-height) storage scan per call, per tip.
-            while idx >= 0 and count < 500:
-                blk = storage.get_block(idx)
-                if blk is None:
-                    break
-                if blk.finalized:
-                    return blk.index
-                idx   -= 1
-                count += 1
+            for blk in _walk_branch(tip):
+                if getattr(blk, "finalized", False):
+                    return int(blk.index)
             return -1
 
         def _justified_height(tip: 'Block') -> int:
@@ -585,42 +647,34 @@ class GovernanceEngine:
             Return the highest block height that has any BFT validator vote,
             even if not yet meeting the finality threshold.
             """
-            idx   = tip.index
-            count = 0
-            # AUDIT-FIX-K5: capped at 500 -- see _finalized_height above.
-            while idx >= 0 and count < 500:
-                blk = storage.get_block(idx)
-                if blk is None:
-                    break
-                if blk.validator_sigs:
-                    return blk.index
-                idx   -= 1
-                count += 1
+            for blk in _walk_branch(tip):
+                if getattr(blk, "validator_sigs", None):
+                    return int(blk.index)
             return -1
 
-        def _cumulative_pow(tip: 'Block') -> float:
+        def _cumulative_pow(tip: 'Block') -> 'Decimal':
             """
-            Approximate cumulative PoW as the sum of 2^(difficulty*4) for each
-            block in the chain.  Higher difficulty = more work per block.
-            This is equivalent to Bitcoin's chainwork metric.
+            Compute cumulative PoW as the sum of 2^(difficulty*4) for each
+            block in the branch (up to 500 blocks). Matches
+            ``Blockchain._cumulative_difficulty()`` using 80-digit Decimal
+            arithmetic with [0, Config.MAX_DIFFICULTY] clamping.
+            """
+            from decimal import Decimal, localcontext
 
-            Uses float arithmetic (2.0 ** x) because difficulty is now a float
-            and Python's bit-shift operator (<<) requires integer operands.
-            """
-            total = 0.0
-            idx   = tip.index
-            count = 0
-            while idx >= 0 and count < 500:   # cap scan for performance
-                blk = storage.get_block(idx)
-                if blk is None:
-                    break
-                # work ∝ 2^(difficulty * 4) — use float exponentiation, not <<
-                try:
-                    total += 2.0 ** (float(blk.difficulty) * 4.0)
-                except (OverflowError, ValueError):
-                    total += 1.0   # guard for extreme difficulty values
-                idx   -= 1
-                count += 1
+            max_d = Decimal(str(float(Config.MAX_DIFFICULTY)))
+            min_d = Decimal('0')
+            total = Decimal(0)
+            with localcontext() as ctx:
+                ctx.prec = 80
+                for blk in _walk_branch(tip):
+                    try:
+                        d = Decimal(str(float(blk.difficulty)))
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if not d.is_finite():
+                        continue
+                    d = min(max(d, min_d), max_d)
+                    total += Decimal(2) ** (d * Decimal(4))
             return total
 
         # Identical tip — deterministic short-circuit (Fix #3: no ambiguity)
@@ -759,6 +813,7 @@ class GovernanceEngine:
             proposal.disabled = True
             self._blacklist.add(version)
             proposal._persist(self.storage)
+            self._rewind_to_highest_active_version(version)
             log.critical(
                 f"GOVERNANCE EMERGENCY DISABLE: Version {version} disabled by a "
                 f"{quorum}-validator quorum.  Reverting to previous rules.")
@@ -853,7 +908,9 @@ class GovernanceEngine:
                     p.phase = UpgradePhase.LOCKED_IN
                 else:
                     continue
-                if p.phase != UpgradePhase.ACTIVE:
+                if p.phase == UpgradePhase.ACTIVE:
+                    self.proto_mgr.advance_version(int(version))
+                else:
                     # Only lowers the version, and only when this proposal's
                     # activation had raised it.
                     self.proto_mgr.rewind_version(int(version) - 1)
@@ -915,9 +972,24 @@ class GovernanceEngine:
         if height < proposal.signal_start_height:
             return   # signaling hasn't started yet
 
-        # Count fraction of last FORK_SIGNAL_WINDOW blocks signaling new version
+        # Check window expiry BEFORE evaluating lock-in
+        if height > proposal.signal_end_height:
+            proposal.phase = UpgradePhase.FAILED
+            proposal._persist(self.storage)
+            self._write_fail_record(proposal.version, {
+                "height": int(height), "kind": "signal",
+                "cooldown_before": int(self._cooldown_until_height),
+                "log_entry": None})
+            log.warning(
+                f"GOVERNANCE FAILED: Version {proposal.version} signaling "
+                f"ended at height {proposal.signal_end_height} without lock-in "
+                f"(observed at height {height}).")
+            metrics.inc("governance_signal_failures")
+            return
+
+        # Count fraction of in-window blocks signaling new version
         win   = Config.FORK_SIGNAL_WINDOW
-        start = max(0, height - win)
+        start = max(proposal.signal_start_height, height - win)
         versions = []
         for h in range(start, height + 1):
             raw = self.storage.get_meta(f"proto_sig:{h}")
@@ -947,20 +1019,6 @@ class GovernanceEngine:
                 f"Activation at height {proposal.activation_height}.")
             metrics.inc("governance_lock_ins")
             return
-
-        # Window expired without threshold
-        if height > proposal.signal_end_height:
-            proposal.phase = UpgradePhase.FAILED
-            proposal._persist(self.storage)
-            self._write_fail_record(proposal.version, {
-                "height": int(height), "kind": "signal",
-                "cooldown_before": int(self._cooldown_until_height),
-                "log_entry": None})
-            log.warning(
-                f"GOVERNANCE FAILED: Version {proposal.version} signaling "
-                f"ended at height {height} without reaching {proposal.threshold*100:.0f}% "
-                f"threshold (reached {fraction*100:.1f}%).")
-            metrics.inc("governance_signal_failures")
 
     def _check_activation(self, proposal: UpgradeProposal, height: int):
         """Transition LOCKED_IN → ACTIVE once activation_height is reached."""
@@ -1017,6 +1075,15 @@ class GovernanceEngine:
                 height)
             return
 
+    def _rewind_to_highest_active_version(self, reverted_version: int) -> None:
+        """Rewind proto_mgr to the highest remaining non-disabled ACTIVE version."""
+        remaining = [
+            p.version for p in self._proposals.values()
+            if p.phase == UpgradePhase.ACTIVE and not p.disabled
+        ]
+        target = max(remaining) if remaining else max(Config.PROTOCOL_VERSION, int(reverted_version) - 1)
+        self.proto_mgr.rewind_version(target)
+
     def _trigger_rollback(self, proposal: UpgradeProposal, reason: str,
                           height: int = -1):
         """
@@ -1029,9 +1096,10 @@ class GovernanceEngine:
         upgrade proposal is accepted.  This bounds the governance instability
         loop to at most _ROLLBACK_LIMIT cycles before a mandatory pause.
         """
-        current_height = proposal.lock_in_height  # best available proxy
+        current_height = int(height) if int(height) >= 0 else int(proposal.lock_in_height)
         proposal.phase = UpgradePhase.FAILED
         proposal._persist(self.storage)
+        self._rewind_to_highest_active_version(proposal.version)
         log.critical(
             f"GOVERNANCE ROLLBACK: Version {proposal.version} REVERTED. "
             f"Reason: {reason}. Previous rules restored.")

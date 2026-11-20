@@ -216,17 +216,27 @@ class UPnPManager:
           - service type string
           - gateway hostname (for local IP detection)
         """
+        import ipaddress
         from urllib.parse import urlparse, urljoin
-        # ── Scheme whitelist ─────────────────────────────────────────────────────
+
+        def _is_lan_http_url(url: str) -> bool:
+            p = urlparse(url)
+            if p.scheme != "http" or not p.hostname:
+                return False
+            try:
+                ip = ipaddress.ip_address(p.hostname)
+                return ip.is_private and not ip.is_link_local and not ip.is_loopback and not ip.is_multicast
+            except ValueError:
+                return False
+
+        # ── Scheme & LAN IP whitelist ────────────────────────────────────────────
         # `location` comes from a SSDP network response and must be validated
         # before opening.  Only plain HTTP to a LAN gateway is expected for UPnP.
-        _parsed_loc = urlparse(location)
-        if _parsed_loc.scheme not in ("http", "https"):
-            log.warning("UPnP: rejecting description URL with unexpected scheme "
-                        f"'{_parsed_loc.scheme}' — location={location!r}")
-            raise ValueError(f"UPnP: disallowed URL scheme '{_parsed_loc.scheme}'")
+        if not _is_lan_http_url(location):
+            log.warning(f"UPnP: rejecting non-LAN description URL {location!r}")
+            raise ValueError(f"UPnP: disallowed non-LAN description URL {location!r}")
         resp  = urllib.request.urlopen(location, timeout=self.SOAP_TIMEOUT)  # nosec B310
-        xml   = resp.read().decode(errors="ignore")
+        xml   = resp.read(262144).decode(errors="ignore")  # 256 KiB cap
         parsed = urlparse(location)
         base  = f"{parsed.scheme}://{parsed.netloc}"
         gw_host = parsed.hostname
@@ -266,6 +276,17 @@ class UPnPManager:
             for svc in svc_types:
                 if svc in svc_type_val and ctrl_url_rel:
                     ctrl_url = urljoin(base, ctrl_url_rel)
+                    ctrl_parsed = urlparse(ctrl_url)
+                    if (
+                        ctrl_parsed.scheme != parsed.scheme
+                        or ctrl_parsed.netloc != parsed.netloc
+                        or not _is_lan_http_url(ctrl_url)
+                    ):
+                        log.warning(
+                            f"UPnP: rejecting cross-origin or non-LAN controlURL {ctrl_url!r} "
+                            f"(expected {base})"
+                        )
+                        continue
                     return ctrl_url, svc_type_val.strip(), gw_host
         raise RuntimeError("No WANIPConnection service found in IGD description")
 

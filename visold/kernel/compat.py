@@ -163,8 +163,7 @@ except ImportError:
 # ParallelMiner.initialize() only when GPU mining is actually requested.
 try:
     import importlib.util as _il_util
-    _il_util.find_spec("pycuda")
-    _CUDA_AVAILABLE = True
+    _CUDA_AVAILABLE = _il_util.find_spec("pycuda") is not None
 except Exception:
     _CUDA_AVAILABLE = False
 
@@ -174,8 +173,7 @@ except Exception:
 # before `import importlib as _il` succeeded. Re-import here unconditionally.
 try:
     import importlib.util as _il_util
-    _il_util.find_spec("pyopencl")
-    _OPENCL_AVAILABLE = True
+    _OPENCL_AVAILABLE = _il_util.find_spec("pyopencl") is not None
 except Exception:
     _OPENCL_AVAILABLE = False
 

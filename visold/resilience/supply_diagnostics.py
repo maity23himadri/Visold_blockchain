@@ -16,6 +16,7 @@ from contextlib import nullcontext
 from typing import Any, Dict, Optional
 
 from visold.kernel.config import Config
+from visold.kernel.units import to_satoshi
 from visold.rollup.l2_state import L2_BRIDGE_ADDRESS, L2_WITHDRAW_ADDRESS
 
 
@@ -113,16 +114,16 @@ class SupplyDiagnostics:
     def balance_snapshot(self) -> Dict[str, Any]:
         """Read canonical held supply and calculate scheduled issuance."""
         try:
-            excludes = (Config.BURN_ADDRESS, L2_BRIDGE_ADDRESS, L2_WITHDRAW_ADDRESS)
+            excludes = (Config.BURN_ADDRESS, L2_WITHDRAW_ADDRESS)
             if getattr(self.storage, "_pgx_enabled", False):
                 rows = self.storage._pg_fetch(
                     "SELECT COALESCE(SUM(balance_sat),0) AS total FROM accounts "
-                    "WHERE address NOT IN ($1,$2,$3)", list(excludes))
+                    "WHERE address NOT IN ($1,$2)", list(excludes))
                 held = int(rows[0]["total"]) if rows else 0
             else:
                 row = self.storage._conn().execute(
                     "SELECT COALESCE(SUM(CAST(balance AS INTEGER)),0) AS total "
-                    "FROM balances WHERE address NOT IN (?,?,?)", excludes).fetchone()
+                    "FROM balances WHERE address NOT IN (?,?)", excludes).fetchone()
                 held = int(row["total"])
             height = int(self.storage.chain_height())
             issued = self.expected_issuance_sat(height)
@@ -138,20 +139,29 @@ class SupplyDiagnostics:
 
     def expected_issuance_sat(self, height: int) -> int:
         """Sum rewards exactly by reward epochs (not a per-block O(height) scan)."""
+        genesis_sat = max(0, int(getattr(Config, "GENESIS_TX_AMOUNT", 0)))
         h = max(0, int(height))
         if h == 0:
-            return 0
+            return genesis_sat
         epoch_size = int(Config.REWARD_DECAY_BLOCKS)
         if epoch_size <= 0:
-            return sum(int(self.blockchain.compute_reward_sat(i)) for i in range(1, h + 1))
-        issued = 0
+            return genesis_sat + sum(int(self.blockchain.compute_reward_sat(i)) for i in range(1, h + 1))
+        issued = genesis_sat
         first = 1
+        min_reward = int(Config.MIN_REWARD)
+        decaying = (
+            int(Config.REWARD_DECAY_NUM) > 0
+            and int(Config.REWARD_DECAY_NUM) < int(Config.REWARD_DECAY_DEN)
+        )
         while first <= h:
             epoch = first // epoch_size
             end = min(h, (epoch + 1) * epoch_size - 1)
             if end < first:  # defensive progress guard for unusual config values
                 end = first
             reward = int(self.blockchain.compute_reward_sat(first))
+            if decaying and reward == min_reward:
+                issued += (h - first + 1) * reward
+                break
             issued += (end - first + 1) * reward
             first = end + 1
         return issued
@@ -292,11 +302,11 @@ def install_supply_diagnostics(storage: Any, blockchain: Any, data_dir: Optional
                     except Exception:
                         after = None
                     # This method treats an int as satoshi; floats are VSD.
-                    if isinstance(balance, int):
-                        target_sat = int(balance)
+                    if isinstance(balance, int) and not isinstance(balance, bool):
+                        target_sat = balance
                     else:
                         try:
-                            target_sat = int(round(float(balance) * Config.SATOSHI_PER_VSD))
+                            target_sat = to_satoshi(balance)
                         except (TypeError, ValueError, OverflowError):
                             target_sat = None
                     diag.emit("storage_set_balance", account_id=diag.account_id(address),

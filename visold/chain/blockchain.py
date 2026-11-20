@@ -43,6 +43,7 @@ from visold.kernel.config import BLOCK_ALREADY_APPLIED_MSG, Config
 from visold.kernel.logging_setup import log
 from visold.kernel.metrics import metrics
 from visold.kernel.units import bft_threshold_met, from_satoshi, gas_fee_to_sat, to_satoshi
+from visold.ledger.addressing import is_valid_protocol_address
 from visold.ledger.block import Block
 from visold.mempool.mev import check_reveal, is_protected_reveal
 from visold.ledger.transaction import Transaction
@@ -219,6 +220,31 @@ class Blockchain:
                               "or corrupted.  Node will continue and attempt "
                               "to self-heal on first height() call.")
         else:
+            pinned = (Config.GENESIS_HASH_PIN or "").strip().lower()
+            if pinned:
+                canonical_genesis = self.build_canonical_genesis()
+                if pinned != canonical_genesis.block_hash.lower():
+                    raise RuntimeError(
+                        "FATAL: Computed genesis hash does not match Config.GENESIS_HASH_PIN.\n"
+                        f"  computed = {canonical_genesis.block_hash}\n"
+                        f"  pinned   = {pinned}\n"
+                        "Refusing to start to avoid silently forking the network."
+                    )
+                gen = self.storage.get_block(0)
+                if gen is None or gen.block_hash.lower() != pinned:
+                    actual = gen.block_hash if gen is not None else "<missing>"
+                    raise RuntimeError(
+                        "FATAL: Stored genesis block does not match Config.GENESIS_HASH_PIN.\n"
+                        f"  stored = {actual}\n"
+                        f"  pinned = {pinned}\n"
+                        "Refusing to start on mismatched or missing genesis."
+                    )
+            if self.storage.chain_height() == 0:
+                gen = self.storage.get_block(0)
+                if (gen is not None
+                        and self.storage.get_block_validator_snapshot(
+                            0, gen.block_hash) is None):
+                    self.storage.record_block_validator_snapshot(0, gen.block_hash, [])
             self._maybe_migrate_difficulty_state()
             self._init_highest_finalized_height()
 
@@ -338,14 +364,22 @@ class Blockchain:
             if gov is None:
                 return
             with gov._lock:
-                # Snapshot the registry under lock — values are floats.
+                # Snapshot the registry under lock — key by miner_address when known
+                # (derived from signed MSG_HASHRATE_REPORT pub_hex / local own_address).
+                peer_addrs = getattr(gov, "_peer_addresses", {})
                 for pid, (rate, _ts) in gov._peer_rates.items():
                     if rate > 0:
-                        cap_registry[pid] = float(rate)
-                # Include our own measured rate keyed by our node_id.
+                        addr_key = peer_addrs.get(pid, pid)
+                        cap_registry[addr_key] = cap_registry.get(addr_key, 0.0) + float(rate)
                 if gov._local_actual_hashrate > 0:
-                    self_id = getattr(net, "node_id", "self")
-                    cap_registry[self_id] = float(gov._local_actual_hashrate)
+                    local_addr = ""
+                    if getattr(self, "storage", None) is not None and hasattr(self.storage, "get_meta"):
+                        try:
+                            local_addr = str(self.storage.get_meta("own_address") or "")
+                        except Exception:
+                            local_addr = ""
+                    self_id = local_addr or getattr(self, "_own_address", "") or getattr(net, "node_id", "self")
+                    cap_registry[self_id] = cap_registry.get(self_id, 0.0) + float(gov._local_actual_hashrate)
         except Exception as exc:
             log.debug(f"[RateAudit] Failed to build registry: {exc}")
             return
@@ -393,53 +427,27 @@ class Blockchain:
                 log.debug(f"[RateAudit] Broadcast failed: {exc}")
 
     # ── Genesis ───────────────────────────────────────────────────────────────
-    def _create_genesis(self):
-        # =====================================================================
-        # DETERMINISTIC GENESIS CONSTRUCTION
-        # ---------------------------------------------------------------------
-        # CRITICAL CONSENSUS RULE:
-        # Every node on this chain — independent of machine, OS, locale, or
-        # wall-clock time — MUST construct a byte-for-byte identical genesis
-        # block. Any divergence produces a different block_hash, which causes
-        # validate_block() to reject foreign genesis blocks as "wrong-chain"
-        # and the two nodes will never sync.
-        #
-        # PREVIOUS BUG (fixed in this method):
-        #   Transaction.coinbase() does not accept a timestamp argument, so it
-        #   fell back to `int(time.time())` inside Transaction.__init__. The
-        #   genesis tx was therefore stamped with each node's first-launch
-        #   wall-clock second, producing a different tx_id, a different
-        #   merkle_root, and a different genesis block_hash on every machine.
-        #
-        # FIX:
-        #   Build the genesis transaction by calling Transaction(...) directly
-        #   with EVERY field pinned to a Config constant — including the
-        #   timestamp and expiry. No call paths inside Transaction.__init__
-        #   may now read the system clock.
-        # =====================================================================
-
+    @staticmethod
+    def build_canonical_genesis() -> Block:
+        """Construct and seal the deterministic genesis block from Config.GENESIS_* constants."""
+        genesis_amount_sat = int(Config.GENESIS_TX_AMOUNT)
+        if genesis_amount_sat < 0:
+            raise ValueError(
+                f"Config.GENESIS_TX_AMOUNT must be non-negative, got {genesis_amount_sat}"
+            )
         genesis_tx = Transaction(
             sender    = "COINBASE",                  # required so __init__ keeps expiry=0
             receiver  = Config.GENESIS_MINER,
-            amount    = Config.GENESIS_TX_AMOUNT,
+            amount    = from_satoshi(genesis_amount_sat),
             fee       = 0.0,
             timestamp = Config.GENESIS_TIMESTAMP,    # ← was the missing piece
             memo      = Config.GENESIS_TX_MEMO,
             nonce     = Config.GENESIS_TX_NONCE,
             expiry    = Config.GENESIS_TX_EXPIRY,
         )
-        # Patch sender to the symbolic genesis sender. We do this AFTER
-        # construction (not via the constructor) for two reasons:
-        #   1. The expiry-default branch in __init__ only triggers when
-        #      sender == "COINBASE", so we need that during construction.
-        #   2. Every node performs the exact same patch, so the resulting
-        #      tx object is still byte-for-byte identical across the network.
-        # We must recompute tx_id afterwards because _compute_id() hashes the
-        # sender field.
         genesis_tx.sender = Config.GENESIS_TX_SENDER
         genesis_tx.tx_id  = genesis_tx._compute_id()
 
-        # ── Build the genesis block from pinned constants ────────────────────
         genesis = Block(
             index         = 0,
             prev_hash     = "0" * 64,
@@ -449,15 +457,13 @@ class Blockchain:
             timestamp     = Config.GENESIS_TIMESTAMP,
             nonce         = Config.GENESIS_NONCE,
         )
-
-        # SECURITY: finalize and seal genesis before storing.
-        # seal() computes the final merkle_root and locks all consensus-
-        # critical fields so genesis cannot be modified after creation.
         genesis.finalized = True
-        # AUDIT-FIX (Batch D): keep the incremental finality-fence tracker
-        # in sync (see _highest_finalized_height in __init__).
-        self._highest_finalized_height = max(self._highest_finalized_height, 0)
         genesis.seal()
+        return genesis
+
+    def _create_genesis(self):
+        genesis = self.build_canonical_genesis()
+        self._highest_finalized_height = max(self._highest_finalized_height, 0)
 
         # ── Pinned-hash verification ─────────────────────────────────────────
         # If an operator has pinned the canonical genesis hash in
@@ -478,6 +484,11 @@ class Blockchain:
 
         self._genesis_hash = genesis.block_hash
         self.storage.save_block(genesis)
+        self.storage.record_block_validator_snapshot(0, genesis.block_hash, [])
+        genesis_amount_sat = int(Config.GENESIS_TX_AMOUNT)
+        if genesis_amount_sat > 0:
+            self.storage.credit_sat(Config.GENESIS_MINER, genesis_amount_sat)
+            self.storage.increment_cumulative_issued_sat(genesis_amount_sat)
         self.storage.set_meta("genesis_hash", genesis.block_hash)
 
         # Mark that this chain uses the hybrid rolling-window difficulty system.
@@ -626,9 +637,10 @@ class Blockchain:
         field.  validate_block() always calls get_difficulty() independently
         and rejects the block if the values do not match exactly.
         """
-        return DifficultyEngine.compute_next_difficulty(
-            self.storage, self.height()
-        )
+        with self._lock:
+            return DifficultyEngine.compute_next_difficulty(
+                self.storage, self.height()
+            )
 
     def compute_reward(self, height: int) -> float:
         """Return block reward in VSD (float) for use with credit().
@@ -636,6 +648,8 @@ class Blockchain:
         to VSD here so callers that pass the result to credit() / to_satoshi()
         do not double-multiply by SATOSHI_PER_VSD."""
         return from_satoshi(self.compute_reward_sat(height))
+
+    _REWARD_FLOOR_CACHE: dict = {}
 
     def compute_reward_sat(self, height: int) -> int:
         """Return block reward in satoshi — no float intermediate (F-01 COMPLETION).
@@ -651,12 +665,55 @@ class Blockchain:
         Rounding is done on the exact rational result with an explicit,
         platform-independent round-half-up rule rather than float round().
         """
-        n = height // Config.REWARD_DECAY_BLOCKS
-        numerator = Config.INITIAL_REWARD * (Config.REWARD_DECAY_NUM ** n)
-        denominator = Config.REWARD_DECAY_DEN ** n
+        h = int(height)
+        if h < 0:
+            raise ValueError(f"height must be non-negative, got {height}")
+        if h == 0:
+            return 0
+
+        decay_blocks = int(Config.REWARD_DECAY_BLOCKS)
+        n = (h // decay_blocks) if decay_blocks > 0 else 0
+        initial = int(Config.INITIAL_REWARD)
+        min_reward = int(Config.MIN_REWARD)
+        num = int(Config.REWARD_DECAY_NUM)
+        den = int(Config.REWARD_DECAY_DEN)
+
+        if initial <= min_reward:
+            return min_reward
+        if n == 0:
+            return initial
+        if num <= 0:
+            return min_reward
+
+        if num < den:
+            cache_key = (initial, min_reward, num, den)
+            n_floor = Blockchain._REWARD_FLOOR_CACHE.get(cache_key)
+            if n_floor is None:
+                lo, hi = 0, 1
+                while True:
+                    d_hi = den ** hi
+                    r_hi = (initial * (num ** hi) + d_hi // 2) // d_hi
+                    if r_hi <= min_reward:
+                        break
+                    lo = hi
+                    hi *= 2
+                while lo + 1 < hi:
+                    mid = (lo + hi) // 2
+                    d_mid = den ** mid
+                    r_mid = (initial * (num ** mid) + d_mid // 2) // d_mid
+                    if r_mid <= min_reward:
+                        hi = mid
+                    else:
+                        lo = mid
+                n_floor = hi
+                Blockchain._REWARD_FLOOR_CACHE[cache_key] = n_floor
+            if n >= n_floor:
+                return min_reward
+
+        numerator = initial * (num ** n)
+        denominator = den ** n
         r_sat = (numerator + denominator // 2) // denominator
-        r_sat = max(Config.MIN_REWARD, r_sat)
-        return r_sat
+        return max(min_reward, r_sat)
 
     def get_dynamic_block_size(self) -> int:
         """Return the byte cap used when building the NEXT candidate block.
@@ -748,11 +805,15 @@ class Blockchain:
             # Consensus fields must never accept IEEE-754 non-finite values.
             # NaN makes ordinary comparisons false and can otherwise bypass
             # timestamp and difficulty validation.
+            if isinstance(block.timestamp, bool) or not isinstance(block.timestamp, int):
+                return False, "Invalid block timestamp: must be an integer"
+            if hasattr(block, "validate_header_types"):
+                ok_types, types_msg = block.validate_header_types()
+                if not ok_types:
+                    return False, types_msg
             try:
-                if not math.isfinite(float(block.difficulty)):
+                if isinstance(block.difficulty, bool) or not math.isfinite(float(block.difficulty)):
                     return False, "Invalid block difficulty: value must be finite"
-                if not math.isfinite(float(block.timestamp)):
-                    return False, "Invalid block timestamp: value must be finite"
             except (TypeError, ValueError, OverflowError):
                 return False, "Invalid block consensus numeric field"
             # ═══════════════════════════════════════════════════════════════════
@@ -800,20 +861,49 @@ class Blockchain:
             # For index=0 we cannot check prev_hash, MTP, difficulty, or PoW
             # (there is no parent block).  What we CAN enforce is that the block
             # hash matches what was recorded when the node first created genesis.
+            _vrf_p = getattr(block, "vrf_proof", "")
+            _vrf_o = getattr(block, "vrf_output", "")
+            if _vrf_p or _vrf_o:
+                if not isinstance(_vrf_p, str) or not isinstance(_vrf_o, str):
+                    return False, "Invalid block VRF fields: must be hex strings"
+                try:
+                    _p_bytes = bytes.fromhex(_vrf_p)
+                    _o_bytes = bytes.fromhex(_vrf_o)
+                except ValueError:
+                    return False, "Invalid block VRF fields: malformed hex"
+                if len(_p_bytes) != 81 or len(_o_bytes) != 32:
+                    return False, "Invalid block VRF fields: unexpected byte length"
+
             if block.index == 0:
+                canonical_hash = self.build_canonical_genesis().block_hash
+                if block.block_hash != canonical_hash:
+                    return False, (
+                        f"Genesis block hash mismatch: "
+                        f"presented={block.block_hash[:16]}, "
+                        f"canonical={canonical_hash[:16]}. "
+                        f"Forged or wrong-chain genesis block rejected.")
+                pinned = (Config.GENESIS_HASH_PIN or "").strip().lower()
+                if pinned and block.block_hash.lower() != pinned:
+                    return False, (
+                        f"Genesis block does not match Config.GENESIS_HASH_PIN: "
+                        f"presented={block.block_hash[:16]}, "
+                        f"pinned={pinned[:16]}.")
                 stored_genesis = self.storage.get_meta("genesis_hash")
-                if stored_genesis:
-                    if block.block_hash != stored_genesis:
-                        return False, (
-                            f"Genesis block hash mismatch: "
-                            f"presented={block.block_hash[:16]}, "
-                            f"canonical={stored_genesis[:16]}. "
-                            f"Forged or wrong-chain genesis block rejected.")
-                    # Hash matches the stored genesis — genesis is valid.
-                    return True, "OK"
-                # No genesis_hash stored yet (first boot) — accept but do NOT
-                # bypass the integrity_check above which already ran.
+                if stored_genesis and block.block_hash != stored_genesis:
+                    return False, (
+                        f"Genesis block hash mismatch: "
+                        f"presented={block.block_hash[:16]}, "
+                        f"canonical={stored_genesis[:16]}. "
+                        f"Forged or wrong-chain genesis block rejected.")
                 return True, "OK"
+
+            # ── Canonical height continuity ───────────────────────────────────
+            latest_height = self.height()
+            if block.index != latest_height + 1:
+                return False, (
+                    f"Block height mismatch: expected {latest_height + 1}, "
+                    f"got {block.index}"
+                )
 
             # ── Previous block linkage ────────────────────────────────────────
             prev_hash = self.storage.get_block_hash(block.index - 1)
@@ -911,6 +1001,33 @@ class Blockchain:
             # neither an under-claim nor an over-claim is valid.
             expected_subsidy_sat = self.compute_reward_sat(block.index)
             cb_tx      = block.transactions[0]
+            if cb_tx.tx_type != Transaction.TYPE_TRANSFER:
+                return False, (
+                    f"Coinbase tx_type must be '{Transaction.TYPE_TRANSFER}', "
+                    f"got {cb_tx.tx_type!r}"
+                )
+            try:
+                _cb_fee = float(cb_tx.fee)
+                if not math.isfinite(_cb_fee) or to_satoshi(cb_tx.fee) != 0:
+                    return False, "Coinbase transaction fee must be 0"
+            except (TypeError, ValueError, OverflowError):
+                return False, "Invalid coinbase fee: must be a finite number"
+            if getattr(cb_tx, "sig_hex", "") or getattr(cb_tx, "pub_hex", ""):
+                return False, "Coinbase transaction must not carry a signature or public key"
+            if int(getattr(cb_tx, "expiry", 0) or 0) != 0:
+                return False, f"Coinbase expiry must be 0, got {cb_tx.expiry!r}"
+            if (getattr(cb_tx, "data", "")
+                    or int(getattr(cb_tx, "gas_limit", 0) or 0) != 0
+                    or float(getattr(cb_tx, "gas_price", 0.0) or 0.0) != 0.0
+                    or getattr(cb_tx, "contract_name", "")):
+                return False, "Coinbase transaction must not carry VVM/payload fields"
+            if (block.miner_address == "COINBASE"
+                    or not is_valid_protocol_address(
+                        block.miner_address, specials=(), allow_contract=False)):
+                return False, (
+                    f"Invalid block miner_address '{block.miner_address}': "
+                    f"must be a canonical wallet address"
+                )
             # BUG-8: reject non-finite or storage-unrepresentable coinbase
             # amounts before to_satoshi() can raise. SQLite INTEGER and all
             # consensus balance counters are signed 64-bit satoshi values.
@@ -938,6 +1055,12 @@ class Blockchain:
                 return False, (
                     f"Coinbase receiver '{cb_tx.receiver}' does not match "
                     f"block miner_address '{block.miner_address}'")
+            expected_cb_memo = f"coinbase:{block.index}"
+            cb_memo = str(getattr(cb_tx, "memo", "") or "")
+            if cb_memo.startswith("coinbase:") and cb_memo != expected_cb_memo and not cb_memo.startswith(f"{expected_cb_memo}|"):
+                return False, (
+                    f"Coinbase memo '{cb_memo}' must be bound to block height "
+                    f"{block.index}")
 
             # ── Consensus-authenticated pruning bootstrap commitment ─────────
             # At H = K+1 for each fixed K=600*n boundary (after activation),
@@ -1003,7 +1126,6 @@ class Blockchain:
             # deploy appears earlier in the block.  Runtime VM failure remains
             # a normal reverted VVM transaction, matching apply_block().
             pending_deploy_addrs: Set[str] = set()
-            pending_deploy_names: Set[str] = set()
             # BUG-3 FIX: track satoshi already "spent" by earlier transactions
             # in this block for each sender.  Without this, two txs from the
             # same sender each spending 90% of balance both pass the individual
@@ -1027,10 +1149,10 @@ class Blockchain:
             # Validation does not mutate account balances. Cache each sender's
             # pre-block balance once, then apply pending same-block debits locally.
             preblock_balances: Dict[str, int] = {}
-            non_coinbase_tx_ids = [
-                tx.tx_id for tx in block.transactions if tx.sender != "COINBASE"
-            ]
-            existing_block_tx_ids = self.storage.existing_tx_ids(non_coinbase_tx_ids)
+            all_block_tx_ids = [tx.tx_id for tx in block.transactions]
+            existing_block_tx_ids = self.storage.existing_tx_ids(all_block_tx_ids)
+            if cb_tx.tx_id in existing_block_tx_ids:
+                return False, f"Duplicate coinbase tx_id: {cb_tx.tx_id[:8]}"
             sender_addresses = {
                 tx.sender for tx in block.transactions if tx.sender != "COINBASE"
             }
@@ -1136,13 +1258,10 @@ class Blockchain:
                             block.index >= Config.CONTRACT_NAMING_ACTIVATION_HEIGHT)
                         name_blocked = False
                         if naming_active and deploy_name:
-                            name_blocked = (
-                                self.storage.contract_name_exists(deploy_name)
-                                or deploy_name in pending_deploy_names)
+                            name_blocked = self.storage.contract_name_exists(
+                                deploy_name)
                         if not name_blocked:
                             pending_deploy_addrs.add(deploy_addr)
-                            if naming_active and deploy_name:
-                                pending_deploy_names.add(deploy_name)
                     elif tx.tx_type == Transaction.TYPE_CALL:
                         # Ordinary calls still require an already-committed
                         # contract.  The sole exception is a deterministic
@@ -1183,7 +1302,9 @@ class Blockchain:
             stored_genesis = self.storage.get_meta("genesis_hash")
             if stored_genesis:
                 gen = self.storage.get_block(0)
-                if gen and gen.block_hash != stored_genesis:
+                if gen is None:
+                    return False, "Genesis block missing"
+                if gen.block_hash != stored_genesis:
                     return False, "Genesis hash tampered"
 
             # ── Protocol version validation (Problem #13 + Governance) ──────────
@@ -1273,12 +1394,13 @@ class Blockchain:
 
         # Start with every currently active role, not only addresses that
         # submit REGISTER transactions in this block.
-        for existing_role_name in ("miner", "investor"):
-            for r in self.storage.get_all_by_role(existing_role_name):
-                addr = r.get("address")
-                if addr:
-                    locked_stake_reserve[addr] = to_satoshi(
-                        float(r.get("stake", 0.0)))
+        for r in self.storage.get_all_roles():
+            if r.get("role") not in ("miner", "investor"):
+                continue
+            addr = r.get("address")
+            if addr:
+                locked_stake_reserve[addr] = to_satoshi(
+                    float(r.get("stake", 0.0)))
 
         # Re-simulate only the REGISTER mutations that can actually take
         # effect at the end of this block and add their positive stake
@@ -1298,7 +1420,7 @@ class Blockchain:
         # legacy tests/protocol deliberately permit that re-registration
         # amount to be arbitrary positive stake, while a genuinely new
         # activation is subject to the configured minimum.
-        same_block_reentry: set[str] = set()
+        same_block_reentry: Dict[str, str] = {}
         for tx in transactions:
             if tx.tx_type != Transaction.TYPE_REGISTER or tx.sender == "COINBASE":
                 continue
@@ -1309,13 +1431,9 @@ class Blockchain:
                 role = "none"
             current = role_shadow.get(tx.sender)
             if role == "none":
-                # The previous role's stake becomes spendable again at the
-                # end of this block. Keep the reserve in lockstep with the
-                # shadow role state. A slash marker, however, is permanent
-                # through an ordinary unregister and must survive this
-                # transition so a later REGISTER cannot self-unslash.
                 if current and current.get("role") in ("miner", "investor"):
-                    same_block_reentry.add(tx.sender)
+                    same_block_reentry.setdefault(
+                        tx.sender, str(current.get("role")))
                 locked_stake_reserve[tx.sender] = 0
                 was_slashed = bool(current and current.get("slashed"))
                 role_shadow[tx.sender] = {
@@ -1329,9 +1447,10 @@ class Blockchain:
             if current and current.get("slashed"):
                 continue
             same_role = bool(current and current.get("role") == role)
+            same_role_reentry = (same_block_reentry.get(tx.sender) == role)
             if (block_index >= role_stake_activation
                     and not same_role
-                    and tx.sender not in same_block_reentry):
+                    and not same_role_reentry):
                 minimum_sat = (
                     int(Config.MIN_MINER_STAKE)
                     if role == "miner"
@@ -1344,6 +1463,7 @@ class Blockchain:
                         f"{from_satoshi(tx_stake_sat):.8f} VSD "
                         f"(minimum {from_satoshi(minimum_sat):.8f} VSD)")
                     return {}, _err_msg, tx
+            same_block_reentry.pop(tx.sender, None)
             cur_stake = float(current.get("stake", 0.0)) if same_role else 0.0
             delta_sat = to_satoshi(float(tx.amount))
             locked_stake_reserve[tx.sender] = (
@@ -1397,7 +1517,13 @@ class Blockchain:
         seen: Set[str] = set()
         block_gas = 0
         l2_spent: Dict[str, int] = {}
+        l2_credited: Dict[str, int] = {}
         bridge_spent = 0
+        bridge_credited = 0
+        pending_deploy_addrs: Set[str] = set()
+        pending_deploy_names: Set[str] = set()
+        missing_call_err = None
+        naming_active = block_index >= int(Config.CONTRACT_NAMING_ACTIVATION_HEIGHT)
 
         for pos, tx in enumerate(transactions):
             if tx.sender == "COINBASE":
@@ -1453,6 +1579,28 @@ class Blockchain:
                         pos, tx,
                         f"insufficient spendable balance for VVM tx: need {required} sat, "
                         f"have {available} sat")
+                if tx.tx_type == Transaction.TYPE_DEPLOY:
+                    deploy_addr = derive_contract_address(
+                        tx.sender, tx.nonce, tx.tx_id)
+                    deploy_name = normalize_contract_name(
+                        getattr(tx, "contract_name", "") or "")
+                    name_blocked = False
+                    if naming_active and deploy_name:
+                        name_blocked = (
+                            self.storage.contract_name_exists(deploy_name)
+                            or deploy_name in pending_deploy_names)
+                    if not name_blocked:
+                        pending_deploy_addrs.add(deploy_addr)
+                        if naming_active and deploy_name:
+                            pending_deploy_names.add(deploy_name)
+                elif tx.tx_type == Transaction.TYPE_CALL:
+                    if (missing_call_err is None
+                            and not self.storage.get_contract(tx.receiver)
+                            and tx.receiver not in pending_deploy_addrs):
+                        missing_call_err = (
+                            pos, tx,
+                            f"Contract not found for CALL tx {tx.tx_id[:8]}: "
+                            f"{tx.receiver}")
             elif tx.tx_type == Transaction.TYPE_REGISTER:
                 required = tx.compute_fee_sat()
                 if available < required:
@@ -1475,16 +1623,31 @@ class Blockchain:
                     layer2 = getattr(self, "layer2", None)
                     if layer2 is None:
                         raise CandidateTxRejected(pos, tx, "L2 subsystem not initialised")
-                    l2_free = layer2.get_balance_sat(tx.sender) - l2_spent.get(tx.sender, 0)
+                    l2_free = (
+                        layer2.get_balance_sat(tx.sender)
+                        + l2_credited.get(tx.sender, 0)
+                        - l2_spent.get(tx.sender, 0)
+                    )
                     if l2_free < amount_sat:
                         raise CandidateTxRejected(
                             pos, tx, "insufficient L2 balance for withdrawal")
-                    bridge_free = self.storage.get_balance_sat(L2_BRIDGE_ADDRESS) - bridge_spent
+                    bridge_free = (
+                        self.storage.get_balance_sat(L2_BRIDGE_ADDRESS)
+                        + bridge_credited
+                        - bridge_spent
+                    )
                     if bridge_free < amount_sat:
                         raise CandidateTxRejected(
                             pos, tx, "insufficient L2 bridge escrow for withdrawal")
                     l2_spent[tx.sender] = l2_spent.get(tx.sender, 0) + amount_sat
                     bridge_spent += amount_sat
+                elif amount_sat > 0 and tx.receiver == L2_BRIDGE_ADDRESS:
+                    if getattr(self, "layer2", None) is not None:
+                        l2_credited[tx.sender] = l2_credited.get(tx.sender, 0) + amount_sat
+                        bridge_credited += amount_sat
+
+        if missing_call_err is not None:
+            raise CandidateTxRejected(*missing_call_err)
 
     # ── Dry-run state root (v7.1.9 — Option A fix) ────────────────────────────
     def dry_run_state_root(self,
@@ -1687,7 +1850,8 @@ class Blockchain:
 
         try:
             fee_pool_sat = 0
-            _l2_spent: Dict[str, int] = {}   # VSA-01: earlier withdrawals per sender
+            _l2_spent: Dict[str, int] = {}      # VSA-01: earlier withdrawals per sender
+            _l2_credited: Dict[str, int] = {}   # intra-block L2 deposits per sender
             for _tx_idx, tx in enumerate(transactions):
                 if tx.sender == "COINBASE":
                     continue
@@ -1733,6 +1897,9 @@ class Blockchain:
                             if _collision_refund > 0:
                                 self.storage.credit_sat(
                                     tx.sender, _collision_refund)
+                            if _penalty_fee_sat > 0:
+                                self.storage.credit_sat(
+                                    Config.BURN_ADDRESS, _penalty_fee_sat)
                         cur_nonce = self.storage.get_nonce(tx.sender)
                         self.storage.set_nonce(
                             tx.sender, max(cur_nonce, tx.nonce + 1))
@@ -1893,41 +2060,31 @@ class Blockchain:
                         # tx amount was already debited above; these deltas now
                         # materialise the recipient plus every successful nested
                         # CALL/CREATE value transfer in the same order as apply_block.
+                        _net_deltas: dict = {}
                         for _addr, _delta in result.balance_deltas.items():
-                            _delta = int(_delta)
-                            if _delta == 0:
-                                continue
-                            if _addr not in snap and _addr not in _dry_run_dynamic_accounts:
-                                _dry_run_dynamic_accounts[_addr] = \
-                                    self.storage.snapshot_accounts([_addr])[_addr]
-                            if _delta > 0:
-                                self.storage.credit_sat(_addr, _delta)
-                            else:
-                                if not self.storage.debit_sat(_addr, -_delta):
-                                    raise CandidateTxRejected(_tx_idx, tx, 
-                                        f"dry-run VVM balance overlay debit failed for {_addr[:16]}")
-                            touched.add(_addr)
-
-                        # Mirror the real SELFDESTRUCT balance transfer exactly:
-                        # debit the source contract and credit the beneficiary.
-                        # The previous dry-run path only marked the contract as
-                        # destroyed, so its computed root omitted the actual
-                        # beneficiary credit and retained the source balance.
+                            _net_deltas[_addr] = _net_deltas.get(_addr, 0) + int(_delta)
                         for _sd_transfer in result.self_destruct_transfers:
                             if len(_sd_transfer) != 3:
-                                raise CandidateTxRejected(_tx_idx, tx, 
+                                raise CandidateTxRejected(_tx_idx, tx,
                                     "SELFDESTRUCT transfer record is missing its source")
                             _source_addr, _beneficiary_addr, _sd_amount = _sd_transfer
                             _sd_amount = int(_sd_amount)
                             if _sd_amount <= 0:
                                 continue
-                            _snapshot_dry_run_account(_source_addr)
-                            _snapshot_dry_run_account(_beneficiary_addr)
-                            if not self.storage.debit_sat(_source_addr, _sd_amount):
-                                raise CandidateTxRejected(_tx_idx, tx, 
-                                    f"dry-run SELFDESTRUCT source {_source_addr[:16]} "
-                                    f"has insufficient balance for {_sd_amount} sat")
-                            self.storage.credit_sat(_beneficiary_addr, _sd_amount)
+                            _net_deltas[_source_addr] = _net_deltas.get(_source_addr, 0) - _sd_amount
+                            _net_deltas[_beneficiary_addr] = _net_deltas.get(_beneficiary_addr, 0) + _sd_amount
+                        for _addr, _delta in _net_deltas.items():
+                            if _delta == 0:
+                                continue
+                            _snapshot_dry_run_account(_addr)
+                            touched.add(_addr)
+                            if _delta > 0:
+                                self.storage.credit_sat(_addr, _delta)
+                        for _addr, _delta in _net_deltas.items():
+                            if _delta < 0:
+                                if not self.storage.debit_sat(_addr, -_delta):
+                                    raise CandidateTxRejected(_tx_idx, tx,
+                                        f"dry-run VVM balance overlay debit failed for {_addr[:16]}")
 
                         # Apply storage writes temporarily so
                         # update_contract_storage_root sees the correct slots,
@@ -2044,7 +2201,11 @@ class Blockchain:
                         raise CandidateTxRejected(_tx_idx, tx, "L2 subsystem not initialised")
                     if fee_sat < 0 or fee_sat > amount_sat:
                         raise CandidateTxRejected(_tx_idx, tx, "invalid L2 withdrawal fee")
-                    l2_bal = layer2.get_balance_sat(tx.sender) - _l2_spent.get(tx.sender, 0)
+                    l2_bal = (
+                        layer2.get_balance_sat(tx.sender)
+                        + _l2_credited.get(tx.sender, 0)
+                        - _l2_spent.get(tx.sender, 0)
+                    )
                     bridge_bal = self.storage.get_balance_sat(L2_BRIDGE_ADDRESS)
                     if l2_bal < amount_sat:
                         raise CandidateTxRejected(_tx_idx, tx, "insufficient L2 balance for withdrawal")
@@ -2089,8 +2250,11 @@ class Blockchain:
                 # (they live in Layer2State's own Merkle tree), but the L1
                 # escrow credit to L2_BRIDGE_ADDRESS IS in storage and must
                 # be included — which the credit_sat above already covers.
-                # No additional action needed for deposits beyond what the
-                # standard credit_sat already did.
+                if tx.receiver == L2_BRIDGE_ADDRESS and amount_sat > 0:
+                    if getattr(self, "layer2", None) is not None:
+                        _l2_credited[tx.sender] = (
+                            _l2_credited.get(tx.sender, 0) + amount_sat
+                        )
                 fee_pool_sat += fee_sat
                 cur_nonce = self.storage.get_nonce(tx.sender)
                 self.storage.set_nonce(tx.sender, max(cur_nonce, tx.nonce + 1))
@@ -2606,7 +2770,8 @@ class Blockchain:
     # ── Apply block ───────────────────────────────────────────────────────────
     def _undo_vvm_block_effects(
             self, vvm_undo_log: List[dict],
-            restore_state_channel_accounts: bool = True) -> None:
+            restore_state_channel_accounts: bool = True,
+            block_idx: Optional[int] = None) -> None:
         """
         AUDIT-FIX-3 (state corruption / non-atomic contract storage):
         reverse every VVM transaction's contract-storage side effects
@@ -2754,6 +2919,22 @@ class Blockchain:
                     "apply_block VVM-undo: storage_root recompute failed "
                     "for %s: %s", addr, _root_e)
 
+        ev_index = getattr(self, "_event_index", None)
+        if ev_index is not None:
+            undo_blocks = {
+                int(u["block_idx"]) for u in vvm_undo_log
+                if isinstance(u, dict) and u.get("block_idx") is not None
+            }
+            if block_idx is not None:
+                undo_blocks.add(int(block_idx))
+            for b_idx in sorted(undo_blocks):
+                try:
+                    ev_index.delete_block_events(b_idx)
+                except Exception as _ev_e:
+                    log.debug(
+                        "apply_block VVM-undo: event index cleanup failed "
+                        "for block %d: %s", b_idx, _ev_e)
+
     def apply_block(self, block: Block, *,
                     defer_finality: bool = False) -> Tuple[bool, str]:
         """Apply one block atomically at the persistent-storage boundary.
@@ -2820,6 +3001,10 @@ class Blockchain:
                         result = self._apply_block_unwrapped(
                             block, defer_finality=defer_finality,
                             _l2_snapshot=_l2_wrapper_snap)
+                        if result[0]:
+                            _hc_hook = getattr(self, "_hc_post_apply_hook", None)
+                            if _hc_hook is not None:
+                                _hc_hook(self, block, result[1])
                         if result[0] and pgx_tx is not None:
                             pgx_tx["commit"] = True
                     if result[0]:
@@ -2832,6 +3017,10 @@ class Blockchain:
                         result = self._apply_block_unwrapped(
                             block, defer_finality=defer_finality,
                             _l2_snapshot=_l2_wrapper_snap)
+                        if result[0]:
+                            _hc_hook = getattr(self, "_hc_post_apply_hook", None)
+                            if _hc_hook is not None:
+                                _hc_hook(self, block, result[1])
                     except BaseException:
                         if atomic_started:
                             atomic_storage.rollback_sqlite_atomic_block()
@@ -2994,9 +3183,9 @@ class Blockchain:
             # normal fork validation.
             existing_hash = self.storage.get_block_hash(block.index)
             applied_marker = self.storage.get_meta(f"block_apply:{block.index}")
-            if (block.block_hash in self._applied_block_hashes
-                    or (existing_hash == block.block_hash
-                        and applied_marker == "ok")):
+            if (existing_hash == block.block_hash
+                    and (block.block_hash in self._applied_block_hashes
+                         or applied_marker == "ok")):
                 return True, BLOCK_ALREADY_APPLIED_MSG
 
             ok, msg = self.validate_block(block)
@@ -3036,9 +3225,18 @@ class Blockchain:
             # message dies naturally after one fan-out hop per node.
             # ═══════════════════════════════════════════════════════════════════
             if block.index == 0:
+                canonical_hash = self.build_canonical_genesis().block_hash
+                if block.block_hash != canonical_hash:
+                    return False, (
+                        f"Forged or wrong-chain genesis block rejected: "
+                        f"{block.block_hash[:16]} != {canonical_hash[:16]}")
                 existing_hash = self.storage.get_block_hash(0)
                 if existing_hash == block.block_hash:
                     return True, "Genesis already present (idempotent)"
+                if existing_hash is not None:
+                    return False, (
+                        f"Conflicting genesis block rejected: "
+                        f"existing={existing_hash[:16]}, got={block.block_hash[:16]}")
                 # If existing is None we are a fresh node whose Blockchain.__init__
                 # has not yet created genesis.  In that rare path (which
                 # normally cannot occur because __init__ creates genesis
@@ -3083,7 +3281,8 @@ class Blockchain:
                         # validation; failure to derive a defensive snapshot
                         # must never make a block valid by itself.
                         pass
-                if (tx.tx_type == Transaction.TYPE_REGISTER
+                if (tx.sender != "COINBASE"
+                        and tx.tx_type == Transaction.TYPE_REGISTER
                         and not Transaction.is_identity_claim(tx)):
                     register_txs.append(tx)
             # Reward recipients: miner + all registered validators + miners.
@@ -3164,6 +3363,7 @@ class Blockchain:
                 # below, so contract storage gets the same all-or-nothing
                 # guarantee balances/roles/L2 state already have.
                 _vvm_undo_log: List[dict] = []
+                _skipped_rollup_tx_ids: set[str] = set()
                 for tx in block.transactions:
                     if tx.sender == "COINBASE":
                         # The coinbase transaction is the canonical issuance record
@@ -3252,6 +3452,8 @@ class Blockchain:
                                 f"rejected by _apply_rollup_tx ({msg_r}); "
                                 f"skipping and removing from mempool — block "
                                 f"otherwise valid.")
+                            if getattr(tx, "tx_id", ""):
+                                _skipped_rollup_tx_ids.add(tx.tx_id)
                             try:
                                 self.mempool.remove(tx.tx_id)
                             except Exception as _mp_err:
@@ -3489,9 +3691,8 @@ class Blockchain:
                 # the same block; after this loop, every node's role table
                 # is identical going into block N+1's reward calculation.
                 for tx in register_txs:
-                    # Identity claims use the TYPE_REGISTER envelope but must
-                    # never mutate the miner/investor role table.
-                    if Transaction.is_identity_claim(tx):
+                    # Identity claims and COINBASE must never mutate the role table.
+                    if tx.sender == "COINBASE" or Transaction.is_identity_claim(tx):
                         continue
                     role = (tx.memo or "").strip().lower()
                     if role not in ("miner", "investor", "none"):
@@ -3614,6 +3815,8 @@ class Blockchain:
                 # (or POW_FINALITY_DEPTH confirmations if no investors)
                 block.finalized = False
                 self.storage.save_block(block)
+                if block.index == 0 and not self.storage.get_meta("genesis_hash"):
+                    self.storage.set_meta("genesis_hash", block.block_hash)
 
             except Exception as _exc:
                 _restore_cumulative_issued_apply()
@@ -3718,7 +3921,14 @@ class Blockchain:
             # Set OWNER_ADDRESS to your VSD address to enable archiving.
             # Leave as "" to disable (the function returns instantly on "").
             _OWNER_ADDRESS: str = os.environ.get("VSD_LEDGER_OWNER", "")
-            sync_local_ledger(block, _OWNER_ADDRESS)
+            try:
+                sync_local_ledger(
+                    block,
+                    _OWNER_ADDRESS,
+                    skipped_rollup_tx_ids=_skipped_rollup_tx_ids,
+                )
+            except TypeError:
+                sync_local_ledger(block, _OWNER_ADDRESS)
 
             # ── v7.4.0: Rolling window pruning (background, non-blocking) ─────
             self._rolling_pruner.prune_async(block.index)
@@ -4052,13 +4262,19 @@ class Blockchain:
                 collision_refund_sat = total_upfront_sat - collision_fee_sat
                 if collision_refund_sat > 0:
                     self.storage.credit_sat(tx.sender, collision_refund_sat)
+                if collision_fee_sat > 0:
+                    self.storage.credit_sat(Config.BURN_ADDRESS, collision_fee_sat)
                 self.storage.save_vvm_receipt(
                     tx_id=tx.tx_id, block_idx=block.index,
                     contract_addr="", gas_used=NAME_COLLISION_GAS_PENALTY,
                     gas_limit=tx.gas_limit, success=False,
                     return_data=b"",
                     revert_reason="Contract name already exists",
-                    logs=[], storage_delta={"__fee_pool_sat__": 0})
+                    logs=[],
+                    storage_delta={
+                        "__fee_pool_sat__": 0,
+                        "__burn_sat__": int(collision_fee_sat),
+                    })
                 log.warning(
                     f"VVM deploy {tx.tx_id[:8]}: name collision '{norm}' "
                     f"by {tx.sender[:12]}")
@@ -4240,6 +4456,7 @@ class Blockchain:
                 # to exactly its pre-this-tx state — the same guarantee
                 # restore_accounts()/restore_roles() already give balances/roles.
                 vvm_undo = {
+                    "block_idx": int(block.index),
                     "storage_delta": {
                         (addr, slot): result.storage_orig.get((addr, slot), 0)
                         for (addr, slot) in result.storage_writes.keys()
@@ -4261,23 +4478,9 @@ class Blockchain:
                 # with the maximum gas fee above; the overlay now credits the
                 # top-level recipient and applies every nested CALL/CREATE value
                 # movement exactly once.
+                _net_deltas: dict = {}
                 for _addr, _delta in result.balance_deltas.items():
-                    _delta = int(_delta)
-                    if _delta > 0:
-                        self.storage.credit_sat(_addr, _delta)
-                    elif _delta < 0:
-                        if not self.storage.debit_sat(_addr, -_delta):
-                            raise RuntimeError(
-                                f"VVM balance overlay debit failed for {_addr[:16]} "
-                                f"of {-_delta} sat")
-
-                # SC-V73-FIX-3 / AUDIT-FIX-SELFDESTRUCT-1: materialize each
-                # SELFDESTRUCT transfer as a real balance move.  The old path only
-                # credited the beneficiary, leaving the destroyed contract's
-                # balance untouched and therefore creating new supply.  Debit the
-                # exact source first so a failed transfer cannot mint value; the
-                # surrounding apply_block rollback restores the whole proxy state
-                # if the subsequent credit fails.
+                    _net_deltas[_addr] = _net_deltas.get(_addr, 0) + int(_delta)
                 for _sd_transfer in result.self_destruct_transfers:
                     if len(_sd_transfer) != 3:
                         raise RuntimeError(
@@ -4286,11 +4489,17 @@ class Blockchain:
                     amount_sat_sd = int(amount_sat_sd)
                     if amount_sat_sd <= 0:
                         continue
-                    if not self.storage.debit_sat(_source_addr, amount_sat_sd):
-                        raise RuntimeError(
-                            f"SELFDESTRUCT source {_source_addr[:16]} has insufficient "
-                            f"balance for transfer of {amount_sat_sd} sat")
-                    self.storage.credit_sat(_beneficiary_addr, amount_sat_sd)
+                    _net_deltas[_source_addr] = _net_deltas.get(_source_addr, 0) - amount_sat_sd
+                    _net_deltas[_beneficiary_addr] = _net_deltas.get(_beneficiary_addr, 0) + amount_sat_sd
+                for _addr, _delta in _net_deltas.items():
+                    if _delta > 0:
+                        self.storage.credit_sat(_addr, _delta)
+                for _addr, _delta in _net_deltas.items():
+                    if _delta < 0:
+                        if not self.storage.debit_sat(_addr, -_delta):
+                            raise RuntimeError(
+                                f"VVM balance overlay debit failed for {_addr[:16]} "
+                                f"of {-_delta} sat")
                 metrics.inc("vvm_txs_success")
             else:
                 # Revert: call_value already debited from sender but not credited
@@ -4313,11 +4522,17 @@ class Blockchain:
             # Recording them in storage_delta would only confuse the rollback
             # path which would try to sstore them back as a phantom slot.
             storage_delta: dict = {}
+            storage_tag_delta: dict = {}
             for (addr, slot) in result.storage_writes.keys():
                 if addr == "__selfdestruct__":
                     continue
                 prev_val = result.storage_orig.get((addr, slot), 0)
                 storage_delta[f"{addr}:{slot}"] = hex(prev_val)
+                prev_tag = result.storage_tag_orig.get((addr, slot))
+                if prev_tag is not None:
+                    storage_tag_delta[f"{addr}:{slot}"] = int(prev_tag)
+            if storage_tag_delta:
+                storage_delta["__storage_tag_delta__"] = storage_tag_delta
 
             # AUDIT-FIX (Batch D): SELFDESTRUCT beneficiary transfers were never
             # persisted anywhere — result.self_destruct_transfers only ever
@@ -4541,7 +4756,7 @@ class Blockchain:
             if not address:
                 continue
             stake_sat = to_satoshi(float(validator.get("stake", 0.0)))
-            if stake_sat < 0:
+            if stake_sat <= 0:
                 continue
             rows.append({"address": address, "stake_sat": int(stake_sat)})
         rows.sort(key=lambda row: row["address"])
@@ -4599,13 +4814,14 @@ class Blockchain:
                     stake_sat = int(item[1])
                     slashed = bool(item[3])
                     existed = bool(item[5] if len(item) >= 6 else item[4])
-                    if existed and role == "investor" and not slashed:
+                    if existed and role == "investor" and not slashed and stake_sat > 0:
                         current[address] = stake_sat
                     else:
                         current.pop(address, None)
             rebuilt = [
                 {"address": address, "stake_sat": int(stake_sat)}
                 for address, stake_sat in current.items()
+                if int(stake_sat) > 0
             ]
             rebuilt.sort(key=lambda row: row["address"])
             self.storage.record_block_validator_snapshot(
@@ -4844,7 +5060,7 @@ class Blockchain:
         # denominator or count more than once.
         unique = {}
         for row in eligible:
-            if row["stake_sat"] >= 0:
+            if row["stake_sat"] > 0:
                 unique.setdefault(row["address"], row["stake_sat"])
         eligible = [
             {"address": address, "stake_sat": stake}
@@ -4940,21 +5156,20 @@ class Blockchain:
         (Fix #2), and PoW-depth finalized blocks can be upgraded to BFT-final
         when validators return.
         """
-        validators = self.storage.get_all_by_role("investor")
+        applied_blk = self.storage.get_block(applied_height)
+        validators = (
+            self.get_validator_set_for_block(applied_blk)
+            if applied_blk is not None else None
+        )
+        if validators is None:
+            return
 
-        # SEC-FIX H-04 (Bootstrap Finality Depth)
-        # ───────────────────────────────────────
-        # During bootstrap (validator count below MIN_VALIDATORS_FOR_BFT) the
-        # chain has no BFT finality at all and runs in pure PoW mode.  Six
-        # confirmations against a near-MIN_DIFFICULTY target is too shallow
-        # to defend against a 51% rewrite by a determined attacker, so use
-        # the deeper BOOTSTRAP_POW_FINALITY_DEPTH until enough validators
-        # register.  Once the validator set reaches MIN_VALIDATORS_FOR_BFT
-        # the chain switches to BFT finality and the steady-state depth (6)
-        # applies.
-        validator_count = len(validators) if validators else 0
-        bft_active      = validator_count >= int(getattr(
-            Config, "MIN_VALIDATORS_FOR_BFT", 3))
+        total_stake_sat = sum(int(v.get("stake_sat", 0)) for v in validators)
+        validator_count = len(validators)
+        bft_active      = (
+            validator_count >= int(getattr(Config, "MIN_VALIDATORS_FOR_BFT", 3))
+            and total_stake_sat > 0
+        )
         finality_depth  = int(Config.POW_FINALITY_DEPTH) if bft_active \
             else int(getattr(Config,
                              "BOOTSTRAP_POW_FINALITY_DEPTH",
@@ -5249,6 +5464,12 @@ class Blockchain:
             self._rebuild_economic_monitor_history()
         except Exception as _eco_exc:
             log.warning(f"[ROLLBACK] economic monitor rebuild failed: {_eco_exc}")
+        try:
+            auditor = getattr(self, "_rate_auditor", None)
+            if auditor is not None and hasattr(auditor, "on_rollback"):
+                auditor.on_rollback(int(self.storage.chain_height()))
+        except Exception as _ra_exc:
+            log.warning(f"[ROLLBACK] rate auditor rollback reset failed: {_ra_exc}")
         # Confirmed indexes are now gone, so mempool.restore() can legitimately
         # accept the original tx ids back into the pool.
         for _tx in mempool_restore:
@@ -5782,6 +6003,15 @@ class Blockchain:
                 # the already-refunded value contributes nothing here.
                 gas_used = receipt["gas_used"] if receipt else tx.gas_limit
                 actual_gas_fee_sat = gas_fee_to_sat(gas_used, tx.gas_price)
+                sd = (receipt.get("storage_delta") or {}) if receipt else {}
+                burn_sat_raw = sd.get("__burn_sat__")
+                if burn_sat_raw is not None:
+                    try:
+                        burn_sat = max(0, int(burn_sat_raw))
+                    except (TypeError, ValueError):
+                        burn_sat = 0
+                    if burn_sat > 0:
+                        self.storage.debit_sat(Config.BURN_ADDRESS, burn_sat)
                 if receipt and receipt.get("success", False):
                     refund_sat = to_satoshi(tx.amount) + actual_gas_fee_sat
                 else:
@@ -6030,6 +6260,34 @@ class Blockchain:
                         f"governance state restore after failed reorg failed: {_gov_restore_exc}")
             return ok, msg
 
+    def _has_bft_finalized_blocks_in_range(self, start_height: int,
+                                           end_height: int) -> bool:
+        """Return True if any finalized block in [start_height, end_height]
+        was BFT-finalized (or its validator snapshot cannot be verified).
+        """
+        min_validators = int(getattr(Config, "MIN_VALIDATORS_FOR_BFT", 3))
+        for idx in range(max(1, int(start_height)), int(end_height) + 1):
+            blk = self.storage.get_block(idx)
+            if blk is None:
+                return True
+            if not blk.finalized:
+                continue
+            eligible = self.get_validator_set_for_block(blk)
+            if eligible is None:
+                return True
+            total_stake_sat = sum(int(v.get("stake_sat", 0)) for v in eligible)
+            if len(eligible) < min_validators or total_stake_sat <= 0:
+                continue
+            authenticated = self._authenticated_block_votes(blk, eligible)
+            voted_addrs = {v["addr"] for v in authenticated}
+            voted_stake_sat = sum(
+                int(v["stake_sat"]) for v in eligible
+                if str(v["address"]) in voted_addrs
+            )
+            if bft_threshold_met(voted_stake_sat, total_stake_sat):
+                return True
+        return False
+
     def _reorg_locked(self, new_chain: List[Block], *,
                       allow_deep_no_investor: bool = False) -> Tuple[bool, str]:
         """
@@ -6063,6 +6321,10 @@ class Blockchain:
                     f"({self._critical_recovery})")
 
             fork_height = new_chain[0].index
+            if fork_height < 1:
+                return False, (
+                    f"Reorg rejected: fork_height={fork_height} must be >= 1 "
+                    "(genesis block 0 is immutable).")
             tip         = self.height()
 
             # ── Fix #2: Finality fence ────────────────────────────────────────
@@ -6099,10 +6361,14 @@ class Blockchain:
                 # network has no investors/BFT validators. Keep that rule
                 # enforced here as well so a future caller cannot accidentally
                 # turn an ordinary reorg into a finality bypass.
-                if self.storage.get_all_by_role("investor"):
+                if (any(to_satoshi(float(v.get("stake", 0.0))) > 0
+                        for v in (self.storage.get_all_by_role("investor") or []))
+                        or self._has_bft_finalized_blocks_in_range(
+                            fork_height, highest_finalized)):
                     return False, (
                         "Reorg rejected: finalized history is protected while "
-                        "investors/BFT validators are present.")
+                        "investors/BFT validators are present or BFT-finalized "
+                        "blocks exist.")
                 log.warning(
                     "Deep PoW fork crossing finalized height %d with no "
                     "investors; using the explicit no-BFT exception with "
@@ -6235,246 +6501,262 @@ class Blockchain:
             # atomic (_rollback_block).  If a step fails, the blocks already removed
             # are put back, so the old canonical chain is intact and the reorg is
             # rejected rather than left half-done.
-            _suffix_removed: list = []   # newest first
-            try:
-                for blk in reversed(_saved_old_blocks):
-                    self._rollback_block(blk)
-                    _suffix_removed.append(blk)
-            except Exception as _old_rb_e:
-                _ok_r, _msg_r = self._restore_removed_suffix(
-                    _suffix_removed, tip, fork_height, _old_finality_by_height,
-                    _old_hash_by_height, _pre_reorg_finality_fence,
-                    "reorg old-suffix rollback")
+            _prune_lock = getattr(self._rolling_pruner, "_running_lock", None)
+            _prune_guarded = bool(
+                _prune_lock is not None and _prune_lock.acquire(blocking=False))
+            if _prune_lock is not None and not _prune_guarded:
                 return False, (
-                    f"Reorg aborted: rollback of the old suffix failed: "
-                    f"{_old_rb_e}; {_msg_r}")
-            # VSA-21: difficulty entries at or above the fork point were computed on the
-            # abandoned branch.  Drop them before any replacement block is validated.
-            DifficultyEngine.invalidate_cache(from_height=fork_height)
-            # Snapshots at or above the fork point describe the abandoned suffix.
-            # Drop them now, as rollback() does.  get_servable_manifest() also
-            # refuses any entry whose anchor no longer matches the canonical block.
-            try:
-                self._snapshot_engine.invalidate_snapshots_above(fork_height - 1)
-            except Exception as _snap_reorg_exc:
-                log.error(
-                    "[REORG] Failed to invalidate snapshots above %d: %s",
-                    fork_height - 1, _snap_reorg_exc)
-            # Protocol-upgrade state reached through the removed suffix is undone,
-            # so replacement blocks are checked against the fork-point state.
-            try:
-                self._governance.reconcile_to_height(fork_height - 1)
-            except Exception as _gov_reorg_exc:
-                log.error(
-                    "[REORG] governance reconciliation at fork %d failed: %s",
-                    fork_height, _gov_reorg_exc)
-                _ok_r, _msg_r = self._restore_removed_suffix(
-                    _suffix_removed, tip, fork_height, _old_finality_by_height,
-                    _old_hash_by_height, _pre_reorg_finality_fence,
-                    "reorg governance reconciliation")
-                return False, (
-                    f"Reorg aborted: governance reconciliation failed: "
-                    f"{_gov_reorg_exc}; {_msg_r}")
+                    "Reorg deferred: rolling pruning is currently in progress. "
+                    "Retry after the active prune pass completes.")
 
-            # ── v7.5.0-OPT LAYER-2 REORG HOOK ────────────────────────────────
-            # Any RollupSubmission confirmed at an L1 height >= fork_height
-            # is now on a discarded branch.  Roll the L2 tree back to the
-            # most recent snapshot taken at l1_height < fork_height.  If
-            # the new chain contains its own rollup submissions, they will
-            # be re-applied as apply_block() processes each new block
-            # below — and Layer2State.commit_batch() will re-add them to
-            # the snapshot history with the new L1 heights.
-            #
-            # Safety: rollback_to_height() is idempotent — calling it with
-            # a height that has no matching snapshot resets the tree to
-            # empty (which is correct for a deep reorg below any ever-
-            # confirmed batch).
-            layer2 = getattr(self, "layer2", None)
-            safe_l1 = fork_height - 1
-            _l2_err = None
-            if layer2 is not None:
+            try:
+                _suffix_removed: list = []   # newest first
                 try:
-                    ok_rb, msg_rb = layer2.rollback_to_height(safe_l1)
-                    if not ok_rb:
-                        _l2_err = msg_rb
-                    elif msg_rb == "no-l2-state":
-                        log.debug(
-                            f"[L2-REORG] no L2 state to roll back "
-                            f"(height <= {safe_l1})")
-                    else:
-                        log.info(
-                            f"[L2-REORG] L2 state rolled back to L1 height "
-                            f"<= {safe_l1} ({msg_rb})")
-                except Exception as _l2_rb_e:
-                    _l2_err = str(_l2_rb_e)
-            if _l2_err is not None:
-                # The replacement cannot be validated against L2 that is not at
-                # the fork point, so the removed suffix is put back.
-                log.error(f"[L2-REORG] rollback_to_height({safe_l1}) failed: {_l2_err}")
-                _ok_r, _msg_r = self._restore_removed_suffix(
-                    _suffix_removed, tip, fork_height, _old_finality_by_height,
-                    _old_hash_by_height, _pre_reorg_finality_fence,
-                    "reorg L2 fork-point rollback")
-                return False, (
-                    f"Reorg aborted: L2 rollback to height {safe_l1} failed: "
-                    f"{_l2_err}; {_msg_r}")
-
-            # Capture the exact L2 state at the fork point.  If applying the
-            # replacement chain fails, _rollback_block() cannot undo a committed
-            # TYPE_ROLLUP tree transition by itself; this checkpoint lets the
-            # recovery path restore precisely the state from which the old
-            # canonical suffix must be replayed.
-            _l2_reorg_base_snap = None
-            try:
-                if layer2 is not None:
-                    _l2_reorg_base_snap = layer2.snapshot_full()
-            except Exception as _l2_snap_e:
-                log.error(f"[L2-REORG] failed to snapshot fork-point L2 state: {_l2_snap_e}")
-                _ok_r, _msg_r = self._restore_removed_suffix(
-                    _suffix_removed, tip, fork_height, _old_finality_by_height,
-                    _old_hash_by_height, _pre_reorg_finality_fence,
-                    "reorg fork-point snapshot")
-                return False, (
-                    f"Unable to snapshot L2 state before reorg: {_l2_snap_e}; {_msg_r}")
-
-            # Apply new chain — on any failure, restore the old chain.
-            _applied: list = []
-            for b in new_chain:
-                # Do not allow a not-yet-fully-validated replacement branch to
-                # advance finality. If a later replacement block fails, this
-                # branch is discarded and must leave no finality side effects.
+                    for blk in reversed(_saved_old_blocks):
+                        self._rollback_block(blk)
+                        _suffix_removed.append(blk)
+                except Exception as _old_rb_e:
+                    _ok_r, _msg_r = self._restore_removed_suffix(
+                        _suffix_removed, tip, fork_height, _old_finality_by_height,
+                        _old_hash_by_height, _pre_reorg_finality_fence,
+                        "reorg old-suffix rollback")
+                    return False, (
+                        f"Reorg aborted: rollback of the old suffix failed: "
+                        f"{_old_rb_e}; {_msg_r}")
+                # VSA-21: difficulty entries at or above the fork point were computed on the
+                # abandoned branch.  Drop them before any replacement block is validated.
+                DifficultyEngine.invalidate_cache(from_height=fork_height)
+                # Snapshots at or above the fork point describe the abandoned suffix.
+                # Drop them now, as rollback() does.  get_servable_manifest() also
+                # refuses any entry whose anchor no longer matches the canonical block.
                 try:
-                    ok, msg = self.apply_block(b, defer_finality=True)
-                except BaseException as _apply_exc:
-                    # BUG-7: an exception must take the exact same recovery path
-                    # as an ordinary rejected replacement block.  Otherwise the
-                    # already-applied replacement prefix and rolled-back honest
-                    # suffix remain canonical/absent respectively.
-                    ok, msg = False, f"exception: {_apply_exc}"
-                if not ok:
+                    self._snapshot_engine.invalidate_snapshots_above(fork_height - 1)
+                except Exception as _snap_reorg_exc:
                     log.error(
-                        f"Reorg apply failed at block {b.index}: {msg} — "
-                        f"restoring {len(_applied)} already-applied blocks "
-                        f"and {len(_saved_old_blocks)} old-chain blocks")
-                    # Roll back whatever we managed to apply from new_chain.  VSA-26: a
-                    # failed reversal leaves the chain partially mutated, so it is a critical
-                    # recovery condition rather than an ordinary rejection.
-                    _unwind_errors = []
-                    for _rb in reversed(_applied):
-                        try:
-                            self._rollback_block(_rb)
-                        except Exception as _rbe:
-                            _unwind_errors.append((_rb.index, str(_rbe)))
-                            log.error(f"Restore rollback failed at "
-                                      f"block {_rb.index}: {_rbe}")
-                    if _unwind_errors:
-                        self._highest_finalized_height = _pre_reorg_finality_fence
-                        self._mark_critical_recovery(
-                            f"rollback of replacement block {_unwind_errors[0][0]} "
-                            f"failed: {_unwind_errors[0][1]}")
-                        return False, (
-                            f"Reorg apply block {b.index}: {msg}; "
-                            f"{self._critical_recovery}")
-                    # Restore the exact L2 state at the fork point before replaying the old
-                    # canonical suffix.  Without this, a discarded TYPE_ROLLUP can survive
-                    # because _rollback_block intentionally does not guess its L2 inverse.
-                    if layer2 is not None and _l2_reorg_base_snap is not None:
-                        try:
-                            layer2.restore_full(_l2_reorg_base_snap)
-                        except Exception as _l2_restore_e:
-                            log.error(
-                                f"[L2-REORG] failed to restore fork-point L2 state: "
-                                f"{_l2_restore_e}")
+                        "[REORG] Failed to invalidate snapshots above %d: %s",
+                        fork_height - 1, _snap_reorg_exc)
+                # Protocol-upgrade state reached through the removed suffix is undone,
+                # so replacement blocks are checked against the fork-point state.
+                try:
+                    self._governance.reconcile_to_height(fork_height - 1)
+                except Exception as _gov_reorg_exc:
+                    log.error(
+                        "[REORG] governance reconciliation at fork %d failed: %s",
+                        fork_height, _gov_reorg_exc)
+                    _ok_r, _msg_r = self._restore_removed_suffix(
+                        _suffix_removed, tip, fork_height, _old_finality_by_height,
+                        _old_hash_by_height, _pre_reorg_finality_fence,
+                        "reorg governance reconciliation")
+                    return False, (
+                        f"Reorg aborted: governance reconciliation failed: "
+                        f"{_gov_reorg_exc}; {_msg_r}")
+
+                # ── v7.5.0-OPT LAYER-2 REORG HOOK ────────────────────────────────
+                # Any RollupSubmission confirmed at an L1 height >= fork_height
+                # is now on a discarded branch.  Roll the L2 tree back to the
+                # most recent snapshot taken at l1_height < fork_height.  If
+                # the new chain contains its own rollup submissions, they will
+                # be re-applied as apply_block() processes each new block
+                # below — and Layer2State.commit_batch() will re-add them to
+                # the snapshot history with the new L1 heights.
+                #
+                # Safety: rollback_to_height() is idempotent — calling it with
+                # a height that has no matching snapshot resets the tree to
+                # empty (which is correct for a deep reorg below any ever-
+                # confirmed batch).
+                layer2 = getattr(self, "layer2", None)
+                safe_l1 = fork_height - 1
+                _l2_err = None
+                if layer2 is not None:
+                    try:
+                        ok_rb, msg_rb = layer2.rollback_to_height(safe_l1)
+                        if not ok_rb:
+                            _l2_err = msg_rb
+                        elif msg_rb == "no-l2-state":
+                            log.debug(
+                                f"[L2-REORG] no L2 state to roll back "
+                                f"(height <= {safe_l1})")
+                        else:
+                            log.info(
+                                f"[L2-REORG] L2 state rolled back to L1 height "
+                                f"<= {safe_l1} ({msg_rb})")
+                    except Exception as _l2_rb_e:
+                        _l2_err = str(_l2_rb_e)
+                if _l2_err is not None:
+                    # The replacement cannot be validated against L2 that is not at
+                    # the fork point, so the removed suffix is put back.
+                    log.error(f"[L2-REORG] rollback_to_height({safe_l1}) failed: {_l2_err}")
+                    _ok_r, _msg_r = self._restore_removed_suffix(
+                        _suffix_removed, tip, fork_height, _old_finality_by_height,
+                        _old_hash_by_height, _pre_reorg_finality_fence,
+                        "reorg L2 fork-point rollback")
+                    return False, (
+                        f"Reorg aborted: L2 rollback to height {safe_l1} failed: "
+                        f"{_l2_err}; {_msg_r}")
+
+                # Capture the exact L2 state at the fork point.  If applying the
+                # replacement chain fails, _rollback_block() cannot undo a committed
+                # TYPE_ROLLUP tree transition by itself; this checkpoint lets the
+                # recovery path restore precisely the state from which the old
+                # canonical suffix must be replayed.
+                _l2_reorg_base_snap = None
+                try:
+                    if layer2 is not None:
+                        _l2_reorg_base_snap = layer2.snapshot_full()
+                except Exception as _l2_snap_e:
+                    log.error(f"[L2-REORG] failed to snapshot fork-point L2 state: {_l2_snap_e}")
+                    _ok_r, _msg_r = self._restore_removed_suffix(
+                        _suffix_removed, tip, fork_height, _old_finality_by_height,
+                        _old_hash_by_height, _pre_reorg_finality_fence,
+                        "reorg fork-point snapshot")
+                    return False, (
+                        f"Unable to snapshot L2 state before reorg: {_l2_snap_e}; {_msg_r}")
+
+                # Apply new chain — on any failure, restore the old chain.
+                _applied: list = []
+                for b in new_chain:
+                    # Do not allow a not-yet-fully-validated replacement branch to
+                    # advance finality. If a later replacement block fails, this
+                    # branch is discarded and must leave no finality side effects.
+                    try:
+                        ok, msg = self.apply_block(b, defer_finality=True)
+                    except BaseException as _apply_exc:
+                        # BUG-7: an exception must take the exact same recovery path
+                        # as an ordinary rejected replacement block.  Otherwise the
+                        # already-applied replacement prefix and rolled-back honest
+                        # suffix remain canonical/absent respectively.
+                        ok, msg = False, f"exception: {_apply_exc}"
+                    if not ok:
+                        log.error(
+                            f"Reorg apply failed at block {b.index}: {msg} — "
+                            f"restoring {len(_applied)} already-applied blocks "
+                            f"and {len(_saved_old_blocks)} old-chain blocks")
+                        # Roll back whatever we managed to apply from new_chain.  VSA-26: a
+                        # failed reversal leaves the chain partially mutated, so it is a critical
+                        # recovery condition rather than an ordinary rejection.
+                        _unwind_errors = []
+                        for _rb in reversed(_applied):
+                            try:
+                                self._rollback_block(_rb)
+                            except Exception as _rbe:
+                                _unwind_errors.append((_rb.index, str(_rbe)))
+                                log.error(f"Restore rollback failed at "
+                                          f"block {_rb.index}: {_rbe}")
+                        if _unwind_errors:
                             self._highest_finalized_height = _pre_reorg_finality_fence
                             self._mark_critical_recovery(
-                                f"L2 fork-point restore failed: {_l2_restore_e}")
+                                f"rollback of replacement block {_unwind_errors[0][0]} "
+                                f"failed: {_unwind_errors[0][1]}")
                             return False, (
                                 f"Reorg apply block {b.index}: {msg}; "
-                                f"L2 recovery failed: {_l2_restore_e}")
+                                f"{self._critical_recovery}")
+                        # Restore the exact L2 state at the fork point before replaying the old
+                        # canonical suffix.  Without this, a discarded TYPE_ROLLUP can survive
+                        # because _rollback_block intentionally does not guess its L2 inverse.
+                        if layer2 is not None and _l2_reorg_base_snap is not None:
+                            try:
+                                layer2.restore_full(_l2_reorg_base_snap)
+                            except Exception as _l2_restore_e:
+                                log.error(
+                                    f"[L2-REORG] failed to restore fork-point L2 state: "
+                                    f"{_l2_restore_e}")
+                                self._highest_finalized_height = _pre_reorg_finality_fence
+                                self._mark_critical_recovery(
+                                    f"L2 fork-point restore failed: {_l2_restore_e}")
+                                return False, (
+                                    f"Reorg apply block {b.index}: {msg}; "
+                                    f"L2 recovery failed: {_l2_restore_e}")
 
-                    # VSA-21: restoration must not validate old-branch blocks against
-                    # difficulty entries computed for the rejected replacement branch.
-                    DifficultyEngine.invalidate_cache(from_height=fork_height)
+                        # VSA-21: restoration must not validate old-branch blocks against
+                        # difficulty entries computed for the rejected replacement branch.
+                        DifficultyEngine.invalidate_cache(from_height=fork_height)
 
-                    # Re-apply the original chain in ascending order.  VSA-26: every result
-                    # is checked; a partial restore is a critical recovery condition.
-                    _restore_failure = None
-                    for _ob in _saved_old_blocks:
-                        try:
-                            _r_ok, _r_msg = self.apply_block(
-                                _ob, defer_finality=True)
-                        except Exception as _obe:
-                            _r_ok, _r_msg = False, f"exception: {_obe}"
-                        if not _r_ok:
-                            _restore_failure = (_ob.index, _r_msg)
-                            break
-                    if _restore_failure is not None:
-                        self._highest_finalized_height = _pre_reorg_finality_fence
-                        self._mark_critical_recovery(
-                            f"restoration of the old chain failed at height "
-                            f"{_restore_failure[0]}: {_restore_failure[1]}")
-                        return False, (
-                            f"Reorg apply block {b.index}: {msg}; "
-                            f"{self._critical_recovery}")
-                    # apply_block deliberately distrusts a peer-supplied
-                    # finalized flag. During restoration these are not peer
-                    # claims: restore the exact flags captured from the old
-                    # canonical branch, and only after every block re-applied.
-                    try:
+                        # Re-apply the original chain in ascending order.  VSA-26: every result
+                        # is checked; a partial restore is a critical recovery condition.
+                        _restore_failure = None
                         for _ob in _saved_old_blocks:
-                            idx = int(_ob.index)
-                            restored = self.storage.get_block(idx)
-                            if (restored is None
-                                    or restored.block_hash != _old_hash_by_height[idx]):
-                                raise RuntimeError(
-                                    f"restored block identity mismatch at height {idx}")
-                            old_flag = _old_finality_by_height[idx]
-                            if bool(restored.finalized) != old_flag:
-                                restored.finalized = old_flag
-                                self.storage.save_block(restored)
-                        self._highest_finalized_height = _pre_reorg_finality_fence
-                    except Exception as _finality_restore_e:
-                        self._highest_finalized_height = _pre_reorg_finality_fence
-                        self._mark_critical_recovery(
-                            f"restoration of original finality state failed: "
-                            f"{_finality_restore_e}")
-                        return False, (
-                            f"Reorg apply block {b.index}: {msg}; "
-                            f"{self._critical_recovery}")
-                    DifficultyEngine.invalidate_cache(from_height=fork_height)
-                    return False, f"Reorg apply block {b.index}: {msg}"
-                _applied.append(b)
+                            try:
+                                _r_ok, _r_msg = self.apply_block(
+                                    _ob, defer_finality=True)
+                            except Exception as _obe:
+                                _r_ok, _r_msg = False, f"exception: {_obe}"
+                            if not _r_ok:
+                                _restore_failure = (_ob.index, _r_msg)
+                                break
+                        if _restore_failure is not None:
+                            self._highest_finalized_height = _pre_reorg_finality_fence
+                            self._mark_critical_recovery(
+                                f"restoration of the old chain failed at height "
+                                f"{_restore_failure[0]}: {_restore_failure[1]}")
+                            return False, (
+                                f"Reorg apply block {b.index}: {msg}; "
+                                f"{self._critical_recovery}")
+                        # apply_block deliberately distrusts a peer-supplied
+                        # finalized flag. During restoration these are not peer
+                        # claims: restore the exact flags captured from the old
+                        # canonical branch, and only after every block re-applied.
+                        try:
+                            for _ob in _saved_old_blocks:
+                                idx = int(_ob.index)
+                                restored = self.storage.get_block(idx)
+                                if (restored is None
+                                        or restored.block_hash != _old_hash_by_height[idx]):
+                                    raise RuntimeError(
+                                        f"restored block identity mismatch at height {idx}")
+                                old_flag = _old_finality_by_height[idx]
+                                if bool(restored.finalized) != old_flag:
+                                    restored.finalized = old_flag
+                                    self.storage.save_block(restored)
+                            self._highest_finalized_height = _pre_reorg_finality_fence
+                        except Exception as _finality_restore_e:
+                            self._highest_finalized_height = _pre_reorg_finality_fence
+                            self._mark_critical_recovery(
+                                f"restoration of original finality state failed: "
+                                f"{_finality_restore_e}")
+                            return False, (
+                                f"Reorg apply block {b.index}: {msg}; "
+                                f"{self._critical_recovery}")
+                        DifficultyEngine.invalidate_cache(from_height=fork_height)
+                        return False, f"Reorg apply block {b.index}: {msg}"
+                    _applied.append(b)
 
-            # Invalidate difficulty cache for all heights at or after the fork.
-            # The new chain may have different timestamps and therefore different
-            # computed difficulties from the fork point onwards.
-            DifficultyEngine.invalidate_cache(from_height=fork_height)
+                # Invalidate difficulty cache for all heights at or after the fork.
+                # The new chain may have different timestamps and therefore different
+                # computed difficulties from the fork point onwards.
+                DifficultyEngine.invalidate_cache(from_height=fork_height)
 
-            # The replacement branch is now fully validated and canonical.
-            # Only now may embedded authenticated votes or depth finality
-            # promote blocks. Recompute (rather than max) the fence afterward
-            # so the explicitly permitted deep-PoW/no-validator reorg cannot
-            # retain a height finalized only on the discarded branch.
-            try:
-                for candidate in new_chain:
-                    canonical = self.storage.get_block(int(candidate.index))
-                    if canonical is None or canonical.block_hash != candidate.block_hash:
-                        raise RuntimeError(
-                            f"canonical replacement block missing at height {candidate.index}")
-                    self._maybe_finalize_by_bft(canonical)
-                for idx in range(int(fork_height), int(new_tip) + 1):
-                    self._maybe_finalize_by_depth(idx)
-                self._recompute_highest_finalized_height()
-            except Exception as _finality_commit_e:
-                self._mark_critical_recovery(
-                    f"finality reconciliation after successful reorg failed: "
-                    f"{_finality_commit_e}")
-                return False, (
-                    f"Replacement branch applied, but finality reconciliation failed; "
-                    f"{self._critical_recovery}")
+                # The replacement branch is now fully validated and canonical.
+                # Only now may embedded authenticated votes or depth finality
+                # promote blocks. Recompute (rather than max) the fence afterward
+                # so the explicitly permitted deep-PoW/no-validator reorg cannot
+                # retain a height finalized only on the discarded branch.
+                try:
+                    for candidate in new_chain:
+                        canonical = self.storage.get_block(int(candidate.index))
+                        if canonical is None or canonical.block_hash != candidate.block_hash:
+                            raise RuntimeError(
+                                f"canonical replacement block missing at height {candidate.index}")
+                        self._maybe_finalize_by_bft(canonical)
+                    for idx in range(int(fork_height), int(new_tip) + 1):
+                        self._maybe_finalize_by_depth(idx)
+                    self._recompute_highest_finalized_height()
+                except Exception as _finality_commit_e:
+                    self._mark_critical_recovery(
+                        f"finality reconciliation after successful reorg failed: "
+                        f"{_finality_commit_e}")
+                    return False, (
+                        f"Replacement branch applied, but finality reconciliation failed; "
+                        f"{self._critical_recovery}")
 
-            log.info(f"Chain reorg: rolled back to {fork_height}, new tip={new_tip}")
-            return True, "OK"
+                log.info(f"Chain reorg: rolled back to {fork_height}, new tip={new_tip}")
+                return True, "OK"
+            finally:
+                try:
+                    self._rolling_pruner._last_height = -1
+                except Exception:
+                    pass
+                if _prune_guarded:
+                    _prune_lock.release()
 
     def _miner_activity_credit(self, miner_address: str, tip_before: int) -> int:
         """Return deterministic recent canonical-PoW activity credit.
@@ -6832,13 +7114,18 @@ class Blockchain:
                 return False, (f"{label} index mismatch at block {candidate.index}")
             if candidate.prev_hash != prev_hash:
                 return False, f"{label} linkage mismatch at block {candidate.index}"
+            if isinstance(candidate.timestamp, bool) or not isinstance(candidate.timestamp, int):
+                return False, f"Invalid {label.lower()} timestamp at block {candidate.index}"
             try:
                 d = float(candidate.difficulty)
-                t = float(candidate.timestamp)
-                if not math.isfinite(d) or not math.isfinite(t):
+                if isinstance(candidate.difficulty, bool) or not math.isfinite(d):
                     return False, f"Invalid {label.lower()} numeric field at block {candidate.index}"
             except (TypeError, ValueError, OverflowError):
                 return False, f"Invalid {label.lower()} numeric field at block {candidate.index}"
+            if hasattr(candidate, "validate_header_types"):
+                ok_types, types_msg = candidate.validate_header_types()
+                if not ok_types:
+                    return False, f"{label} block {candidate.index}: {types_msg}"
 
             ok_int, msg_int = candidate.integrity_check(mempool=self.mempool)
             if not ok_int:
@@ -7003,6 +7290,7 @@ class Blockchain:
                     ok, msg = self.apply_block(block)
                     if not ok:
                         return False, f"Apply block {block.index}: {msg}"
+                    self._governance.on_block_applied(block)
                 return True, "OK"
 
             # A pruned fork payload cannot be re-executed, so reject the entire
@@ -7121,8 +7409,16 @@ class Blockchain:
             # Safety: this path is only taken when there are NO investors
             # (no BFT finality).  On a network with investors, BFT-finalized
             # blocks are truly irreversible and this reset is skipped.
-            validators = self.storage.get_all_by_role("investor")
-            if validators:
+            validators = [
+                v for v in (self.storage.get_all_by_role("investor") or [])
+                if to_satoshi(float(v.get("stake", 0.0))) > 0
+            ]
+            if validators or (
+                highest_finalized >= 0
+                and fork_start <= highest_finalized
+                and self._has_bft_finalized_blocks_in_range(
+                    fork_start, highest_finalized)
+            ):
                 return False, (
                     "Deep fork rejected: BFT-finalized blocks are irreversible. "
                     "Cannot adopt peer chain that diverges below the finality fence.")
@@ -7208,103 +7504,103 @@ class Blockchain:
         eligibility because it already includes REGISTER transactions from the
         block being voted on.
         """
-        target_block = self.storage.get_block_by_hash(block_hash)
-        if target_block is None or target_block.block_hash != block_hash:
-            return False
-        idx = int(target_block.index)
-        eligible = self.get_validator_set_for_block(target_block)
-        if eligible is None:
-            self._report_missing_validator_snapshot(
-                target_block,
-                "Validator vote rejected for block #%d: eligible validator snapshot unavailable"
-                % idx,
-            )
-            return False
-        eligible_by_addr = {
-            str(item["address"]): int(item["stake_sat"])
-            for item in eligible
-            if isinstance(item, dict) and item.get("address")
-        }
-        if validator_address not in eligible_by_addr:
-            log.warning(
-                "Validator vote rejected: %s was not eligible for block #%d",
-                str(validator_address)[:16], idx)
-            return False
-
-        # Cross-layer identity binding and signature verification must happen
-        # before either duplicate-vote handling or double-sign detection.
-        try:
-            claimed_pub = pub_from_hex(pub_hex)
-            derived_addr = pub_to_address(claimed_pub)
-            if derived_addr != validator_address:
-                log.warning(
-                    "Validator sig identity mismatch: pub derives to %s but claimed validator is %s",
-                    derived_addr[:16], str(validator_address)[:16])
+        with self._lock:
+            target_block = self.storage.get_block_by_hash(block_hash)
+            if target_block is None or target_block.block_hash != block_hash:
                 return False
-            signature = sig_from_hex(sig_hex)
-            digest = hashlib.sha256(str(block_hash).encode("utf-8")).digest()
-            if not ecdsa_verify(claimed_pub, digest, signature):
-                log.warning(
-                    "Validator signature verification failed for %s",
-                    str(validator_address)[:16])
+            idx = int(target_block.index)
+            if self.storage.get_block_hash(idx) != block_hash:
                 return False
-        except Exception as exc:
-            log.warning("Validator signature parse/verification failed: %s", exc)
-            return False
-
-        prior_votes = self.storage.get_validator_votes_at_height(idx)
-        for prior in prior_votes:
-            if (prior["validator_addr"] == validator_address
-                    and prior["block_hash"] != block_hash):
-                # Preserve the second valid signature as durable evidence even
-                # though it must not be accepted as a normal vote.
-                self.storage.record_validator_vote(
-                    block_hash, validator_address, sig_hex, pub_hex,
-                    block_idx=idx)
+            eligible = self.get_validator_set_for_block(target_block)
+            if eligible is None:
+                self._report_missing_validator_snapshot(
+                    target_block,
+                    "Validator vote rejected for block #%d: eligible validator snapshot unavailable"
+                    % idx,
+                )
+                return False
+            eligible_by_addr = {
+                str(item["address"]): int(item["stake_sat"])
+                for item in eligible
+                if (isinstance(item, dict)
+                    and item.get("address")
+                    and int(item.get("stake_sat", 0)) > 0)
+            }
+            if validator_address not in eligible_by_addr:
                 log.warning(
-                    "SLASH: double-sign by %s at height %d",
+                    "Validator vote rejected: %s was not eligible for block #%d",
                     str(validator_address)[:16], idx)
-                self._queue_or_handle_vote_equivocation(
-                    validator_address, target_block, sig_hex, pub_hex, prior)
                 return False
 
-        same_block_vote = next(
-            (prior for prior in prior_votes
-             if prior["validator_addr"] == validator_address
-             and prior["block_hash"] == block_hash),
-            None,
-        )
-        if same_block_vote is not None:
-            if not any(
-                    isinstance(vote, dict)
-                    and vote.get("addr") == validator_address
-                    for vote in (target_block.validator_sigs or [])):
-                target_block.validator_sigs.append({
-                    "addr": validator_address,
-                    "sig": same_block_vote["sig_hex"],
-                    "pub": same_block_vote["pub_hex"],
-                })
+            try:
+                claimed_pub = pub_from_hex(pub_hex)
+                derived_addr = pub_to_address(claimed_pub)
+                if derived_addr != validator_address:
+                    log.warning(
+                        "Validator sig identity mismatch: pub derives to %s but claimed validator is %s",
+                        derived_addr[:16], str(validator_address)[:16])
+                    return False
+                signature = sig_from_hex(sig_hex)
+                digest = hashlib.sha256(str(block_hash).encode("utf-8")).digest()
+                if not ecdsa_verify(claimed_pub, digest, signature):
+                    log.warning(
+                        "Validator signature verification failed for %s",
+                        str(validator_address)[:16])
+                    return False
+            except Exception as exc:
+                log.warning("Validator signature parse/verification failed: %s", exc)
+                return False
+
+            prior_votes = self.storage.get_validator_votes_at_height(idx)
+            for prior in prior_votes:
+                if (prior["validator_addr"] == validator_address
+                        and prior["block_hash"] != block_hash):
+                    self.storage.record_validator_vote(
+                        block_hash, validator_address, sig_hex, pub_hex,
+                        block_idx=idx)
+                    log.warning(
+                        "SLASH: double-sign by %s at height %d",
+                        str(validator_address)[:16], idx)
+                    self._queue_or_handle_vote_equivocation(
+                        validator_address, target_block, sig_hex, pub_hex, prior)
+                    return False
+
+            if target_block.validator_sigs is None:
+                target_block.validator_sigs = []
+
+            same_block_vote = next(
+                (prior for prior in prior_votes
+                 if prior["validator_addr"] == validator_address
+                 and prior["block_hash"] == block_hash),
+                None,
+            )
+            if same_block_vote is not None:
+                if not any(
+                        isinstance(vote, dict)
+                        and vote.get("addr") == validator_address
+                        for vote in target_block.validator_sigs):
+                    target_block.validator_sigs.append({
+                        "addr": validator_address,
+                        "sig": same_block_vote["sig_hex"],
+                        "pub": same_block_vote["pub_hex"],
+                    })
+                self._maybe_finalize_by_bft(
+                    target_block, eligible_validators=eligible)
+                self.storage.save_block(target_block)
+                return True
+
+            self.storage.record_validator_vote(
+                block_hash, validator_address, sig_hex, pub_hex, block_idx=idx)
+            entry = {"addr": validator_address, "sig": sig_hex, "pub": pub_hex}
+            if entry not in target_block.validator_sigs:
+                target_block.validator_sigs.append(entry)
+
             self._maybe_finalize_by_bft(
                 target_block, eligible_validators=eligible)
-            # Persist even when this vote did not newly cross quorum.
             self.storage.save_block(target_block)
+
+            self._eco_mon.record_validator_sigs([
+                vote["addr"] for vote in target_block.validator_sigs
+                if isinstance(vote, dict) and vote.get("addr")
+            ], block_hash=block_hash)
             return True
-
-        self.storage.record_validator_vote(
-            block_hash, validator_address, sig_hex, pub_hex, block_idx=idx)
-        entry = {"addr": validator_address, "sig": sig_hex, "pub": pub_hex}
-        if entry not in target_block.validator_sigs:
-            target_block.validator_sigs.append(entry)
-
-        # Shared quorum path authenticates every stored entry, filters invalid
-        # votes, applies the height-specific eligible stake denominator, and
-        # advances the fence only if the authenticated quorum is met.
-        self._maybe_finalize_by_bft(
-            target_block, eligible_validators=eligible)
-        self.storage.save_block(target_block)
-
-        self._eco_mon.record_validator_sigs([
-            vote["addr"] for vote in target_block.validator_sigs
-            if isinstance(vote, dict) and vote.get("addr")
-        ])
-        return True

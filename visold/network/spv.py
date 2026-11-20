@@ -24,10 +24,18 @@ Defines: SPVClient
 Origin: visold_vsd_.py L8293-8488
 """
 
+import re
 from typing import List, Optional, TYPE_CHECKING
 
 from visold.crypto.hashing import sha256
 from visold.kernel.config import Config
+
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+_EMPTY_MERKLE_ROOT = sha256(b"empty")
+
+
+def _is_hex64(value: object) -> bool:
+    return isinstance(value, str) and bool(_HEX64_RE.fullmatch(value))
 
 if TYPE_CHECKING:  # annotation-only references (no runtime import, no cycle)
     from visold.ledger.block import Block
@@ -88,6 +96,19 @@ class SPVClient:
     """
 
     @staticmethod
+    def _v3_active_for_height(block_height) -> bool:
+        v3_h = getattr(Config, "MERKLE_V3_ACTIVATION_HEIGHT", None)
+        if v3_h is None:
+            return False
+        if block_height is None or block_height < 0:
+            return int(v3_h) == 0 and int(Config.MERKLE_V2_ACTIVATION_HEIGHT) == 0
+        try:
+            return (int(block_height) >= int(v3_h)
+                    and int(block_height) >= int(Config.MERKLE_V2_ACTIVATION_HEIGHT))
+        except Exception:
+            return False
+
+    @staticmethod
     def _v2_active_for_height(block_height: int) -> bool:
         """
         Mirror of the activation rule used in Block._merkle().  When the
@@ -130,6 +151,30 @@ class SPVClient:
             return None
 
         proof: List[dict] = []
+
+        if SPVClient._v3_active_for_height(block_height):
+            LEAF_TAG = "|leaf|"
+            NODE_TAG = "|node|"
+            ODD_TAG  = "|odd|"
+            hashes = [sha256((LEAF_TAG + h).encode()) for h in hashes]
+            while len(hashes) > 1:
+                pairs = len(hashes) // 2
+                paired_count = pairs * 2
+                if idx < paired_count:
+                    sibling_idx = idx ^ 1
+                    side        = "R" if idx % 2 == 0 else "L"
+                    proof.append({"hash": hashes[sibling_idx], "side": side})
+                else:
+                    proof.append({"hash": "", "side": "ODD"})
+                next_level = [
+                    sha256((NODE_TAG + hashes[2*i] + hashes[2*i+1]).encode())
+                    for i in range(pairs)
+                ]
+                if len(hashes) % 2 == 1:
+                    next_level.append(sha256((ODD_TAG + hashes[-1]).encode()))
+                idx = idx // 2 if idx < paired_count else len(next_level) - 1
+                hashes = next_level
+            return proof
 
         if SPVClient._v2_active_for_height(block_height):
             # V2 — domain-separated odd-loner promotion.  Mirror of the V2
@@ -190,28 +235,43 @@ class SPVClient:
         Accepts both legacy proofs ('L'/'R' steps only) and V2 proofs that
         may also contain 'ODD' steps for domain-separated loner promotion.
 
-        Returns True iff the reconstructed root matches `merkle_root`.
+        Returns True iff `tx_id`, `merkle_root`, and all proof steps are
+        well-formed and the reconstructed root matches `merkle_root`.
         Never raises — malformed or unknown step kinds yield False.
         """
-        if proof is None or merkle_root is None:
+        if not _is_hex64(tx_id) or not _is_hex64(merkle_root):
             return False
+        if merkle_root == _EMPTY_MERKLE_ROOT:
+            return False
+        if not isinstance(proof, (list, tuple)) or len(proof) > 64:
+            return False
+        v3_active = SPVClient._v3_active_for_height(None)
+        LEAF_TAG = "|leaf|"
+        NODE_TAG = "|node|"
         ODD_TAG = "|odd|"
-        current = tx_id
-        try:
-            for step in proof:
-                side = step.get('side', 'R')
-                if side == 'ODD':
-                    current = sha256((ODD_TAG + current).encode())
-                elif side == 'R':
-                    current = sha256((current + step['hash']).encode())
-                elif side == 'L':
-                    current = sha256((step['hash'] + current).encode())
-                else:
-                    # Unknown step kind — refuse rather than silently
-                    # accepting under one of the legacy branches.
+        current = sha256((LEAF_TAG + tx_id).encode()) if v3_active else tx_id
+        for step in proof:
+            if not isinstance(step, dict):
+                return False
+            side = step.get('side')
+            if side == 'ODD':
+                if step.get('hash', '') != '':
                     return False
-        except (KeyError, TypeError, AttributeError):
-            return False
+                current = sha256((ODD_TAG + current).encode())
+            elif side == 'R':
+                sibling = step.get('hash')
+                if not _is_hex64(sibling):
+                    return False
+                pre = (NODE_TAG + current + sibling) if v3_active else (current + sibling)
+                current = sha256(pre.encode())
+            elif side == 'L':
+                sibling = step.get('hash')
+                if not _is_hex64(sibling):
+                    return False
+                pre = (NODE_TAG + sibling + current) if v3_active else (sibling + current)
+                current = sha256(pre.encode())
+            else:
+                return False
         return current == merkle_root
 
     @staticmethod

@@ -121,6 +121,10 @@ class PeerReputationManager:
 
     def _adjust(self, peer_id: str, delta: float, counter_col: str):
         with self._lock:
+            is_cached = peer_id in self._cache
+        if not is_cached:
+            self.get_score(peer_id)
+        with self._lock:
             current = self._cache.get(peer_id, self.NEUTRAL)
             # Exponential approach to MAX_SCORE: diminishing returns near ceiling
             remaining = self.MAX_SCORE - current
@@ -132,11 +136,21 @@ class PeerReputationManager:
 
     def decay_all(self):
         """
-        Apply hourly decay toward NEUTRAL for all cached scores.
+        Apply hourly decay toward NEUTRAL for all cached and persisted scores.
         Called periodically by the peer decay loop.
         """
         factor = Config.REPUTATION_DECAY_FACTOR
+        try:
+            rows = self._storage._conn().execute(
+                "SELECT peer_id, score FROM reputation_extended"
+            ).fetchall()
+        except Exception:
+            rows = []
         with self._lock:
+            for row in rows:
+                pid = row["peer_id"]
+                if pid not in self._cache:
+                    self._cache[pid] = float(row["score"])
             for pid in list(self._cache.keys()):
                 score = self._cache[pid]
                 # Decay toward NEUTRAL, not toward 0

@@ -92,10 +92,12 @@ class MiningEngine:
         # StateEngine reference — injected after construction to avoid circular
         # dependency.  If None (e.g. in tests), falls back to direct apply_block.
         self._state_engine: Optional['StateEngine'] = state_engine
-        self._running   = False
-        self._paused    = False
-        self._stop_evt  = threading.Event()
-        self._thread    = None
+        self._running       = False
+        self._paused        = False
+        self._stop_evt      = threading.Event()
+        self._work_stop_evt = threading.Event()
+        self._pause_wake    = threading.Event()
+        self._thread        = None
         self.hashes_done  = 0
         self.start_time   = 0.0
         self.blocks_found = 0
@@ -253,10 +255,17 @@ class MiningEngine:
             governor = getattr(self, "_hashrate_governor", None)
             if governor is not None:
                 governor.reset_local_measurement()
+            self.hashes_done = 0
             self.start_time = time.time()
             self._running = True
             self._paused  = False
             self._stop_evt.clear()
+            work_stop = getattr(self, "_work_stop_evt", None)
+            if work_stop is not None:
+                work_stop.clear()
+            pause_wake = getattr(self, "_pause_wake", None)
+            if pause_wake is not None:
+                pause_wake.clear()
             self._thread  = threading.Thread(target=self._mine_loop, daemon=True)
             self._thread.start()
             # ── v7.5.0-OPT Start the parallel candidate-builder thread ──────
@@ -280,6 +289,12 @@ class MiningEngine:
         with self._lifecycle_lock:
             self._running = False
             self._stop_evt.set()
+            work_stop = getattr(self, "_work_stop_evt", None)
+            if work_stop is not None:
+                work_stop.set()
+            pause_wake = getattr(self, "_pause_wake", None)
+            if pause_wake is not None:
+                pause_wake.set()
             # ── v7.5.0-OPT Stop prewarm thread first ─────────────────────────
             self._prewarm_stop.set()
             self._prewarm_wake.set()   # unblock any wait()
@@ -356,17 +371,40 @@ class MiningEngine:
             self._hr_report_stop.wait(timeout=0.25)
 
     def pause(self):
-        self._paused = True
+        lock = getattr(self, "_lifecycle_lock", None)
+        work_stop = getattr(self, "_work_stop_evt", None) or self._stop_evt
+        if lock is not None:
+            with lock:
+                self._paused = True
+                work_stop.set()
+        else:
+            self._paused = True
+            work_stop.set()
         return True, "Mining paused"
 
     def resume(self):
-        self._paused = False
+        lock = getattr(self, "_lifecycle_lock", None)
+        work_stop = getattr(self, "_work_stop_evt", None) or self._stop_evt
+        if lock is not None:
+            with lock:
+                self._paused = False
+                if self._running and not self._stop_evt.is_set():
+                    work_stop.clear()
+        else:
+            self._paused = False
+            if self._running and not self._stop_evt.is_set():
+                work_stop.clear()
+        pause_wake = getattr(self, "_pause_wake", None)
+        if pause_wake is not None:
+            pause_wake.set()
+        self.wake_prewarm()
         return True, "Mining resumed"
 
     def status(self) -> dict:
         elapsed = time.time() - self.start_time if self.start_time else 1
         session_mean_hr = self.hashes_done / elapsed if elapsed > 0 else 0
-        self.network.hashrate = session_mean_hr
+        if self.network is not None:
+            self.network.hashrate = session_mean_hr
         binfo = self._parallel.backend_info()
         # Bring worker telemetry into the governor before creating this status
         # snapshot, so the UI does not wait for a solved block or the next peer
@@ -420,15 +458,20 @@ class MiningEngine:
         }
 
     def _mine_loop(self):
-        while self._running:
+        while self._running and not self._stop_evt.is_set():
             if self._paused:
-                time.sleep(1)
+                pause_wake = getattr(self, "_pause_wake", None)
+                if pause_wake is not None:
+                    pause_wake.wait(timeout=1.0)
+                    pause_wake.clear()
+                else:
+                    self._stop_evt.wait(timeout=0.5)
                 continue
             try:
                 self._mine_one()
             except Exception as e:
                 log.error(f"Mining error: {e}")
-                time.sleep(2)
+                self._stop_evt.wait(timeout=2.0)
 
     # ── v7.5.0-OPT Parallel Block Construction ────────────────────────────
     def _prewarm_loop(self):
@@ -462,10 +505,12 @@ class MiningEngine:
                 # what build_candidate_block actually produces.
                 tip = self.blockchain.latest_block()
                 tip_height = tip.index if tip is not None else -1
+                expected_prev_hash = tip.block_hash if tip is not None else "0" * 64
 
                 # Build the VRF proof bound to the CURRENT tip hash.  If the
-                # tip advances by the time we consume this candidate, the
-                # prewarm is stale and _consume_prewarm() discards it.
+                # tip advances before build_candidate_block() acquires
+                # blockchain._lock, the VRF proof is bound to the old tip and
+                # must be discarded.
                 alpha = (tip.block_hash if tip is not None else "genesis").encode()
                 vrf_proof, vrf_beta = vrf_prove(self.wallet.priv, alpha)
                 _candidate_started = time.perf_counter()
@@ -481,10 +526,20 @@ class MiningEngine:
                         f"elapsed_ms={_candidate_elapsed_ms:.1f} height={tip_height + 1}"
                     )
 
-                # Store only if it still matches the observed tip height + 1.
-                # (A race with apply_block could have advanced the tip while
-                # we were building; that's fine — we just won't publish the
-                # stale candidate.)
+                # Store only if it still matches the observed tip height + 1
+                # and parent hash (guards against both height advance and
+                # same-height reorg during build_candidate_block).
+                if (candidate.index != tip_height + 1
+                        or candidate.prev_hash != expected_prev_hash):
+                    log.debug(
+                        "[MiningPrewarm] discarding stale candidate "
+                        f"(expected #{tip_height + 1}/{expected_prev_hash[:12]}, "
+                        f"got #{candidate.index}/{candidate.prev_hash[:12]})"
+                    )
+                    with self._prewarm_lock:
+                        self._prewarm_block = None
+                    continue
+
                 with self._prewarm_lock:
                     self._prewarm_block  = candidate
                     self._prewarm_height = tip_height
@@ -528,10 +583,13 @@ class MiningEngine:
         tip_height = tip.index if tip is not None else -1
         with self._prewarm_lock:
             blk = self._prewarm_block
+            prewarm_height = getattr(self, "_prewarm_height", None)
             # Consume exactly once — clear the slot so a second call must
             # wait for the next prewarm cycle.
             self._prewarm_block = None
         if blk is None:
+            return None
+        if prewarm_height is not None and prewarm_height != tip_height:
             return None
         if blk.prev_hash != tip_hash:
             return None
@@ -576,7 +634,8 @@ class MiningEngine:
         else:
             ok, msg = self.blockchain.apply_block(block)
             if ok:
-                self.network.broadcast_block(block)
+                if self.network is not None:
+                    self.network.broadcast_block(block)
                 self.consensus.validate_and_finalize(block)
 
         if not ok:
@@ -612,8 +671,9 @@ class MiningEngine:
         # blocks the network rejects.  Wait until we are caught up to the
         # best peer (within tolerance), or until the absolute wait cap
         # elapses.  If MINING_SAFETY_ENABLED is False this is a no-op.
+        work_stop_evt = getattr(self, "_work_stop_evt", None) or self._stop_evt
         try:
-            proceed, why = self._safety_guard.pre_mine_sync_check(self._stop_evt)
+            proceed, why = self._safety_guard.pre_mine_sync_check(work_stop_evt)
             if not proceed:
                 # Stop event fired during the wait — exit cleanly.
                 return
@@ -636,13 +696,28 @@ class MiningEngine:
         # ── v7.5.0-OPT: try the prewarmed candidate first ─────────────────
         block = self._consume_prewarm()
         if block is None:
-            latest = self.blockchain.latest_block()
-            alpha  = (latest.block_hash if latest else "genesis").encode()
-            vrf_proof, vrf_beta = vrf_prove(self.wallet.priv, alpha)
-            vrf_proof_hex = vrf_proof.hex()
-            vrf_beta_hex  = vrf_beta.hex()
-            block = self.consensus.build_candidate_block(
-                self.wallet.address, vrf_proof_hex, vrf_beta_hex)
+            for _attempt in range(3):
+                if self._stop_evt.is_set() or work_stop_evt.is_set():
+                    return
+                latest = self.blockchain.latest_block()
+                expected_prev_hash = (
+                    latest.block_hash if latest is not None else "0" * 64
+                )
+                expected_height = (latest.index + 1) if latest is not None else 0
+                alpha = (latest.block_hash if latest else "genesis").encode()
+                vrf_proof, vrf_beta = vrf_prove(self.wallet.priv, alpha)
+                candidate = self.consensus.build_candidate_block(
+                    self.wallet.address, vrf_proof.hex(), vrf_beta.hex())
+                if candidate.prev_hash == expected_prev_hash:
+                    block = candidate
+                    break
+                log.debug(
+                    "[MiningEngine] Tip advanced during candidate build "
+                    f"(expected #{expected_height}/{expected_prev_hash[:12]}, "
+                    f"got #{candidate.index}/{candidate.prev_hash[:12]}); retrying."
+                )
+            else:
+                return
         self.current_candidate = block
 
         # ── v7.6.0 Compute hashrate cap from the governor ─────────────────
@@ -684,7 +759,7 @@ class MiningEngine:
         def _mining_watchdog():
             poll = 1.0
             while not watchdog_local_stop.is_set():
-                if self._stop_evt.is_set():
+                if work_stop_evt.is_set():
                     return
                 if self._safety_guard.mining_should_abort():
                     watchdog_fired[0] = True
@@ -694,7 +769,7 @@ class MiningEngine:
                         f"{elapsed_w:.0f}s (>{Config.MINING_STALE_CANDIDATE_TIMEOUT}s) "
                         f"without solving — aborting and rebuilding candidate "
                         f"against the latest tip.")
-                    self._stop_evt.set()
+                    work_stop_evt.set()
                     # The mining loop will re-check _running and rebuild.
                     return
                 if watchdog_local_stop.wait(timeout=poll):
@@ -730,9 +805,18 @@ class MiningEngine:
                 # advisory and must never prevent consensus mining entirely.
                 return float("inf")
 
+        if self._paused or not self._running or self._stop_evt.is_set() or work_stop_evt.is_set():
+            watchdog_local_stop.set()
+            wd_thread.join(timeout=2.0)
+            try:
+                self._safety_guard.mining_finished()
+            except Exception:
+                pass
+            return
+
         try:
             success = self._parallel.mine(
-                block, stop_event=self._stop_evt, max_hps=mine_max_hps,
+                block, stop_event=work_stop_evt, max_hps=mine_max_hps,
                 max_hps_provider=_live_hashrate_cap)
         finally:
             watchdog_local_stop.set()
@@ -747,8 +831,8 @@ class MiningEngine:
         # If the watchdog fired we treat this as an aborted attempt.  Clear
         # the stop event so the outer loop can immediately try again on a
         # fresh candidate — but only if shutdown was NOT requested.
-        if watchdog_fired[0] and self._running:
-            self._stop_evt.clear()
+        if watchdog_fired[0] and self._running and not self._paused and not self._stop_evt.is_set():
+            work_stop_evt.clear()
             self.wake_prewarm()
             return
 
@@ -763,6 +847,8 @@ class MiningEngine:
         # throttle-feedback loop; failed block attempts also provide no result.
 
         if not success:
+            return
+        if self._paused or not self._running or self._stop_evt.is_set():
             return
 
         # ── Final MTP safety check before submission ──────────────────────────
@@ -790,6 +876,8 @@ class MiningEngine:
         # complete.  This locks the consensus-critical fields (transactions,
         # merkle_root, block_hash, etc.) so they cannot be tampered with
         # between mining and submission to the StateEngine / network.
+        if self._paused or not self._running or self._stop_evt.is_set():
+            return
         if not block._sealed:
             block.seal()
 
@@ -819,6 +907,8 @@ class MiningEngine:
             f"{cap_summary}"
         )
 
+        if self._paused or not self._running or self._stop_evt.is_set():
+            return
         # ── Post MINE_RESULT to StateEngine (single-writer principle) ──────────
         applied = self._submit_mined_block(block)
         if applied is None:

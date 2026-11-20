@@ -183,28 +183,30 @@ class VVMStaticAnalyzer:
         and so cannot be a reentrancy vector.
         """
         ops = cls._parse_ops(bytecode)
-        call_offsets = [off for off, op, _ in ops
-                        if op in (Op.CALL, Op.DELEGATECALL, Op.CALLCODE,
-                                  Op.CREATE, Op.CREATE2)]
-        sstore_offsets = {off for off, op, _ in ops if op == Op.SSTORE}
+        call_ops = (
+            Op.CALL, Op.DELEGATECALL, Op.CALLCODE, Op.CREATE, Op.CREATE2
+        )
+        terminal_ops = (Op.STOP, Op.RETURN, Op.REVERT)
 
-        for call_off in call_offsets:
-            # Check for SSTORE after this CALL with no intervening terminal
-            subsequent = [(off, op) for off, op, _ in ops if off > call_off]
-            found_sstore_after = False
-            for off, op in subsequent:
-                if op in (Op.STOP, Op.RETURN, Op.REVERT):
-                    break  # safe: execution terminates before reaching SSTORE
-                if off in sstore_offsets:
-                    found_sstore_after = True
-                    break
-            if found_sstore_after:
-                findings.append(cls.Finding(
-                    "HIGH", "REENTRANCY",
-                    "External call (CALL/DELEGATECALL/CALLCODE/CREATE/CREATE2) "
-                    "followed by SSTORE without intervening STOP/RETURN. "
-                    "Use checks-effects-interactions pattern to prevent reentrancy.",
-                    call_off))
+        # Single-pass O(N) reverse scan: track whether an SSTORE is reachable
+        # after the current offset without an intervening terminal opcode.
+        sstore_reachable = False
+        flagged_offsets = []
+        for off, op, _ in reversed(ops):
+            if op in terminal_ops:
+                sstore_reachable = False
+            elif op == Op.SSTORE:
+                sstore_reachable = True
+            elif op in call_ops and sstore_reachable:
+                flagged_offsets.append(off)
+
+        for call_off in reversed(flagged_offsets):
+            findings.append(cls.Finding(
+                "HIGH", "REENTRANCY",
+                "External call (CALL/DELEGATECALL/CALLCODE/CREATE/CREATE2) "
+                "followed by SSTORE without intervening STOP/RETURN. "
+                "Use checks-effects-interactions pattern to prevent reentrancy.",
+                call_off))
 
     @classmethod
     def _scan_unbounded_loops(cls, bytecode: bytes, findings: list):
@@ -366,22 +368,38 @@ class VVMStaticAnalyzer:
                 "Deposited funds may be permanently locked if counterparty "
                 "is unresponsive."))
 
-        # Rule 2: CHAN_CLOSE without CHAN_DISPUTE
-        if has_close and not has_dispute:
+        # Rule 2 & 3: Missing CHAN_DISPUTE path (mutually exclusive to avoid double-counting)
+        if has_open and has_close and not has_dispute:
+            findings.append(cls.Finding(
+                "HIGH", "CHANNEL_MISSING_DISPUTE_PATH",
+                "Channel opened and closed cooperatively but no dispute path. "
+                "A silent counterparty can hold opener's deposit hostage."))
+        elif has_close and not has_dispute:
             findings.append(cls.Finding(
                 "MEDIUM", "CHANNEL_NO_DISPUTE",
                 "CHAN_CLOSE present but CHAN_DISPUTE is absent. "
                 "If counterparty refuses to co-sign closure, funds cannot be "
                 "recovered. Add CHAN_DISPUTE as a unilateral exit path."))
 
-        # Rule 3: CHAN_OPEN + CHAN_CLOSE but no CHAN_DISPUTE
-        if has_open and has_close and not has_dispute:
-            findings.append(cls.Finding(
-                "HIGH", "CHANNEL_MISSING_DISPUTE_PATH",
-                "Channel opened and closed cooperatively but no dispute path. "
-                "A silent counterparty can hold opener's deposit hostage."))
+        # Rule 4: CHAN_DISPUTE preceded by STATICCALL in the same basic block
+        in_static_ctx = False
+        block_reset_ops = (
+            Op.JUMPDEST, Op.STOP, Op.RETURN, Op.REVERT, Op.JUMP, Op.JUMPI,
+            Op.CALL, Op.DELEGATECALL, Op.CALLCODE, Op.CREATE, Op.CREATE2,
+        )
+        for off, op, _ in ops:
+            if op in block_reset_ops:
+                in_static_ctx = False
+            elif op == Op.STATICCALL:
+                in_static_ctx = True
+            elif op == Op.CHAN_DISPUTE and in_static_ctx:
+                findings.append(cls.Finding(
+                    "HIGH", "CHANNEL_DISPUTE_IN_STATICCALL",
+                    "CHAN_DISPUTE preceded by STATICCALL in the same basic block; "
+                    "state-mutating channel dispute will always revert in static context.",
+                    off))
 
-        # Rule 4: CHAN_DISPUTE in bytecode — verify CHAN_OPEN is also present
+        # Rule 5: CHAN_DISPUTE in bytecode — verify CHAN_OPEN is also present
         if has_dispute and not has_open:
             findings.append(cls.Finding(
                 "LOW", "CHANNEL_DISPUTE_WITHOUT_OPEN",

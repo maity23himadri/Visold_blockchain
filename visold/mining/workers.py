@@ -106,8 +106,11 @@ def _build_mine_template(header_base: dict) -> str:
     ni = full.index(sn)
     ti = full.index(st, ni + len(sn))
 
-    # Replace both sentinels with %d — preserves exact key order and spacing
-    return full[:ni] + '%d' + full[ni + len(sn):ti] + '%d' + full[ti + len(st):]
+    # Escape literal '%' in header fields before inserting '%d' placeholders.
+    prefix = full[:ni].replace('%', '%%')
+    middle = full[ni + len(sn):ti].replace('%', '%%')
+    suffix = full[ti + len(st):].replace('%', '%%')
+    return prefix + '%d' + middle + '%d' + suffix
 
 
 # ── Cython-typed inner mining worker (replaces _cpu_mine_thread) ──────────────

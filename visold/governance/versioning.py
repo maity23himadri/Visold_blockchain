@@ -98,11 +98,18 @@ class ProtocolVersionManager:
             metrics.inc("protocol_upgrade_signals")
 
     def validate_block_version(self, proto_ver: int) -> Tuple[bool, str]:
-        """Reject blocks from incompatible future hard forks."""
+        """Reject blocks with invalid, unsupported, or incompatible future protocol versions."""
+        if isinstance(proto_ver, bool) or not isinstance(proto_ver, int):
+            return False, f"Invalid block protocol_version type: {type(proto_ver).__name__}"
+        if proto_ver < Config.PROTOCOL_VERSION:
+            return False, (f"Block protocol_version {proto_ver} below minimum "
+                           f"supported version ({Config.PROTOCOL_VERSION})")
         # Hard fork: refuse blocks with version > current + 1
-        if proto_ver > self._current_ver + 1:
+        with self._lock:
+            current = self._current_ver
+        if proto_ver > current + 1:
             return False, (f"Block protocol_version {proto_ver} too far ahead "
-                           f"(current {self._current_ver}) — hard fork?")
+                           f"(current {current}) — hard fork?")
         return True, "OK"
 
     def current_version(self) -> int:
@@ -123,14 +130,15 @@ class ProtocolVersionManager:
                 self._current_ver = new_version
 
     def rewind_version(self, to_version: int) -> None:
-        """Undo an activation: lower the enforced version to ``to_version``.
+        """Undo an activation: lower the enforced version to ``to_version`` (clamped >= PROTOCOL_VERSION).
 
         Used only when a rollback or reorg removes the block that activated an
         upgrade.  It never raises the version.
         """
         with self._lock:
-            if int(to_version) < self._current_ver:
-                self._current_ver = int(to_version)
+            target = max(Config.PROTOCOL_VERSION, int(to_version))
+            if target < self._current_ver:
+                self._current_ver = target
 
     def restore_version(self, version: int) -> None:
         """Set the enforced version exactly, for restoring a saved governance snapshot."""

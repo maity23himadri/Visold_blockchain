@@ -71,49 +71,82 @@ class SupplyConservationMonitor:
         self._check_count = 0
 
     def check(self, block, ade: AnomalyDetectionEngine) -> None:
-        height = getattr(block, "index", 0)
+        height = getattr(block, "index", getattr(block, "height", 0))
         if height % self.SAMPLE_INTERVAL != 0:
             return
         self._check_count += 1
         try:
-            current_supply = self._storage.get_total_supply_sat()
-            # A rollback/reorg can move the sampled height backwards.  A supply
+            current_supply = int(self._storage.get_total_supply_sat())
+
+            # Primary conservation invariant: sum(all balances) == cumulative_issued_sat
+            issued_fn = getattr(self._storage, "get_total_issued_satoshi", None)
+            if issued_fn is None:
+                issued_fn = getattr(self._storage, "get_cumulative_issued_sat", None)
+
+            if callable(issued_fn):
+                total_issued = int(issued_fn())
+                discrepancy_sat = current_supply - total_issued
+                if discrepancy_sat != 0:
+                    report = AnomalyReport(
+                        kind=AnomalyKind.SUPPLY_INFLATION,
+                        detected_at=time.time(),
+                        description=(
+                            f"Supply conservation violated at height {height}: "
+                            f"balances={current_supply} sat != issued={total_issued} sat "
+                            f"(diff={discrepancy_sat:+d} sat / {discrepancy_sat/1e8:+.8f} VSD)"
+                        ),
+                        evidence={
+                            "curr_supply_sat": current_supply,
+                            "total_issued_sat": total_issued,
+                            "discrepancy_sat": discrepancy_sat,
+                        },
+                        source="rule",
+                        confidence=0.99,
+                        block_height=height,
+                    )
+                    for listener in ade._listeners:
+                        try:
+                            listener(report)
+                        except Exception:
+                            pass
+                    log.critical(
+                        f"[SUPPLY] Conservation invariant VIOLATED at height {height}: "
+                        f"balances={current_supply} != issued={total_issued} "
+                        f"(diff={discrepancy_sat} sat)"
+                    )
+
+            # A rollback/reorg can move the sampled height backwards. A supply
             # sample from the abandoned branch must never be compared against
             # the replacement branch; establish a fresh baseline instead.
             reset_for_reorg = (
-                self._last_checked_height is not None and
-                height <= self._last_checked_height
+                self._last_checked_height is not None
+                and height <= self._last_checked_height
             )
             if reset_for_reorg:
                 self._last_checked_supply = current_supply
                 self._last_checked_height = height
-            elif self._last_checked_supply is not None:
-                # The balance-table total normally changes only through protocol
-                # issuance. Burns are represented by credits to BURN_ADDRESS, so
-                # a large negative jump is also a conservation violation.
+            elif not callable(issued_fn) and self._last_checked_supply is not None:
+                # Fallback for legacy storage mocks without issuance tracking:
+                # scale expected_max_delta by actual elapsed blocks.
+                elapsed_blocks = max(height - self._last_checked_height, 1)
                 delta_sat = current_supply - self._last_checked_supply
                 expected_max_delta = (
-                    # 50 blocks × ~10 VSD reward × 1e8 sat/VSD × 1.05 tolerance
-                    self.SAMPLE_INTERVAL * 10 * 100_000_000 * 1.05
+                    elapsed_blocks * 10 * 100_000_000 * 1.05
                 )
                 if abs(delta_sat) > expected_max_delta:
-                    # Large positive or negative conservation anomaly.  Visold
-                    # represents burns as balances at BURN_ADDRESS, so ordinary
-                    # burns, fees, L2 escrow transfers and account transfers do
-                    # not reduce sum(all balances).
                     report = AnomalyReport(
                         kind=AnomalyKind.SUPPLY_INFLATION,
                         detected_at=time.time(),
                         description=(
                             f"Supply changed {delta_sat/1e8:.4f} VSD in "
-                            f"{self.SAMPLE_INTERVAL} blocks "
+                            f"{elapsed_blocks} blocks "
                             f"(expected max {expected_max_delta/1e8:.4f} VSD)"
                         ),
                         evidence={
                             "prev_supply_sat": self._last_checked_supply,
                             "curr_supply_sat": current_supply,
                             "delta_sat": delta_sat,
-                            "blocks": self.SAMPLE_INTERVAL,
+                            "blocks": elapsed_blocks,
                         },
                         source="rule",
                         confidence=0.95,
@@ -126,7 +159,8 @@ class SupplyConservationMonitor:
                             pass
                     log.critical(
                         f"[SUPPLY] Conservation invariant VIOLATED: "
-                        f"delta={delta_sat/1e8:.4f} VSD")
+                        f"delta={delta_sat/1e8:.4f} VSD"
+                    )
             self._last_checked_supply = current_supply
             self._last_checked_height = height
         except Exception as exc:
@@ -136,8 +170,14 @@ class SupplyConservationMonitor:
         try:
             layer2 = getattr(self._blockchain, "layer2", None)
             if layer2 is not None:
-                l2_ok, l2_detail = layer2.supply_invariant_ok()
+                l2_ok, l2_supply_sat, l1_bridge_sat = layer2.supply_invariant_ok()
                 if not l2_ok:
+                    diff_sat = l2_supply_sat - l1_bridge_sat
+                    l2_detail = (
+                        f"l2_supply_sat={l2_supply_sat}, "
+                        f"l1_bridge_sat={l1_bridge_sat}, "
+                        f"diff_sat={diff_sat}"
+                    )
                     report = AnomalyReport(
                         kind=AnomalyKind.SUPPLY_INFLATION,
                         detected_at=time.time(),
@@ -146,7 +186,10 @@ class SupplyConservationMonitor:
                             f"{l2_detail}"),
                         evidence={
                             "check": "layer2.supply_invariant_ok",
-                            "detail": str(l2_detail),
+                            "detail": l2_detail,
+                            "l2_supply_sat": l2_supply_sat,
+                            "l1_bridge_sat": l1_bridge_sat,
+                            "diff_sat": diff_sat,
                         },
                         source="rule",
                         confidence=0.95,

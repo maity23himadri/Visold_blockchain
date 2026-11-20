@@ -123,8 +123,9 @@ class STUNClient:
         try:
             # Resolve STUN server (may be a hostname)
             try:
+                req_af = local_sock.family if local_sock is not None else socket.AF_UNSPEC
                 infos = socket.getaddrinfo(stun_host, stun_port,
-                                           socket.AF_UNSPEC, socket.SOCK_DGRAM)
+                                           req_af, socket.SOCK_DGRAM)
                 if not infos:
                     return None
                 _af, _st, _pr, _cn, stun_addr = infos[0]
@@ -189,11 +190,13 @@ class STUNClient:
         while offset + 4 <= len(data):
             attr_type, attr_len = struct.unpack_from("!HH", data, offset)
             offset += 4
+            if offset + attr_len > len(data):
+                break
             attr_val = data[offset: offset + attr_len]
             # Pad to 4-byte boundary
             offset += (attr_len + 3) & ~3
 
-            if attr_type == cls.ATTR_XOR_MAPPED_ADDRESS and attr_len >= 8:
+            if attr_type == cls.ATTR_XOR_MAPPED_ADDRESS and len(attr_val) >= 8:
                 # XOR-MAPPED-ADDRESS: family=IPv4 only for now
                 _reserved, family = struct.unpack_from("!BB", attr_val)
                 if family == 0x01:  # IPv4
@@ -211,7 +214,7 @@ class STUNClient:
                     ip = socket.inet_ntop(socket.AF_INET6, ip_bytes)
                     return ip, port
 
-            elif attr_type == cls.ATTR_MAPPED_ADDRESS and attr_len >= 8:
+            elif attr_type == cls.ATTR_MAPPED_ADDRESS and len(attr_val) >= 8:
                 # Fallback: plain MAPPED-ADDRESS (older servers)
                 _reserved, family = struct.unpack_from("!BB", attr_val)
                 if family == 0x01:

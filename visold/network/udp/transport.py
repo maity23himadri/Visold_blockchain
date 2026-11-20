@@ -161,7 +161,17 @@ class UDPTransport:
             sock = self._sock
             if sock is None:
                 raise OSError("UDP socket is temporarily unavailable")
-            return sock.sendto(data, addr)
+            target = addr
+            if sock.family == socket.AF_INET6:
+                host = addr[0]
+                try:
+                    socket.inet_pton(socket.AF_INET, host)
+                    target = (f"::ffff:{host}", int(addr[1]))
+                except OSError:
+                    pass
+            elif sock.family == socket.AF_INET:
+                target = _udp_normalize_addr(addr)
+            return sock.sendto(data, target)
 
     def _ensure_socket(self):
         """Return the current socket, recreating it if recovery previously failed."""
@@ -474,6 +484,7 @@ class UDPPeerConnection:
         self.connected   = True
         self._lock       = threading.Lock()
         self.trust_level = trust_level or self.TRUST_HIGH
+        self.logic_hash: str = ""
 
         # Soft-ban / audit fields (mirrors PeerConnection)
         self.consecutive_audit_failures: int  = 0
@@ -645,7 +656,16 @@ class UDPPeerConnection:
         self.close_writer()
         self.connected = False
         try:
-            self._session.close()
+            sess = self._session
+            transport = getattr(sess, "_transport", None)
+            addr = getattr(sess, "addr", None)
+            removed = False
+            if transport is not None and addr is not None:
+                remove_fn = getattr(transport, "remove_session", None)
+                if callable(remove_fn):
+                    removed = bool(remove_fn(addr, expected_session=sess))
+            if not removed:
+                sess.close()
         except Exception:
             pass
 

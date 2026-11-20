@@ -25,6 +25,7 @@ Origin: visold_vsd_.py L24854-24887, L24891-25014
 """
 
 import json
+import re
 import time
 import zlib
 from typing import List, Tuple
@@ -152,18 +153,45 @@ class RollupSubmission:
             "backend_security":  self.backend_security,
         }
 
+    _HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
     @classmethod
     def from_dict(cls, d: dict) -> 'RollupSubmission':
+        if not isinstance(d, dict):
+            raise ValueError("rollup submission payload must be a JSON object")
         if d.get("kind") != "rollup_submission_v1":
             raise ValueError(f"not a rollup_submission_v1: kind={d.get('kind')}")
+        for req in ("batch_id", "previous_l2_root", "new_l2_root"):
+            if req not in d:
+                raise ValueError(f"rollup submission missing required field: {req}")
+
+        raw_batch_id = d["batch_id"]
+        if isinstance(raw_batch_id, bool) or not isinstance(raw_batch_id, int):
+            raise ValueError("batch_id must be an integer")
+
+        prev_root = d["previous_l2_root"]
+        new_root = d["new_l2_root"]
+        if not isinstance(prev_root, str) or not isinstance(new_root, str):
+            raise ValueError("previous_l2_root and new_l2_root must be strings")
+
+        zk_hex = d.get("zk_proof", "")
+        comp_hex = d.get("compressed_data", "")
+        if not isinstance(zk_hex, str) or not isinstance(comp_hex, str):
+            raise ValueError("zk_proof and compressed_data must be hex strings")
+
+        backend = d.get("backend", "")
+        backend_security = d.get("backend_security", "")
+        if not isinstance(backend, str) or not isinstance(backend_security, str):
+            raise ValueError("backend and backend_security must be strings")
+
         return cls(
-            batch_id         = int(d["batch_id"]),
-            previous_l2_root = d["previous_l2_root"],
-            new_l2_root      = d["new_l2_root"],
-            zk_proof         = bytes.fromhex(d.get("zk_proof", "")),
-            compressed_data  = bytes.fromhex(d.get("compressed_data", "")),
-            backend          = d.get("backend", ""),
-            backend_security = d.get("backend_security", ""),
+            batch_id         = raw_batch_id,
+            previous_l2_root = prev_root,
+            new_l2_root      = new_root,
+            zk_proof         = bytes.fromhex(zk_hex),
+            compressed_data  = bytes.fromhex(comp_hex),
+            backend          = backend,
+            backend_security = backend_security,
         )
 
     def to_json(self) -> str:
@@ -173,17 +201,19 @@ class RollupSubmission:
 
     @classmethod
     def from_json(cls, s: str) -> 'RollupSubmission':
+        if not isinstance(s, (str, bytes, bytearray)):
+            raise ValueError("rollup submission JSON must be a string or bytes")
         return cls.from_dict(json.loads(s))
 
     # ── Structural validation ────────────────────────────────────────────
     def structural_ok(self) -> Tuple[bool, str]:
         """Surface-level checks that do NOT require proof verification or
         decompression.  Cheap filters that can run before the precompile."""
-        if self.batch_id < 0:
+        if isinstance(self.batch_id, bool) or not isinstance(self.batch_id, int) or self.batch_id < 0:
             return False, "batch_id must be non-negative"
-        if not self.previous_l2_root or len(self.previous_l2_root) != 64:
+        if not isinstance(self.previous_l2_root, str) or not self._HEX64_RE.match(self.previous_l2_root):
             return False, "previous_l2_root must be 64 hex chars"
-        if not self.new_l2_root or len(self.new_l2_root) != 64:
+        if not isinstance(self.new_l2_root, str) or not self._HEX64_RE.match(self.new_l2_root):
             return False, "new_l2_root must be 64 hex chars"
         if self.previous_l2_root == self.new_l2_root and len(self.compressed_data) > 0:
             # Zero-tx batch would have prev == new; with data present this
@@ -212,9 +242,11 @@ class RollupSubmission:
         _MAX = 32 * 1024 * 1024
         try:
             raw = bounded_zlib_decompress(blob, _MAX)
-        except (zlib.error, ValueError) as e:
+            rows = json.loads(raw.decode("utf-8"))
+        except (zlib.error, UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
             raise ValueError(f"bad compressed_data: {e}")
-        rows = json.loads(raw.decode())
+        if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+            raise ValueError("bad batch payload: expected JSON list of transaction objects")
         return [L2Transaction.from_dict(r) for r in rows]
 
     @staticmethod

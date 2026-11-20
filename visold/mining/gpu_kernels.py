@@ -91,14 +91,16 @@ __device__ void atomic_min_ull(unsigned long long *addr,
 __device__ void sha256_block(const unsigned char *data, unsigned int len,
                               unsigned char *out)
 {
+    if (len > 183u) return;
     unsigned int h0=0x6a09e667u, h1=0xbb67ae85u,
                  h2=0x3c6ef372u, h3=0xa54ff53au,
                  h4=0x510e527fu, h5=0x9b05688cu,
                  h6=0x1f83d9abu, h7=0x5be0cd19u;
 
-    /* Padding into at most 2 x 512-bit blocks (sufficient for 136-byte input) */
-    unsigned int padded[32];   /* 2 x 16 words = 32 words = 128 bytes        */
-    for (int i = 0; i < 32; i++) padded[i] = 0;
+    /* Padding into at most 3 x 512-bit blocks (supports up to 183-byte input,
+     * including HEADER_LEN = 136 bytes). */
+    unsigned int padded[48];   /* 3 x 16 words = 48 words = 192 bytes        */
+    for (int i = 0; i < 48; i++) padded[i] = 0;
 
     /* Copy data big-endian word-at-a-time */
     unsigned int full = len / 4, rem = len % 4;
@@ -118,9 +120,9 @@ __device__ void sha256_block(const unsigned char *data, unsigned int len,
     } else {
         padded[full] = 0x80000000u;
     }
-    /* Bit-length in last two words of the last block */
+    /* Bit-length in last two words of the last block (FIPS 180-4: len + 1 + 8 bytes) */
     unsigned long long bits = (unsigned long long)len * 8ULL;
-    unsigned int n_blk = ((len + 8) < 56) ? 1 : 2;
+    unsigned int n_blk = ((len + 8u) / 64u) + 1u;
     padded[n_blk*16 - 2] = (unsigned int)(bits >> 32);
     padded[n_blk*16 - 1] = (unsigned int)(bits & 0xFFFFFFFFu);
 
@@ -194,6 +196,7 @@ _OPENCL_SHA256_KERNEL = r"""
 /* Visold OpenCL Mining Kernel — identical algorithm to the CUDA version */
 
 #pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable
+#pragma OPENCL EXTENSION cl_khr_int64_extended_atomics : enable
 
 #define NONCE_OFFSET 16
 #define HEADER_LEN   136
@@ -221,9 +224,10 @@ __constant uint SHA_K[64] = {
 };
 
 void sha256_hash(__private const uchar *data, uint len, __private uchar *out) {
+    if (len > 183u) return;
     uint h0=0x6a09e667u,h1=0xbb67ae85u,h2=0x3c6ef372u,h3=0xa54ff53au;
     uint h4=0x510e527fu,h5=0x9b05688cu,h6=0x1f83d9abu,h7=0x5be0cd19u;
-    uint padded[32]; for(int i=0;i<32;i++) padded[i]=0;
+    uint padded[48]; for(int i=0;i<48;i++) padded[i]=0;
     uint full=len/4, rem=len%4;
     for(uint i=0;i<full;i++)
         padded[i]=((uint)data[i*4]<<24)|((uint)data[i*4+1]<<16)
@@ -234,7 +238,7 @@ void sha256_hash(__private const uchar *data, uint len, __private uchar *out) {
         w|=0x80u<<(24-rem*8); padded[full]=w;
     } else padded[full]=0x80000000u;
     ulong bits=(ulong)len*8UL;
-    uint nb=((len+8)<56)?1:2;
+    uint nb=((len+8u)/64u)+1u;
     padded[nb*16-2]=(uint)(bits>>32); padded[nb*16-1]=(uint)(bits&0xFFFFFFFFu);
     for(uint blk=0;blk<nb;blk++){
         uint W[64];

@@ -115,7 +115,7 @@ def compute_node_logic_hash(root: Optional[str] = None) -> str:
     try:
         blob = package_source_blob(root)
     except Exception:
-        return manifest_hash[:32] if manifest_hash else "unknown"
+        return "unknown"
 
     if blob:
         # The source blob format has one entry per .py file; count entries from

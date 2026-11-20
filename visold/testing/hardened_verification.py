@@ -85,25 +85,38 @@ class HardenedVerificationSuite:
             self._assert(True, "Old-timestamp raises TimestampAnomalyError")
 
         # 4. State root mismatch trips CB
-        _hc_panic_cb._mode = _HardenedSystemMode.NORMAL
-        _hc_panic_cb._corruption_count = 0
-        _hc_panic_cb._subsystems.clear()
+        with _hc_panic_cb._mode_lock:
+            _hc_panic_cb._mode = _HardenedSystemMode.NORMAL
+            _hc_panic_cb._corruption_count = 0
+            _hc_panic_cb._corruption_timestamps.clear()
+            _hc_panic_cb._subsystems.clear()
+            _hc_panic_cb._read_only_since = 0.0
         try:
             _hc_inv.assert_state_root_matches("aaa" + "0" * 61, "bbb" + "0" * 61, 999)
             self._assert(False, "State-root mismatch gate", "Should have raised")
         except StateRootMismatch:
             self._assert(True, "State-root mismatch raises StateRootMismatch")
-        _hc_panic_cb._mode = _HardenedSystemMode.NORMAL
-        _hc_panic_cb._corruption_count = 0
-        _hc_panic_cb._subsystems.clear()
+        finally:
+            with _hc_panic_cb._mode_lock:
+                _hc_panic_cb._mode = _HardenedSystemMode.NORMAL
+                _hc_panic_cb._corruption_count = 0
+                _hc_panic_cb._corruption_timestamps.clear()
+                _hc_panic_cb._subsystems.clear()
+                _hc_panic_cb._read_only_since = 0.0
 
         # 5. CB trips to READ_ONLY after N failures
-        for _ in range(_HC_CB_FAILURE_THRESHOLD):
-            _hc_panic_cb.record_failure("test_sub", RuntimeError("boom"))
-        self._assert(_hc_panic_cb.mode == _HardenedSystemMode.READ_ONLY,
-                     "CB trips after N failures → READ_ONLY")
-        _hc_panic_cb._mode = _HardenedSystemMode.NORMAL
-        _hc_panic_cb._subsystems.clear()
+        try:
+            for _ in range(_HC_CB_FAILURE_THRESHOLD):
+                _hc_panic_cb.record_failure("test_sub", RuntimeError("boom"))
+            self._assert(_hc_panic_cb.mode == _HardenedSystemMode.READ_ONLY,
+                         "CB trips after N failures → READ_ONLY")
+        finally:
+            with _hc_panic_cb._mode_lock:
+                _hc_panic_cb._mode = _HardenedSystemMode.NORMAL
+                _hc_panic_cb._corruption_count = 0
+                _hc_panic_cb._corruption_timestamps.clear()
+                _hc_panic_cb._subsystems.clear()
+                _hc_panic_cb._read_only_since = 0.0
 
         # 6. Recursion guard
         try:
@@ -135,16 +148,20 @@ class HardenedVerificationSuite:
                      "NTPClock.now() returns plausible integer timestamp")
 
         # 10. assert_writable raises in READ_ONLY
-        _hc_panic_cb._mode = _HardenedSystemMode.READ_ONLY
+        with _hc_panic_cb._mode_lock:
+            _hc_panic_cb._mode = _HardenedSystemMode.READ_ONLY
         try:
             _hc_panic_cb.assert_writable("test")
             self._assert(False, "assert_writable in READ_ONLY", "Should raise")
         except ImmediateAbort:
             self._assert(True, "assert_writable raises ImmediateAbort in READ_ONLY")
         finally:
-            _hc_panic_cb._mode = _HardenedSystemMode.NORMAL
-            _hc_panic_cb._subsystems.clear()
-            _hc_panic_cb._corruption_count = 0
+            with _hc_panic_cb._mode_lock:
+                _hc_panic_cb._mode = _HardenedSystemMode.NORMAL
+                _hc_panic_cb._corruption_count = 0
+                _hc_panic_cb._corruption_timestamps.clear()
+                _hc_panic_cb._subsystems.clear()
+                _hc_panic_cb._read_only_since = 0.0
 
         print("─" * 72)
         print(f"  RESULT: {self._pass} passed, {self._fail} failed")

@@ -104,6 +104,8 @@ def derive_wallet_priv(secret: str, user_id: str) -> int:
     Raises ValueError if either input is empty or whitespace.
     """
     s = (secret or "").strip()
+    if len(s) == 32 and all(c in "0123456789abcdefABCDEF" for c in s):
+        s = s.lower()
     u = (user_id or "").strip()
     if not s:
         raise ValueError("secret must not be empty")

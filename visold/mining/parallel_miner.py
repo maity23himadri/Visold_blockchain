@@ -292,6 +292,17 @@ class ParallelMiner:
 
     # ── CPU parallel (Cython-optimised) ──────────────────────────────────────
 
+    @staticmethod
+    def _resolve_mining_target(difficulty: float) -> Optional[int]:
+        """Convert block difficulty to a positive 256-bit target, or None to fail closed."""
+        try:
+            target = DifficultyEngine.difficulty_to_target(difficulty)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if target <= 0:
+            return None
+        return target
+
     def _mine_cpu(self, block: 'Block',
                   stop_event: Optional[threading.Event] = None,
                   max_hps: float = 0.0,
@@ -318,7 +329,9 @@ class ParallelMiner:
         batch boundaries, so startup calibration does not leave a difficult
         block permanently unthrottled until it is solved.
         """
-        target       = DifficultyEngine.difficulty_to_target(block.difficulty)
+        target = self._resolve_mining_target(block.difficulty)
+        if target is None:
+            return False
         target_bytes = target.to_bytes(32, 'big')   # pre-convert once for cmp
 
         # Pre-render the JSON format template once per candidate block
@@ -432,6 +445,9 @@ class ParallelMiner:
             if stop_event and stop_event.is_set():
                 thread_stop.set()
                 break
+            if not any(w.is_alive() for w in workers):
+                thread_stop.set()
+                break
             thread_stop.wait(timeout=0.05)
             now_mono = time.monotonic()
             if now_mono - last_sample >= 0.10:
@@ -458,6 +474,7 @@ class ParallelMiner:
             block.nonce      = nonce
             block.block_hash = hex_hash
             block.timestamp  = ts
+            block.seal()
             return True
         return False
 
@@ -495,15 +512,20 @@ class ParallelMiner:
 
     def _json_verify(self, block: 'Block', nonce: int) -> bool:
         """
-        Verify a GPU-found nonce with the canonical JSON-based hash.
-        GPU uses binary SHA-256; canonical chain uses JSON SHA-256.
-        Most nonces that pass binary SHA-256 also pass JSON SHA-256 at
-        low-medium difficulty; at high difficulty the CPU quickly confirms.
+        Verify a candidate nonce against the canonical JSON-based hash
+        (Block.compute_hash()) and seal the block on acceptance.
         """
-        block.nonce      = nonce
-        block.block_hash = block.compute_hash()
-        return DifficultyEngine.validate_pow_target(
-            block.block_hash, block.difficulty)
+        prev_nonce = block.nonce
+        prev_hash = block.block_hash
+        block.nonce = nonce
+        candidate_hash = block.compute_hash()
+        block.block_hash = candidate_hash
+        if DifficultyEngine.validate_pow_target(candidate_hash, block.difficulty):
+            block.seal()
+            return True
+        block.nonce = prev_nonce
+        block.block_hash = prev_hash
+        return False
 
     # ── CUDA mine ─────────────────────────────────────────────────────────────
 
@@ -539,7 +561,9 @@ class ParallelMiner:
             GRID = (BTCH + THRD - 1) // THRD
             U64MAX = np.uint64(0xFFFFFFFFFFFFFFFF)
 
-            target  = DifficultyEngine.difficulty_to_target(block.difficulty)
+            target = self._resolve_mining_target(block.difficulty)
+            if target is None:
+                return False
             t_words = np.array(self._target_to_words(target), dtype=np.uint32)
             hdr_np  = np.frombuffer(
                 self._build_binary_header(block), dtype=np.uint8).copy()
@@ -606,7 +630,9 @@ class ParallelMiner:
             BTCH  = self._gpu_batch
             U64MAX= np.uint64(0xFFFFFFFFFFFFFFFF)
 
-            target  = DifficultyEngine.difficulty_to_target(block.difficulty)
+            target = self._resolve_mining_target(block.difficulty)
+            if target is None:
+                return False
             t_words = np.array(self._target_to_words(target), dtype=np.uint32)
             hdr_np  = np.frombuffer(
                 self._build_binary_header(block), dtype=np.uint8).copy()

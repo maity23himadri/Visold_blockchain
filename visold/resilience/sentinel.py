@@ -192,17 +192,20 @@ class SentinelNode:
                 },
             )
             try:
-                resp = urllib.request.urlopen(req, timeout=5)  # nosec B310 – URL built from Config.SENTINEL_PRIMARY_HOST constant
+                with urllib.request.urlopen(req, timeout=5) as resp:  # nosec B310 – URL built from Config.SENTINEL_PRIMARY_HOST constant
+                    data = json.loads(resp.read())
             except urllib.error.HTTPError as _he:
-                if _he.code == 401:
-                    # Token rotated by operator — invalidate cache and
-                    # let the next call re-read.  Return None this time.
-                    log.info(
-                        "sentinel: 401 from primary — invalidating "
-                        "cached RPC token; will re-read on next call")
-                    self._cached_rpc_token = None
+                try:
+                    if _he.code == 401:
+                        # Token rotated by operator — invalidate cache and
+                        # let the next call re-read.  Return None this time.
+                        log.info(
+                            "sentinel: 401 from primary — invalidating "
+                            "cached RPC token; will re-read on next call")
+                        self._cached_rpc_token = None
+                finally:
+                    _he.close()
                 return None
-            data = json.loads(resp.read())
             return data.get("result")
         except Exception:
             return None

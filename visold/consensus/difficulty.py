@@ -127,9 +127,10 @@ class DifficultyEngine:
 
     # ── Class-level cache: parent_chain_height → required_difficulty ──────────
     # Keyed by (chain token, height): two chains in one process never share answers.
-    _cache:      Dict = {}
-    _cache_lock: threading.Lock = threading.Lock()
-    _CACHE_MAX:  int            = 1024          # evict oldest when exceeded
+    _cache:       Dict = {}
+    _cache_lock:  threading.Lock = threading.Lock()
+    _cache_epoch: int            = 0             # bumped on invalidate_cache()
+    _CACHE_MAX:   int            = 1024          # evict oldest when exceeded
 
     # ═════════════════════════════════════════════════════════════════════════
     # Public API
@@ -154,14 +155,16 @@ class DifficultyEngine:
         with cls._cache_lock:
             if key in cls._cache:
                 return cls._cache[key]
+            epoch = cls._cache_epoch
 
         result = cls._compute_uncached(storage, current_height)
 
         with cls._cache_lock:
-            cls._cache[key] = result
-            # Evict the lowest-height entry when cache is full
-            if len(cls._cache) > cls._CACHE_MAX:
-                del cls._cache[min(cls._cache, key=lambda k: k[1])]
+            if cls._cache_epoch == epoch:
+                cls._cache[key] = result
+                # Evict the lowest-height entry when cache is full
+                if len(cls._cache) > cls._CACHE_MAX:
+                    del cls._cache[min(cls._cache, key=lambda k: k[1])]
 
         return result
 
@@ -175,6 +178,7 @@ class DifficultyEngine:
         Pass from_height=0 (default) to flush the entire cache.
         """
         with cls._cache_lock:
+            cls._cache_epoch += 1
             stale_keys = [k for k in cls._cache if k[1] >= from_height]
             for k in stale_keys:
                 del cls._cache[k]
@@ -425,13 +429,12 @@ class DifficultyEngine:
         attacker controlling only a minority of recent blocks cannot lower
         the effective minimum timestamp significantly.
         """
-        try:
-            ts = float(new_ts)
-            nt = float(network_time)
-            if not math.isfinite(ts) or not math.isfinite(nt):
-                return False, "Timestamp and network time must be finite"
-        except (TypeError, ValueError, OverflowError):
-            return False, "Timestamp and network time must be finite numbers"
+        if isinstance(new_ts, bool) or not isinstance(new_ts, int):
+            return False, "Timestamp must be a finite integer"
+        if isinstance(network_time, bool) or not isinstance(network_time, int):
+            return False, "Network time must be a finite integer"
+        if new_ts <= 0:
+            return False, f"Timestamp {new_ts} must be a positive Unix timestamp"
 
         max_future = Config.DIFF_MAX_FUTURE_DRIFT
 

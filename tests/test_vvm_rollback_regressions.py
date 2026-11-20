@@ -61,7 +61,7 @@ def test_reverted_call_value_rollback_is_supply_neutral():
         sender_w = Wallet.generate()
         miner_w = Wallet.generate()
         sender, miner = sender_w.address, miner_w.address
-        contract = "VSDctestrevert00000000000000000000000"
+        contract = "VSDc111111111111111111111111111111111111"
 
         runtime = bytes.fromhex("60006000fd")  # PUSH1 0; PUSH1 0; REVERT
         code_hash = sha256(runtime)
@@ -109,7 +109,7 @@ def test_successful_call_value_rollback_remains_exact():
         sender_w = Wallet.generate()
         miner_w = Wallet.generate()
         sender, miner = sender_w.address, miner_w.address
-        contract = "VSDctestsuccess0000000000000000000000"
+        contract = "VSDc222222222222222222222222222222222222"
 
         # Runtime returns 7: PUSH1 3, PUSH1 4, ADD, MSTORE, RETURN.
         runtime = bytes.fromhex("600360040160005260206000f3")
@@ -301,7 +301,7 @@ def test_absent_contract_call_is_still_rejected_when_no_prior_deploy_exists():
 
         call = Transaction(
             sender=sender_w.address,
-            receiver="VSDc0000000000000000000000000000000000",
+            receiver="VSDc000000000000000000000000000000000000",
             amount=0.0,
             fee=0.0,
             nonce=0,
@@ -348,7 +348,7 @@ def test_name_collision_value_deploy_rollback_restores_exact_state_root():
         # the consensus name gate before the VM executes.
         runtime = bytes.fromhex("600060005260206000f3")
         code_hash = sha256(runtime)
-        collision_addr = "VSDccollisionexisting000000000000000"
+        collision_addr = "VSDc333333333333333333333333333333333333"
         st.save_contract_code(code_hash, runtime)
         st.save_contract(
             collision_addr,

@@ -26,6 +26,7 @@ Origin: visold_vsd_.py L31653-31809, L31815-31822
 
 import json
 import os
+import re
 import threading
 from collections import Counter
 
@@ -74,6 +75,17 @@ class P2PMessageLogger:
         "signature", "sig", "privkey", "private_key", "secret",
         "password", "passphrase", "challenge_resp", "pow_nonce_reveal",
     ))
+    _ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
+    _CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+
+    @classmethod
+    def _sanitize_token(cls, value: object, max_len: int = 32, default: str = "?") -> str:
+        s = str(value) if value is not None else ""
+        s = cls._ANSI_RE.sub("", s)
+        s = cls._CTRL_RE.sub(" ", s).strip()
+        if not s:
+            return default
+        return s[:max_len]
 
     @classmethod
     def enable(cls, verbose: bool = False) -> None:
@@ -123,22 +135,22 @@ class P2PMessageLogger:
 
     @classmethod
     def _emit(cls, arrow, peer, msg, size_bytes, outbound):
-        mtype = ""
+        raw_mtype = ""
         try:
-            mtype = str(msg.get("type", "") if isinstance(msg, dict) else "")
+            raw_mtype = msg.get("type", "") if isinstance(msg, dict) else ""
         except Exception:
-            mtype = "?"
-        if not mtype:
-            mtype = "UNKNOWN"
+            raw_mtype = "?"
+        mtype = cls._sanitize_token(raw_mtype, max_len=32, default="UNKNOWN")
 
         peer_tag = "?"
         try:
             pid = getattr(peer, "peer_id", "") or ""
             if pid:
-                peer_tag = pid[:12]
+                peer_tag = cls._sanitize_token(pid[:12], max_len=12, default="?")
             else:
-                peer_tag = "{}:{}".format(
+                raw_tag = "{}:{}".format(
                     getattr(peer, "host", "?"), getattr(peer, "port", "?"))
+                peer_tag = cls._sanitize_token(raw_tag, max_len=24, default="?")
         except Exception:
             pass
 
@@ -172,7 +184,7 @@ class P2PMessageLogger:
         try:
             safe = {}
             for k, v in msg.items():
-                if k in cls._REDACT_KEYS:
+                if str(k).lower() in cls._REDACT_KEYS:
                     safe[k] = "<redacted>"
                 elif isinstance(v, (dict, list)):
                     # Collapse nested structures to a short marker so one huge

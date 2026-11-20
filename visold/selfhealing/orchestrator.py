@@ -290,6 +290,9 @@ class SelfHealingSystem:
             return False, "address required"
         self.freeze_reg.unfreeze(address)
         self.rate_limiter.unlimit(address)
+        validator = getattr(self, "_v2_safe_validator", None)
+        if validator is not None:
+            validator.record_manual_unfreeze(address)
         return True, f"Unfrozen: {address}"
 
     def receive_vote(

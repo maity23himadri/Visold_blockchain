@@ -26,7 +26,7 @@ Origin: visold_vsd_.py L9163-9512
 
 import threading
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from visold.consensus.difficulty import DifficultyEngine
 from visold.kernel.config import Config
@@ -81,6 +81,7 @@ class HashrateGovernor:
         # Sender metadata is kept separately so the legacy rate tuple remains
         # compatible with existing diagnostics/audit code.
         self._peer_report_meta: Dict[str, Tuple[float, int]] = {}
+        self._peer_addresses: Dict[str, str] = {}
 
         # Local measurement state
         self._local_actual_hashrate = 0.0
@@ -130,7 +131,8 @@ class HashrateGovernor:
     # Inputs from the network (gossip)
     # ─────────────────────────────────────────────────────────────────────
     def record_peer_hashrate(self, peer_id: str, hps: float,
-                             reported_ts=None, sequence=None) -> bool:
+                             reported_ts=None, sequence=None,
+                             miner_address: Optional[str] = None) -> bool:
         """Store a peer's measured-rate report with replay/staleness guards.
 
         Signed miner-origin reports carry a timestamp verified by the network
@@ -167,8 +169,14 @@ class HashrateGovernor:
             # reports are aged from this origin timestamp so relaying cannot
             # refresh an old measurement; legacy reports without a timestamp
             # fall back to local receive time.
-            max_skew = max(float(Config.HASHRATE_PEER_TTL), 300.0)
-            if abs(now - parsed_ts) > max_skew:
+            max_future_skew = 30.0
+            fresh_secs = float(Config.HASHRATE_FRESH_SECS)
+            decay_secs = max(1e-3, float(Config.HASHRATE_DECAY_SECS))
+            max_age_secs = min(float(Config.HASHRATE_PEER_TTL),
+                               fresh_secs + decay_secs)
+            if parsed_ts - now > max_future_skew:
+                return False
+            if now - parsed_ts > max_age_secs:
                 return False
         if sequence is not None:
             if isinstance(sequence, bool):
@@ -182,16 +190,26 @@ class HashrateGovernor:
 
         with self._lock:
             previous = self._peer_report_meta.get(peer_id)
-            if parsed_seq is not None and previous is not None:
+            if previous is not None:
                 previous_ts, previous_seq = previous
-                if parsed_seq <= previous_seq:
-                    return False
-                # Signed rate reports are generated at the configured report
-                # cadence. A higher sequence with an unchanged/backward wall
-                # timestamp is not a fresh measurement and must not refresh it.
-                if parsed_ts is not None and parsed_ts <= previous_ts:
-                    return False
+                if parsed_seq is not None:
+                    if parsed_seq <= previous_seq:
+                        return False
+                    # Signed rate reports are generated at the configured report
+                    # cadence. A higher sequence with an unchanged/backward wall
+                    # timestamp is not a fresh measurement and must not refresh it.
+                    if parsed_ts is not None and parsed_ts <= previous_ts:
+                        return False
+                else:
+                    # Do not let an unsequenced report overwrite a sequenced
+                    # watermark or move an origin-timestamped report backwards.
+                    if previous_seq >= 0:
+                        return False
+                    if parsed_ts is None or parsed_ts <= previous_ts:
+                        return False
             self._peer_rates[peer_id] = (v, now)
+            if miner_address:
+                self._peer_addresses[peer_id] = str(miner_address).strip()
             if parsed_seq is not None:
                 self._peer_report_meta[peer_id] = (
                     parsed_ts if parsed_ts is not None else now, parsed_seq)
@@ -210,6 +228,11 @@ class HashrateGovernor:
         with self._lock:
             self._peer_rates.pop(peer_id, None)
             self._peer_report_meta.pop(peer_id, None)
+            self._peer_addresses.pop(peer_id, None)
+
+    def get_peer_miner_address(self, peer_id: str) -> str:
+        with self._lock:
+            return self._peer_addresses.get(peer_id, peer_id)
 
     # ─────────────────────────────────────────────────────────────────────
     # Internal helpers

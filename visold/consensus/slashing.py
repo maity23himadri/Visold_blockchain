@@ -242,8 +242,13 @@ class SlashingEvidenceProtocol:
                        str(evidence["block_hash_b"])))
         evidence_id = sha256(
             f"{evidence['validator']}:{pair[0]}:{pair[1]}".encode())
+        meta_key = f"slash_evidence:{evidence_id[:32]}"
         with self._lock:
-            if evidence_id in self._seen_evidences:
+            if evidence_id in self._seen_evidences or (
+                hasattr(self._storage, "get_meta")
+                and self._storage.get_meta(meta_key)
+            ):
+                self._seen_evidences.add(evidence_id)
                 return False, "Evidence already processed"
             validator = evidence["validator"]
             role = self._storage.get_role(validator)
@@ -258,7 +263,7 @@ class SlashingEvidenceProtocol:
             # different nodes, so no node can apply it at a common block height.
             # Penalties need an on-chain slash, which does not exist yet.
             self._storage.set_meta(
-                f"slash_evidence:{evidence_id[:32]}",
+                meta_key,
                 json.dumps({"validator": validator,
                             "height": evidence.get("height", 0),
                             "timestamp": int(time.time()),

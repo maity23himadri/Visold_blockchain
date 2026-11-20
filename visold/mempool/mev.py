@@ -49,6 +49,7 @@ the transfer in flight is kept in node metadata, so it survives restarts.
 """
 
 import json
+import re
 import secrets
 import time
 from typing import List, Optional, Tuple
@@ -71,6 +72,11 @@ _TRANSIENT_MARKERS = (
     "Mempool full", "Rate limit", "Reverse transaction",
     "is not on-chain", "is too recent", "is unavailable",
 )
+_MEV_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _is_mev_hex64(value: object) -> bool:
+    return isinstance(value, str) and bool(_MEV_HEX64_RE.fullmatch(value))
 
 
 def is_protected_reveal(tx: Transaction) -> bool:
@@ -152,7 +158,19 @@ def _uses_v2_merkle(block_index: int) -> bool:
         return True
 
 
-def merkle_steps(tx_ids: List[str], index: int, v2: bool) -> List[Tuple[str, str]]:
+def _uses_v3_merkle(block_index: int) -> bool:
+    """Same rule as Block._merkle: V3 when MERKLE_V3_ACTIVATION_HEIGHT is configured."""
+    v3_h = getattr(Config, "MERKLE_V3_ACTIVATION_HEIGHT", None)
+    if v3_h is None:
+        return False
+    try:
+        return int(block_index) >= int(v3_h)
+    except Exception:
+        return False
+
+
+def merkle_steps(tx_ids: List[str], index: int, v2: bool,
+                 v3: bool = False) -> List[Tuple[str, str]]:
     """Merkle path from leaf ``index`` to the root, built as Block._merkle builds it.
 
     Each step is ("L", sibling) when the sibling is on the left, ("R", sibling)
@@ -162,10 +180,28 @@ def merkle_steps(tx_ids: List[str], index: int, v2: bool) -> List[Tuple[str, str
     k = int(index)
     if not 0 <= k < len(level):
         raise ValueError("leaf index out of range")
+    if v3:
+        level = [sha256(("|leaf|" + h).encode()) for h in level]
     steps: List[Tuple[str, str]] = []
     while len(level) > 1:
         m = len(level)
-        if v2:
+        if v3:
+            pairs = m // 2
+            if k < 2 * pairs:
+                if k % 2 == 0:
+                    steps.append(("R", level[k + 1]))
+                else:
+                    steps.append(("L", level[k - 1]))
+                k //= 2
+            else:
+                steps.append(("O", ""))
+                k = pairs
+            nxt = [sha256(("|node|" + level[2 * i] + level[2 * i + 1]).encode())
+                   for i in range(pairs)]
+            if m % 2 == 1:
+                nxt.append(sha256(("|odd|" + level[-1]).encode()))
+            level = nxt
+        elif v2:
             pairs = m // 2
             if k < 2 * pairs:
                 if k % 2 == 0:
@@ -195,14 +231,28 @@ def merkle_steps(tx_ids: List[str], index: int, v2: bool) -> List[Tuple[str, str
 
 
 def verify_merkle_steps(leaf: str, steps: List[Tuple[str, str]], root: str,
-                        v2: bool) -> bool:
-    cur = leaf
-    for kind, sibling in steps:
+                        v2: bool, v3: bool = False) -> bool:
+    if not _is_mev_hex64(leaf) or not _is_mev_hex64(root):
+        return False
+    if not isinstance(steps, (list, tuple)):
+        return False
+    cur = sha256(("|leaf|" + leaf).encode()) if v3 else leaf
+    node_prefix = "|node|" if v3 else ""
+    for step in steps:
+        if not isinstance(step, (list, tuple)) or len(step) != 2:
+            return False
+        kind, sibling = step
         if kind == "R":
-            cur = sha256((cur + sibling).encode())
+            if not _is_mev_hex64(sibling):
+                return False
+            cur = sha256((node_prefix + cur + sibling).encode())
         elif kind == "L":
-            cur = sha256((sibling + cur).encode())
-        elif kind == "O" and v2:
+            if not _is_mev_hex64(sibling):
+                return False
+            cur = sha256((node_prefix + sibling + cur).encode())
+        elif kind == "O" and (v2 or v3):
+            if sibling != "":
+                return False
             cur = sha256(("|odd|" + cur).encode())
         else:
             return False
@@ -219,8 +269,9 @@ def reveal_steps_for_commit(storage, commit_txid: str,
     if commit_txid not in ids:
         raise LookupError("commitment is not in its block")
     v2 = _uses_v2_merkle(block.index)
-    steps = merkle_steps(ids, ids.index(commit_txid), v2)
-    if not verify_merkle_steps(commit_txid, steps, block.merkle_root, v2):
+    v3 = _uses_v3_merkle(block.index)
+    steps = merkle_steps(ids, ids.index(commit_txid), v2, v3=v3)
+    if not verify_merkle_steps(commit_txid, steps, block.merkle_root, v2, v3=v3):
         raise LookupError("block merkle root does not match its transactions")
     return steps
 
@@ -279,7 +330,8 @@ def check_reveal(storage, reveal: Transaction, at_height: int) -> Tuple[bool, st
     commit = commitment_tx_fields(reveal.sender, int(reveal.nonce),
                                   int(reveal.timestamp), reveal.mev_commitment(salt))
     if not verify_merkle_steps(commit.tx_id, steps, header["merkle_root"],
-                               _uses_v2_merkle(commit_height)):
+                               _uses_v2_merkle(commit_height),
+                               v3=_uses_v3_merkle(commit_height)):
         return False, "commitment is not part of its block"
     return True, "OK"
 

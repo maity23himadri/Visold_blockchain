@@ -27,7 +27,7 @@ Origin: visold_vsd_.py L7993-8287
 import math
 import threading
 from collections import Counter, deque
-from typing import Dict, Iterable, List, TYPE_CHECKING
+from typing import Dict, Iterable, List, Optional, TYPE_CHECKING
 
 from visold.kernel.config import Config
 from visold.kernel.logging_setup import log
@@ -74,6 +74,7 @@ class EconomicMonitor:
         self._reward_log: deque = deque(maxlen=self.WINDOW)
         self._fee_log: deque = deque(maxlen=10)
         self._miner_sequence: deque = deque(maxlen=self.WINDOW)
+        self._validator_sig_log: deque = deque(maxlen=max(self.COMPETITION_WINDOW, 20))
         self._lock = threading.RLock()
         self._alert_latches = set()
 
@@ -93,6 +94,7 @@ class EconomicMonitor:
             self._reward_log.append((producer, normalized))
             self._miner_sequence.append(producer)
         self._check_concentration()
+        self._check_validator_reward_manipulation()
 
     def record_reward(self, address: str, amount: float):
         """Backward-compatible adapter for legacy single-recipient callers.
@@ -123,6 +125,7 @@ class EconomicMonitor:
                 self._reward_log.append((address, None))
                 self._miner_sequence.append(address)
             self._fee_log.clear()
+            self._validator_sig_log.clear()
             self._alert_latches.clear()
 
     def record_block_fees(self, total_fees: float):
@@ -136,10 +139,18 @@ class EconomicMonitor:
             self._fee_log.append(fees)
         self._check_fee_spike()
 
-    def record_validator_sigs(self, sig_addresses: List[str]):
-        if len(sig_addresses) < 3:
-            return
-        self._check_collusion(sig_addresses)
+    def record_validator_sigs(self, sig_addresses: List[str],
+                              block_hash: str = ""):
+        if len(sig_addresses) >= 3:
+            with self._lock:
+                if block_hash and self._validator_sig_log and self._validator_sig_log[-1][0] == block_hash:
+                    self._validator_sig_log[-1] = (block_hash, list(sig_addresses))
+                else:
+                    self._validator_sig_log.append((block_hash, list(sig_addresses)))
+                window_sigs = [
+                    addr for _bh, addrs in self._validator_sig_log for addr in addrs
+                ]
+            self._check_collusion(window_sigs)
         self._check_validator_reward_manipulation(sig_addresses)
 
     def _activate_latches(self, group: str, active_keys: set):
@@ -273,9 +284,9 @@ class EconomicMonitor:
                 "prove collusion.")
             metrics.inc("economic_collusion_alerts")
 
-    def _check_validator_reward_manipulation(self, sig_addresses: List[str]):
+    def _check_validator_reward_manipulation(self, sig_addresses: Optional[List[str]] = None):
         """Compare actual recorded payouts with stake shares, not proposer subsidy."""
-        if not sig_addresses or self.storage is None:
+        if self.storage is None:
             return
         with self._lock:
             reward_copy = list(self._reward_log)
@@ -290,10 +301,6 @@ class EconomicMonitor:
         reward_counts: Counter = Counter()
         for allocations in valid:
             reward_counts.update(allocations)
-        total_reward = sum(reward_counts.values())
-        if total_reward <= 0:
-            self._activate_latches("validator_reward", set())
-            return
 
         active_keys = set()
         details = {}
@@ -303,12 +310,23 @@ class EconomicMonitor:
                 total_stake = sum(
                     max(float(item.get("stake", 0)), 0.0) for item in validators
                 )
+                validator_addrs = {
+                    str(item.get("address") or "")
+                    for item in validators
+                    if item.get("address")
+                }
+                validator_total_reward = sum(
+                    reward_counts.get(addr, 0) for addr in validator_addrs
+                )
+                if validator_total_reward <= 0:
+                    self._activate_latches("validator_reward", set())
+                    return
                 if total_stake > 0:
                     for validator in validators:
                         address = str(validator.get("address") or "")
                         stake = max(float(validator.get("stake", 0)), 0.0)
                         stake_share = stake / total_stake
-                        reward_share = reward_counts.get(address, 0) / total_reward
+                        reward_share = reward_counts.get(address, 0) / validator_total_reward
                         if (stake_share > 0 and
                                 reward_share > stake_share * self.REWARD_VS_STAKE_RATIO_MAX):
                             key = ("validator_reward", address)
@@ -323,7 +341,7 @@ class EconomicMonitor:
             reward_share, stake_share = details[key]
             log.warning(
                 f"ECONOMIC ALERT: Reward/stake share divergence — {address[:16]}... "
-                f"received {reward_share*100:.1f}% of measured payouts with "
+                f"received {reward_share*100:.1f}% of measured validator payouts with "
                 f"{stake_share*100:.1f}% of stake "
                 f"(ratio={reward_share/stake_share:.1f}×). Review role eligibility "
                 "and payout records.")

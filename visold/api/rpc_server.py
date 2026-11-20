@@ -27,6 +27,7 @@ Origin: visold_vsd_.py L40412-41687
 import hmac
 import http.server
 import json
+import math
 import os
 import secrets
 import socketserver
@@ -84,7 +85,15 @@ class RPCServer:
     Exposes: getbalance, getblockcount, getblock, sendtransaction,
              getpeerinfo, getmempool
     """
-    TOKEN_FILE = os.path.join(Config.DATA_DIR, "rpc_token")
+    TOKEN_FILE = ""  # optional explicit override; resolved dynamically from Config.DATA_DIR when empty
+
+    @classmethod
+    def _get_token_file(cls) -> str:
+        return cls.TOKEN_FILE or os.path.join(Config.DATA_DIR, "rpc_token")
+
+    @classmethod
+    def _token_file(cls) -> str:
+        return cls._get_token_file()
 
     def __init__(self, node: 'VisoldNode', rpc_port: int):
         self.node      = node
@@ -98,19 +107,21 @@ class RPCServer:
     @classmethod
     def _load_or_create_token(cls) -> str:
         Config.ensure_dirs()
-        if os.path.exists(cls.TOKEN_FILE):
-            with open(cls.TOKEN_FILE, 'r') as f:
+        token_file = cls._get_token_file()
+        if os.path.exists(token_file):
+            with open(token_file, 'r') as f:
                 tok = f.read().strip()
             if tok:
                 return tok
         tok = secrets.token_hex(32)   # 256-bit random token
-        with open(cls.TOKEN_FILE, 'w') as f:
+        fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
             f.write(tok)
         try:
-            os.chmod(cls.TOKEN_FILE, 0o600)
+            os.chmod(token_file, 0o600)
         except Exception:
             pass
-        log.info(f"RPC token written to {cls.TOKEN_FILE} (chmod 600)")
+        log.info(f"RPC token written to {token_file} (chmod 600)")
         return tok
 
     # ── Server lifecycle ──────────────────────────────────────────────────────
@@ -218,7 +229,8 @@ class RPCServer:
                 if not hdr:
                     return False
                 try:
-                    return hmac.compare_digest(str(hdr), _admin_token)
+                    return hmac.compare_digest(
+                        str(hdr).encode("utf-8"), str(_admin_token).encode("utf-8"))
                 except Exception:
                     return False
 
@@ -350,6 +362,13 @@ class RPCServer:
                 if not self._check_rate(rate_method):
                     return
 
+                if not isinstance(req, dict):
+                    self._send_json(200, {
+                        "jsonrpc": "2.0", "id": None,
+                        "error": {"code": -32600, "message": "Invalid Request: expected JSON object"},
+                    })
+                    return
+
                 try:
                     result = self._dispatch(req)
                     self._send_json(200, {
@@ -366,6 +385,10 @@ class RPCServer:
             def _dispatch(self, req):
                 method = req.get("method", "")
                 params = req.get("params", [])
+                if params is None:
+                    params = []
+                if not isinstance(params, list):
+                    raise ValueError("params must be a list")
                 # ── Core ─────────────────────────────────────────────────────
                 if method == "getbalance":
                     addr = params[0] if params else node.wallet.address
@@ -377,6 +400,8 @@ class RPCServer:
                     b = node.blockchain.get_block(idx)
                     return b.to_dict() if b else None
                 elif method == "sendtransaction":
+                    if not self._is_admin():
+                        raise PermissionError("admin token required for sendtransaction")
                     to, amt = params[0], float(params[1])
                     memo = params[2] if len(params) > 2 else ""
                     ok, msg = node.send_transaction(to, amt, memo)
@@ -411,6 +436,8 @@ class RPCServer:
                     return {"tx_id": tx_id, "block_index": idx,
                             "merkle_root": b.merkle_root, "proof": proof}
                 elif method == "verifymerkleproof":
+                    if not isinstance(params, list) or len(params) < 3:
+                        return False
                     return SPVClient.verify_merkle_proof(
                         params[0], params[1], params[2])
                 # ── Protocol version (Problem #13) ────────────────────────────
@@ -464,9 +491,16 @@ class RPCServer:
                     if len(params) < 2:
                         raise ValueError(
                             "proposeupgrade requires [version, signal_start_height]")
+                    if isinstance(params[0], bool) or isinstance(params[1], bool):
+                        raise ValueError("version and signal_start_height must be integers")
                     version      = int(params[0])
                     start_height = int(params[1])
-                    threshold    = float(params[2]) if len(params) > 2 else None
+                    if len(params) > 2 and params[2] is not None:
+                        if isinstance(params[2], bool):
+                            raise ValueError("threshold must be a finite number")
+                        threshold = float(params[2])
+                    else:
+                        threshold = None
                     ok, msg = node.propose_upgrade(version, start_height, threshold)
                     return {"ok": ok, "msg": msg}
                 elif method == "emergencydisable":
@@ -507,7 +541,15 @@ class RPCServer:
                     return tx.to_dict() if tx else None
                 # ── Rich balance list ─────────────────────────────────────────
                 elif method == "getbalances":
-                    limit = min(int(params[0]) if params else 20, 500)
+                    if params:
+                        if isinstance(params[0], bool):
+                            raise ValueError("limit must be an integer >= 1")
+                        raw_limit = int(params[0])
+                        if raw_limit < 1:
+                            raise ValueError("limit must be >= 1")
+                        limit = min(raw_limit, 500)
+                    else:
+                        limit = 20
                     rows = node.storage._conn().execute(
                         "SELECT address, balance FROM balances "
                         "ORDER BY balance DESC LIMIT ?", (limit,)).fetchall()
@@ -631,11 +673,13 @@ class RPCServer:
 
                 elif method == "resetcircuitbreaker":
                     """
-                    Manually reset the circuit breaker (requires bearer token).
+                    Manually reset the circuit breaker (requires bearer + admin token).
                     Only callable after investigating the root cause of the trip.
                     No params required.
                     Returns: {"ok": bool, "msg": str}
                     """
+                    if not self._is_admin():
+                        raise PermissionError("admin token required for resetcircuitbreaker")
                     ok, msg = node.circuit_breaker.reset(authorized_by="rpc_operator")
                     return {"ok": ok, "msg": msg}
 
@@ -748,9 +792,21 @@ class RPCServer:
                         raise ValueError(
                             "deploycontract requires [bytecode_hex, gas_limit, gas_price]")
                     bytecode_hex = str(params[0])
+                    if isinstance(params[1], bool):
+                        raise ValueError("gas_limit must be a positive integer")
                     gas_limit    = int(params[1])
+                    if isinstance(params[2], bool):
+                        raise ValueError("gas_price must be a finite number")
                     gas_price    = float(params[2])
+                    if len(params) > 3 and isinstance(params[3], bool):
+                        raise ValueError("call_value must be a finite number")
                     call_value   = float(params[3]) if len(params) > 3 else 0.0
+                    if gas_limit <= 0:
+                        raise ValueError("gas_limit must be > 0")
+                    if not math.isfinite(gas_price) or gas_price < 0.0:
+                        raise ValueError("gas_price must be finite and >= 0")
+                    if not math.isfinite(call_value) or call_value < 0.0:
+                        raise ValueError("call_value must be finite and >= 0")
                     # Validate bytecode
                     try:
                         bytecode_bytes = bytes.fromhex(bytecode_hex)
@@ -761,15 +817,39 @@ class RPCServer:
                             f"Bytecode {len(bytecode_bytes)} bytes exceeds max "
                             f"{Config.VVM_MAX_BYTECODE_SIZE}")
                     # Build and sign transaction
-                    sender      = node.wallet.address
-                    chain_nonce = node.storage.get_nonce(sender)
-                    pending_cnt = len(node.blockchain.mempool._pending_nonces.get(sender, set()))
-                    nonce       = chain_nonce + pending_cnt
-                    fee         = round(gas_limit * gas_price, 8)
-                    # VSA-27: server-side spendability check including the gas budget.
-                    _reg, _xfer, _pfee = node.blockchain.mempool.pending_outflow_sat(sender)
+                    sender = node.wallet.address
+                    _mp = node.blockchain.mempool
+                    if hasattr(_mp, "next_nonce"):
+                        nonce = _mp.next_nonce(sender)
+                    else:
+                        _mp_lock = getattr(_mp, "_lock", None)
+                        if _mp_lock is not None:
+                            with _mp_lock:
+                                nonce = node.storage.get_nonce(sender)
+                                _pending = _mp._pending_nonces.get(sender)
+                                if _pending:
+                                    while nonce in _pending:
+                                        nonce += 1
+                        else:
+                            nonce = node.storage.get_nonce(sender)
+                            _pending = _mp._pending_nonces.get(sender)
+                            if _pending:
+                                while nonce in _pending:
+                                    nonce += 1
+                    fee = round(gas_limit * gas_price, 8)
+                    # VSA-27: server-side spendability check including stake lock and gas budget.
+                    _role = node.storage.get_role(sender) if hasattr(node.storage, "get_role") else None
+                    _stake_sat = (
+                        to_satoshi(float(_role.get("stake", 0.0)))
+                        if _role and _role.get("role") in ("miner", "investor")
+                        else 0
+                    )
+                    _reg, _xfer, _pfee = _mp.pending_outflow_sat(sender)
                     _required = to_satoshi(call_value) + gas_fee_to_sat(gas_limit, gas_price)
-                    _spendable = node.storage.get_balance_sat(sender) - _reg - _xfer - _pfee
+                    _spendable = (
+                        node.storage.get_balance_sat(sender)
+                        - _stake_sat - _reg - _xfer - _pfee
+                    )
                     if _spendable < _required:
                         raise ValueError(
                             f"insufficient spendable balance for the gas budget: need "
@@ -809,9 +889,21 @@ class RPCServer:
                             "gas_limit, gas_price]")
                     contract_addr = str(params[0])
                     calldata_hex  = str(params[1])
+                    if isinstance(params[2], bool):
+                        raise ValueError("gas_limit must be a positive integer")
                     gas_limit     = int(params[2])
+                    if isinstance(params[3], bool):
+                        raise ValueError("gas_price must be a finite number")
                     gas_price     = float(params[3])
+                    if len(params) > 4 and isinstance(params[4], bool):
+                        raise ValueError("call_value must be a finite number")
                     call_value    = float(params[4]) if len(params) > 4 else 0.0
+                    if gas_limit <= 0:
+                        raise ValueError("gas_limit must be > 0")
+                    if not math.isfinite(gas_price) or gas_price < 0.0:
+                        raise ValueError("gas_price must be finite and >= 0")
+                    if not math.isfinite(call_value) or call_value < 0.0:
+                        raise ValueError("call_value must be finite and >= 0")
                     # Validate contract
                     if not node.storage.get_contract(contract_addr):
                         raise ValueError(f"Contract {contract_addr} not found")
@@ -820,15 +912,39 @@ class RPCServer:
                             bytes.fromhex(calldata_hex)
                     except ValueError:
                         raise ValueError("calldata_hex is not valid hex")
-                    sender      = node.wallet.address
-                    chain_nonce = node.storage.get_nonce(sender)
-                    pending_cnt = len(node.blockchain.mempool._pending_nonces.get(sender, set()))
-                    nonce       = chain_nonce + pending_cnt
-                    fee         = round(gas_limit * gas_price, 8)
-                    # VSA-27: server-side spendability check including the gas budget.
-                    _reg, _xfer, _pfee = node.blockchain.mempool.pending_outflow_sat(sender)
+                    sender = node.wallet.address
+                    _mp = node.blockchain.mempool
+                    if hasattr(_mp, "next_nonce"):
+                        nonce = _mp.next_nonce(sender)
+                    else:
+                        _mp_lock = getattr(_mp, "_lock", None)
+                        if _mp_lock is not None:
+                            with _mp_lock:
+                                nonce = node.storage.get_nonce(sender)
+                                _pending = _mp._pending_nonces.get(sender)
+                                if _pending:
+                                    while nonce in _pending:
+                                        nonce += 1
+                        else:
+                            nonce = node.storage.get_nonce(sender)
+                            _pending = _mp._pending_nonces.get(sender)
+                            if _pending:
+                                while nonce in _pending:
+                                    nonce += 1
+                    fee = round(gas_limit * gas_price, 8)
+                    # VSA-27: server-side spendability check including stake lock and gas budget.
+                    _role = node.storage.get_role(sender) if hasattr(node.storage, "get_role") else None
+                    _stake_sat = (
+                        to_satoshi(float(_role.get("stake", 0.0)))
+                        if _role and _role.get("role") in ("miner", "investor")
+                        else 0
+                    )
+                    _reg, _xfer, _pfee = _mp.pending_outflow_sat(sender)
                     _required = to_satoshi(call_value) + gas_fee_to_sat(gas_limit, gas_price)
-                    _spendable = node.storage.get_balance_sat(sender) - _reg - _xfer - _pfee
+                    _spendable = (
+                        node.storage.get_balance_sat(sender)
+                        - _stake_sat - _reg - _xfer - _pfee
+                    )
                     if _spendable < _required:
                         raise ValueError(
                             f"insufficient spendable balance for the gas budget: need "
@@ -913,7 +1029,15 @@ class RPCServer:
                     Returns list of contract records.
                     SC-NAME-1: contract_name field included.
                     """
-                    limit = min(int(params[0]) if params else 20, 500)
+                    if params:
+                        if isinstance(params[0], bool):
+                            raise ValueError("limit must be an integer >= 1")
+                        raw_limit = int(params[0])
+                        if raw_limit < 1:
+                            raise ValueError("limit must be >= 1")
+                        limit = min(raw_limit, 500)
+                    else:
+                        limit = 20
                     rows = node.storage._conn().execute(
                         "SELECT address, code_hash, storage_root, creator, "
                         "created_at, nonce, contract_name "
@@ -948,9 +1072,18 @@ class RPCServer:
                             "simulatecall requires [contract_addr, calldata_hex, gas_limit]")
                     contract_addr = str(params[0])
                     calldata_hex  = str(params[1])
-                    gas_limit     = min(int(params[2]), Config.VVM_TX_GAS_CAP)
+                    if isinstance(params[2], bool):
+                        raise ValueError("gas_limit must be a positive integer")
+                    raw_gas_limit = int(params[2])
+                    if raw_gas_limit <= 0:
+                        raise ValueError("gas_limit must be > 0")
+                    gas_limit     = min(raw_gas_limit, Config.VVM_TX_GAS_CAP)
                     caller_addr   = str(params[3]) if len(params) > 3 else node.wallet.address
+                    if len(params) > 4 and isinstance(params[4], bool):
+                        raise ValueError("call_value must be a finite number")
                     call_value_f  = float(params[4]) if len(params) > 4 else 0.0
+                    if not math.isfinite(call_value_f) or call_value_f < 0.0:
+                        raise ValueError("call_value must be finite and >= 0")
 
                     if not node.storage.get_contract(contract_addr):
                         raise ValueError(f"Contract {contract_addr} not found")
@@ -994,7 +1127,11 @@ class RPCServer:
                     contract_addr = str(params[0])
                     calldata_hex  = str(params[1])
                     caller_addr   = str(params[2]) if len(params) > 2 else node.wallet.address
+                    if len(params) > 3 and isinstance(params[3], bool):
+                        raise ValueError("call_value must be a finite number")
                     call_value_f  = float(params[3]) if len(params) > 3 else 0.0
+                    if not math.isfinite(call_value_f) or call_value_f < 0.0:
+                        raise ValueError("call_value must be finite and >= 0")
 
                     calldata = bytes.fromhex(calldata_hex) if calldata_hex else b""
                     return node.blockchain.estimate_vvm_gas(
@@ -1050,6 +1187,8 @@ class RPCServer:
                     return shbs.get_action_log(n)
 
                 elif method == "shbs_unfreeze":
+                    if not self._is_admin():
+                        raise PermissionError("admin token required for shbs_unfreeze")
                     shbs = getattr(node, 'shbs', None)
                     if shbs is None:
                         raise ValueError("SHBS not initialized")
@@ -1442,7 +1581,7 @@ class RPCServer:
             self._thread.start()
             log.info(
                 f"JSON-RPC server on 127.0.0.1:{self.rpc_port} "
-                f"(threaded, token auth — see {self.TOKEN_FILE})")
+                f"(threaded, token auth — see {self._get_token_file()})")
         except Exception as e:
             log.warning(f"RPC server failed to start: {e}")
 

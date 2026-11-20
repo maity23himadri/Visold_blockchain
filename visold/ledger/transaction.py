@@ -41,8 +41,12 @@ from visold.crypto.ecc import (
 )
 from visold.crypto.hashing import sha256
 from visold.kernel.config import Config
-from visold.kernel.units import VSD_GLOBAL_MARKET, gas_fee_to_sat, to_satoshi
-from visold.ledger.addressing import is_valid_protocol_address
+from visold.kernel.units import (
+    VSD_GLOBAL_MARKET, from_satoshi, gas_fee_to_sat, to_satoshi,
+)
+from visold.ledger.addressing import (
+    is_canonical_contract_address, is_valid_protocol_address,
+)
 from visold.rollup.batches import RollupSubmission
 from visold.rollup.l2_state import L2_BRIDGE_ADDRESS, L2_WITHDRAW_ADDRESS
 from visold.vm.naming import normalize_contract_name, validate_contract_name
@@ -111,6 +115,9 @@ def parse_mev_reveal_data(data):
     return salt, int(height_text), steps
 
 
+_UNSET = object()
+
+
 class Transaction:
     VERSION = 1
 
@@ -175,43 +182,91 @@ class Transaction:
     TYPE_ROLLUP   = "rollup"
 
     def __init__(self, sender: str, receiver: str, amount: float,
-                 fee: float = 0.0, timestamp: int = 0,
+                 fee: float = 0.0, timestamp: int = _UNSET,
                  pub_hex: str = "", sig_hex: str = "",
                  tx_id: str = "", memo: str = "",
-                 nonce: int = 0, expiry: int = 0,
+                 nonce: int = 0, expiry: int = _UNSET,
                  # ── VVM extension fields ─────────────────────────────────────
-                 tx_type: str = "",        # "transfer" | "deploy" | "call"
+                 tx_type: str = _UNSET,    # "transfer" | "deploy" | "call"
                  data: str = "",           # hex-encoded bytecode (deploy) or calldata (call)
                  gas_limit: int = 0,       # gas budget for VVM execution
                  gas_price: float = 0.0,   # VSD per gas unit
                  # SC-NAME-1: optional human-readable contract name (deploy only)
                  contract_name: str = "",
+                 version: int = VERSION,
+                 *,
+                 _deserializing: bool = False,
                  ):
-        self.version   = self.VERSION
+        self.version   = version
         self.sender    = sender
         self.receiver  = receiver
-        self.amount    = round(amount, 8)
-        self.fee       = round(fee, 8)
-        self.timestamp = timestamp or int(time.time())
+
+        def _safe_round8(val):
+            try:
+                f = float(val)
+                if math.isfinite(f):
+                    return round(f, 8)
+                return f
+            except (TypeError, ValueError, OverflowError):
+                return val
+
+        self.amount    = _safe_round8(amount)
+        self.fee       = _safe_round8(fee)
+        if _deserializing:
+            self.timestamp = timestamp
+        else:
+            self.timestamp = int(time.time()) if timestamp is _UNSET else timestamp
         self.pub_hex   = pub_hex
         self.sig_hex   = sig_hex
-        self.memo      = memo[:128]
+        self.memo      = memo if _deserializing else (memo[:128] if isinstance(memo, str) else memo)
         # Nonce: monotonically increasing per sender (replay protection + ordering)
         self.nonce     = nonce
-        # Expiry: Unix timestamp after which tx is invalid (0 = no expiry, use default)
-        if expiry == 0 and sender != "COINBASE":
-            self.expiry = self.timestamp + Config.TX_DEFAULT_EXPIRY_SECS
+        # Expiry: Unix timestamp after which tx is invalid (0 = no expiry)
+        if _deserializing:
+            self.expiry = expiry
+        elif expiry is _UNSET:
+            if (sender not in ("COINBASE", Config.GENESIS_TX_SENDER)
+                    and isinstance(self.timestamp, int)
+                    and not isinstance(self.timestamp, bool)):
+                self.expiry = self.timestamp + Config.TX_DEFAULT_EXPIRY_SECS
+            else:
+                self.expiry = 0
         else:
             self.expiry = expiry
-        # VVM fields — default to "transfer" type for backwards compatibility
-        self.tx_type   = tx_type or self.TYPE_TRANSFER
+        # VVM fields — default to "transfer" only when omitted
+        self.tx_type   = self.TYPE_TRANSFER if tx_type is _UNSET else tx_type
         self.data      = data          # hex string, may be ""
-        self.gas_limit = max(0, int(gas_limit))
-        self.gas_price = max(0.0, float(gas_price))
+        try:
+            if isinstance(gas_limit, bool):
+                self.gas_limit = gas_limit
+            else:
+                gl_f = float(gas_limit)
+                if math.isfinite(gl_f) and isinstance(gas_limit, (int, float)):
+                    self.gas_limit = max(0, int(gas_limit))
+                else:
+                    self.gas_limit = gas_limit
+        except (TypeError, ValueError, OverflowError):
+            self.gas_limit = gas_limit
+
+        try:
+            if isinstance(gas_price, bool):
+                self.gas_price = gas_price
+            else:
+                gp = float(gas_price)
+                if math.isfinite(gp):
+                    self.gas_price = round(max(0.0, gp), 8) if gp >= 0.0 else round(gp, 8)
+                else:
+                    self.gas_price = gp
+        except (TypeError, ValueError, OverflowError):
+            self.gas_price = gas_price
+
         # SC-NAME-1: normalise at the boundary so every downstream path sees
         # the canonical form.  Empty string = unnamed / non-deploy tx.
-        self.contract_name = normalize_contract_name(contract_name)
-        if tx_id:
+        self.contract_name = (
+            contract_name if _deserializing
+            else (normalize_contract_name(contract_name) if isinstance(contract_name, str) else contract_name)
+        )
+        if tx_id or _deserializing:
             self.tx_id = tx_id
         else:
             # Keep object construction permissive enough for validation tests
@@ -219,7 +274,7 @@ class Transaction:
             # must be rejected by is_valid(), not crash object construction.
             try:
                 self.tx_id = self._compute_id()
-            except (TypeError, ValueError, OverflowError):
+            except (TypeError, ValueError, OverflowError, AttributeError):
                 self.tx_id = ""
 
     @staticmethod
@@ -272,7 +327,7 @@ class Transaction:
             ("nonce", _int_text(self.nonce)),
             ("expiry", _int_text(self.expiry)),
             ("tx_type", str(self.tx_type)),
-            ("data_hash", sha256(self.data.encode()) if self.data else ""),
+            ("data_hash", sha256(self.data.encode()) if (isinstance(self.data, str) and self.data) else (f"invalid:{type(self.data).__name__}" if self.data else "")),
             ("gas_limit", _int_text(self.gas_limit)),
             ("gas_price_sat", gas_price_sat),
             ("contract_name", str(self.contract_name)),
@@ -295,9 +350,9 @@ class Transaction:
         old_v1_allowed = bool(getattr(Config, "TXID_V1_LEGACY_ENABLED", False))
         if (old_v1_allowed and old_activation > 0 and
                 block_height < old_activation):
-            data_component = self.data[:64]
+            data_component = self.data[:64] if isinstance(self.data, str) else ""
         else:
-            data_component = sha256(self.data.encode()) if self.data else ""
+            data_component = sha256(self.data.encode()) if (isinstance(self.data, str) and self.data) else ""
         core = (f"{self.sender}{self.receiver}{self.amount}{self.fee}"
                 f"{self.timestamp}{self.memo}{self.nonce}{self.expiry}"
                 f"{self.tx_type}{data_component}{self.gas_limit}{self.gas_price}"
@@ -317,7 +372,7 @@ class Transaction:
 
     def _legacy_signing_bytes(self) -> bytes:
         """Return the pre-canonical signing payload for historical replay only."""
-        data_hash = sha256(self.data.encode()) if self.data else ""
+        data_hash = sha256(self.data.encode()) if (isinstance(self.data, str) and self.data) else ""
         d = (f"{Config.CHAIN_ID}{self.version}{self.sender}{self.receiver}{self.amount}"
              f"{self.fee}{self.timestamp}{self.memo}{self.nonce}{self.expiry}"
              f"{self.tx_type}{self.gas_limit}{self.gas_price}{data_hash}"
@@ -343,7 +398,8 @@ class Transaction:
 
     def verify_signature(self, block_height: int = -1) -> bool:
         if self.sender == "COINBASE":
-            return True
+            return (self.tx_type == self.TYPE_TRANSFER
+                    and not str(self.data).startswith(Config.MEV_COMMIT_PREFIX))
         try:
             pub = pub_from_hex(self.pub_hex)
             # SENDER-BINDING FIX: an ECDSA signature only proves that the signer
@@ -381,12 +437,47 @@ class Transaction:
         replay remains deterministic: a transaction valid when mined must not
         become invalid merely because a node syncs the block later.
         """
-        if self.sender == "COINBASE" or self.expiry == 0:
+        if self.sender == "COINBASE":
+            return False
+        if isinstance(self.expiry, bool) or not isinstance(self.expiry, (int, float)):
+            return True
+        if isinstance(self.expiry, float) and not math.isfinite(self.expiry):
+            return True
+        exp = int(self.expiry)
+        if exp < 0:
+            return True
+        if exp == 0:
             return False
         now = int(time.time()) if reference_time is None else int(reference_time)
-        return now > self.expiry
+        return now > exp
 
     def is_valid(self, reference_time: Optional[float] = None,
+                 block_height: int = -1,
+                 signature_already_verified: bool = False) -> Tuple[bool, str]:
+        ok, msg = self._is_valid_body(
+            reference_time=reference_time,
+            block_height=block_height,
+            signature_already_verified=signature_already_verified,
+        )
+        if not ok:
+            return False, msg
+        expected_id = self._compute_id(block_height=block_height)
+        if self.tx_id != expected_id:
+            activation = int(getattr(
+                Config, "TXID_CANONICAL_V3_ACTIVATION_HEIGHT", 0))
+            legacy_allowed = bool(getattr(
+                Config, "TXID_CANONICAL_V2_LEGACY_ENABLED", False))
+            legacy_id = (
+                self._compute_legacy_id(block_height)
+                if (legacy_allowed and activation > 0
+                    and 0 <= block_height < activation)
+                else ""
+            )
+            if not legacy_id or self.tx_id != legacy_id:
+                return False, "Invalid tx_id: does not match canonical transaction hash"
+        return True, "OK"
+
+    def _is_valid_body(self, reference_time: Optional[float] = None,
                  block_height: int = -1,
                  signature_already_verified: bool = False) -> Tuple[bool, str]:
         """Validate transaction consensus fields.
@@ -398,12 +489,32 @@ class Transaction:
         verified set after tx_id integrity was checked).  Normal callers keep
         the default ``False`` so signature verification remains mandatory.
         """
+        if isinstance(self.version, bool) or not isinstance(self.version, int) or self.version != self.VERSION:
+            return False, f"Unsupported transaction version: {self.version!r}"
+
+        for _sfield, _sval in (("sender", self.sender), ("receiver", self.receiver),
+                               ("memo", self.memo), ("data", self.data),
+                               ("tx_id", self.tx_id), ("pub_hex", self.pub_hex),
+                               ("sig_hex", self.sig_hex)):
+            if not isinstance(_sval, str):
+                return False, f"{_sfield} must be a string"
+
+        _MAX_CONSENSUS_SAT = 2**63 - 1
+        for _ifield, _ival in (("timestamp", self.timestamp), ("nonce", self.nonce),
+                               ("expiry", self.expiry), ("gas_limit", self.gas_limit)):
+            if isinstance(_ival, bool) or not isinstance(_ival, int):
+                return False, f"{_ifield} must be an integer"
+            if _ival < 0 or _ival > _MAX_CONSENSUS_SAT:
+                return False, f"{_ifield} out of consensus range"
+
         # JSON/Python permit non-finite IEEE-754 values such as NaN and inf.
         # They must never enter consensus arithmetic because comparisons with
         # NaN are false and can therefore bypass ordinary range checks.
         for _field, _value in (("amount", self.amount),
                                ("fee", self.fee),
                                ("gas_price", self.gas_price)):
+            if isinstance(_value, bool):
+                return False, f"{_field} must be a finite number"
             try:
                 if not math.isfinite(float(_value)):
                     return False, f"{_field} must be finite"
@@ -413,7 +524,6 @@ class Transaction:
         # BUG-8: finite is not sufficient.  Conversion to satoshi must also
         # fit the signed 64-bit storage/consensus domain; otherwise a finite
         # Python float such as 1e301 raises in to_satoshi() later.
-        _MAX_CONSENSUS_SAT = 2**63 - 1
         for _field, _value in (("amount", self.amount), ("fee", self.fee),
                                ("gas_price", self.gas_price)):
             try:
@@ -422,6 +532,13 @@ class Transaction:
                     return False, f"{_field} exceeds consensus numeric range"
             except (TypeError, ValueError, OverflowError):
                 return False, f"{_field} exceeds consensus numeric range"
+
+        if self.fee < 0:
+            return False, "Fee cannot be negative"
+        if to_satoshi(self.amount) + max(to_satoshi(self.fee), self.compute_fee_sat()) > _MAX_CONSENSUS_SAT:
+            return False, "Total debit exceeds consensus numeric range"
+        if self.gas_price < 0:
+            return False, "gas_price cannot be negative"
 
         # Transaction type is consensus data.  Unknown values must fail closed;
         # otherwise an unsupported future type would silently fall through into
@@ -435,10 +552,15 @@ class Transaction:
         if self.tx_type not in _known_types:
             return False, f"Unknown transaction type: {self.tx_type!r}"
 
+        if not self.tx_id:
+            return False, "Invalid tx_id: must be a non-empty string"
+
         # ── VVM transaction types — special validation ─────────────────────────
         if self.tx_type == self.TYPE_DEPLOY:
             if self.sender == "COINBASE":
                 return False, "COINBASE cannot deploy contracts"
+            if self.receiver:
+                return False, "Deploy transaction receiver must be empty"
             if not self.data:
                 return False, "Deploy transaction requires bytecode in 'data' field"
             try:
@@ -473,6 +595,10 @@ class Transaction:
             # front-line check).
             if self.amount < 0:
                 return False, "Deploy call value cannot be negative"
+            if to_satoshi(self.amount) + gas_fee_to_sat(self.gas_limit, self.gas_price) > _MAX_CONSENSUS_SAT:
+                return False, "Deploy total debit exceeds consensus numeric range"
+            if to_satoshi(self.fee) > gas_fee_to_sat(self.gas_limit, self.gas_price):
+                return False, "VVM transaction fee cannot exceed gas budget"
             # BUG-FIX: TYPE_DEPLOY was missing the expiry check that TYPE_CALL
             # already had.  Without this, expired deploy transactions could
             # remain valid in the mempool indefinitely.
@@ -494,8 +620,8 @@ class Transaction:
         if self.tx_type == self.TYPE_CALL:
             if self.sender == "COINBASE":
                 return False, "COINBASE cannot call contracts"
-            if not self.receiver or not self.receiver.startswith("VSDc"):
-                return False, "Call transaction receiver must be a contract address (VSDc...)"
+            if not isinstance(self.receiver, str) or not is_canonical_contract_address(self.receiver):
+                return False, "Call transaction receiver must be a canonical contract address (VSDc...)"
             # data may be empty (fallback receive function)
             if self.data:
                 try:
@@ -517,6 +643,10 @@ class Transaction:
                 return False, "Call gas fee exceeds consensus numeric range"
             if self.amount < 0:
                 return False, "Call value cannot be negative"
+            if to_satoshi(self.amount) + gas_fee_to_sat(self.gas_limit, self.gas_price) > _MAX_CONSENSUS_SAT:
+                return False, "Call total debit exceeds consensus numeric range"
+            if to_satoshi(self.fee) > gas_fee_to_sat(self.gas_limit, self.gas_price):
+                return False, "VVM transaction fee cannot exceed gas budget"
             if self.is_expired(reference_time):
                 return False, f"Transaction expired at {self.expiry}"
             if not self.pub_hex or not self.sig_hex:
@@ -537,8 +667,13 @@ class Transaction:
             if self.sender == "COINBASE":
                 return False, "COINBASE cannot submit rollups"
             if self.receiver != L2_BRIDGE_ADDRESS:
+                _recv_preview = (
+                    self.receiver[:16]
+                    if isinstance(self.receiver, str)
+                    else repr(self.receiver)[:16]
+                )
                 return False, (f"TYPE_ROLLUP receiver must be "
-                               f"L2_BRIDGE_ADDRESS, got {self.receiver[:16]}")
+                               f"L2_BRIDGE_ADDRESS, got {_recv_preview}")
             if to_satoshi(self.amount) != 0:
                 return False, "TYPE_ROLLUP amount must be 0"
             if to_satoshi(self.fee) != 0:
@@ -614,6 +749,8 @@ class Transaction:
         # role registration. Malformed identity claims and unknown role memos
         # must fail closed instead of reaching apply-time fallback-to-unstake.
         if self.tx_type == self.TYPE_REGISTER:
+            if self.sender == "COINBASE":
+                return False, "COINBASE cannot register a role"
             _memo = str(self.memo or "").strip().lower()
             if _memo.startswith(self.IDENTITY_MEMO_PREFIX):
                 return False, "Malformed identity claim memo"
@@ -702,7 +839,7 @@ class Transaction:
                       + b"|" + salt_hex.encode("utf-8"))
 
     def compute_fee(self) -> float:
-        return round(self.amount * Config.TX_FEE_RATE, 8)
+        return from_satoshi(self.compute_fee_sat())
 
     def compute_fee_sat(self) -> int:
         """Fee in satoshi — deterministic integer arithmetic (F-01 COMPLETION).
@@ -712,6 +849,10 @@ class Transaction:
         where TX_FEE_RATE is 0.01 = 100 basis points.
         This avoids float multiplication of (amount * rate) which can diverge.
         """
+        if self.sender == "COINBASE" or self.tx_type == self.TYPE_ROLLUP:
+            return 0
+        if self.tx_type in (self.TYPE_DEPLOY, self.TYPE_CALL):
+            return gas_fee_to_sat(int(self.gas_limit), float(self.gas_price))
         if self.tx_type == self.TYPE_TRANSFER and str(self.data).startswith(Config.MEV_COMMIT_PREFIX):
             # MEV commitments pay a fixed fee: their amount is zero.
             return int(getattr(Config, "MIN_TX_FEE_SAT", 1000))
@@ -750,6 +891,11 @@ class Transaction:
 
     @classmethod
     def from_dict(cls, d: dict) -> 'Transaction':
+        if not isinstance(d, dict):
+            raise ValueError("transaction payload must be an object")
+        for req in ("sender", "receiver", "amount"):
+            if req not in d:
+                raise ValueError(f"transaction payload missing required field: {req}")
         return cls(
             sender    = d["sender"],
             receiver  = d["receiver"],
@@ -762,13 +908,15 @@ class Transaction:
             memo      = d.get("memo", ""),
             nonce     = d.get("nonce", 0),
             expiry    = d.get("expiry", 0),
-            # VVM fields — default to legacy "transfer" when absent (backwards compat)
-            tx_type   = d.get("tx_type", cls.TYPE_TRANSFER),
+            # VVM fields — default to legacy "transfer" only when key is absent
+            tx_type   = d["tx_type"] if "tx_type" in d else cls.TYPE_TRANSFER,
             data      = d.get("data", ""),
             gas_limit = d.get("gas_limit", 0),
             gas_price = d.get("gas_price", 0.0),
             # SC-NAME-1: default "" keeps old serialised txs valid
             contract_name = d.get("contract_name", ""),
+            version   = d.get("version", cls.VERSION),
+            _deserializing = True,
         )
 
     @classmethod

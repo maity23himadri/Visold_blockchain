@@ -56,23 +56,23 @@ class LRUCache:
     # ── Internal helpers (must be called with _lock held) ─────────────────────
 
     def _is_expired(self, ts: float) -> bool:
-        return self.ttl > 0 and (time.time() - ts) > self.ttl
+        return self.ttl > 0 and (time.monotonic() - ts) > self.ttl
 
     def _sweep_expired(self, max_scan: int = 64):
-        """Delete up to max_scan expired entries in insertion order.
+        """Scan up to max_scan oldest entries and delete any that are expired.
 
         Called from put() to prevent the cache from filling with stale entries
         that are never accessed (and therefore never cleaned by get()).  Scanning
         a small fixed batch keeps the amortised cost O(1) per put() call.
         """
-        if self.ttl <= 0:
+        if self.ttl <= 0 or max_scan <= 0:
             return
         to_delete = []
-        for k, (_, ts) in self._cache.items():
-            if len(to_delete) >= max_scan:
-                break
+        for scanned, (k, (_, ts)) in enumerate(self._cache.items(), 1):
             if self._is_expired(ts):
                 to_delete.append(k)
+            if scanned >= max_scan:
+                break
         for k in to_delete:
             del self._cache[k]
 
@@ -94,7 +94,7 @@ class LRUCache:
 
     def put(self, key, value):
         with self._lock:
-            now = time.time()
+            now = time.monotonic()
             if key in self._cache:
                 self._cache.move_to_end(key)
             self._cache[key] = (value, now)

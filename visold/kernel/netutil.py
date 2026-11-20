@@ -92,7 +92,7 @@ def _normalize_ip(ip: str) -> str:
     if not ip:
         return ip
     # strip IPv4-mapped prefix
-    if ip.startswith("::ffff:") or ip.startswith("::FFFF:"):
+    if ip[:7].lower() == "::ffff:":
         candidate = ip[7:]
         try:
             socket.inet_pton(socket.AF_INET, candidate)
@@ -102,7 +102,8 @@ def _normalize_ip(ip: str) -> str:
     return ip
 
 
-def _write_node_status(p2p_port: int, rpc_port: int, relay_port: int) -> None:
+def _write_node_status(p2p_port: int, rpc_port: int, relay_port: int,
+                       path: Optional[str] = None) -> None:
     """
     Write a small JSON file (.node_status.json) to DATA_DIR so that the
     Explorer and other tools can always find the node's live ports — even
@@ -123,7 +124,8 @@ def _write_node_status(p2p_port: int, rpc_port: int, relay_port: int) -> None:
         "rpc_port":   rpc_port,
         "relay_port": relay_port,
     }
-    path = Config.NODE_STATUS_FILE
+    if path is None:
+        path = Config.NODE_STATUS_FILE
     if not path:
         return
     try:
@@ -142,12 +144,25 @@ def _create_dual_stack_server_socket(port: int,
     """
     Create a TCP server socket that accepts BOTH IPv4 and IPv6 connections.
 
-    On Linux/macOS a single AF_INET6 socket with IPV6_V6ONLY=0 handles both
-    protocol families.  On Windows IPV6_V6ONLY defaults to 0 already.
-    Falls back to AF_INET if AF_INET6 is unavailable (rare, old kernels).
+    When an explicit IPv4 literal is requested in ``bind_addr``, create an
+    AF_INET socket so ``srv.bind((bind_addr, port))`` succeeds.  Otherwise,
+    on Linux/macOS a single AF_INET6 socket with IPV6_V6ONLY=0 handles both
+    protocol families, falling back to AF_INET if AF_INET6 is unavailable.
     """
     if bind_addr is None:
         bind_addr = Config.BIND_ADDRESS
+    addr_str = str(bind_addr or "").strip()
+    is_ipv4_literal = False
+    if addr_str:
+        try:
+            socket.inet_pton(socket.AF_INET, addr_str)
+            is_ipv4_literal = True
+        except (OSError, socket.error):
+            is_ipv4_literal = False
+    if is_ipv4_literal:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return srv
     try:
         srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
         # IPV6_V6ONLY = 0  →  also accept IPv4-mapped connections (::ffff:x.x.x.x)

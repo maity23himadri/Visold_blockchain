@@ -9,7 +9,15 @@ import json
 import time
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from visold.crypto.ecc import ecdsa_verify, pub_from_hex, pub_to_address, sig_from_hex, sig_to_hex
+from visold.crypto.ecc import (
+    ECPoint,
+    ecdsa_verify,
+    pub_from_hex,
+    pub_to_address,
+    pub_to_hex,
+    sig_from_hex,
+    sig_to_hex,
+)
 from visold.crypto.hashing import sha256
 from visold.kernel.config import Config
 from visold.kernel.logging_setup import log
@@ -20,6 +28,20 @@ from visold.network.spv import SPVClient
 
 _RECEIPT_DOMAIN = "VSD-VARR-RECEIPT-V1"
 _ACK_DOMAIN = "VSD-VARR-ACK-V1"
+_EXPECTED_RECEIPT_KEYS = frozenset({
+    "domain",
+    "version",
+    "chain_id",
+    "block_height",
+    "block_hash",
+    "merkle_root",
+    "tx_id",
+    "signed_fields",
+    "pub_hex",
+    "sig_hex",
+    "merkle_proof",
+    "receipt_id",
+})
 
 
 def _canonical_json(obj: dict) -> bytes:
@@ -130,21 +152,26 @@ class ReceiptRelayManager:
         try:
             if not isinstance(receipt, dict):
                 return False, "receipt is not an object"
+            if frozenset(receipt.keys()) != _EXPECTED_RECEIPT_KEYS:
+                return False, "unexpected or missing receipt fields"
             if len(_canonical_json(receipt)) > int(Config.RECEIPT_MAX_BYTES):
                 return False, "receipt exceeds size limit"
-            if receipt.get("domain") != _RECEIPT_DOMAIN or receipt.get("version") != 1:
+            if (receipt.get("domain") != _RECEIPT_DOMAIN
+                    or type(receipt.get("version")) is not int
+                    or receipt.get("version") != 1):
                 return False, "unsupported receipt domain/version"
-            if str(receipt.get("chain_id", "")) != str(Config.CHAIN_ID):
+            chain_id = receipt.get("chain_id")
+            if not isinstance(chain_id, str) or chain_id != str(Config.CHAIN_ID):
                 return False, "wrong chain_id"
             rid = receipt.get("receipt_id", "")
-            if not _is_hex(rid, 64):
+            if not _is_hex(rid, 64) or rid != rid.lower():
                 return False, "invalid receipt_id"
             without_id = dict(receipt)
             without_id.pop("receipt_id", None)
             if sha256(_canonical_json(without_id)) != rid:
                 return False, "receipt_id mismatch"
             txid = receipt.get("tx_id", "")
-            if not _is_hex(txid, 64):
+            if not _is_hex(txid, 64) or txid != txid.lower():
                 return False, "invalid tx_id"
             fields = self._signed_fields_tuple(receipt)
             if fields is None:
@@ -161,22 +188,46 @@ class ReceiptRelayManager:
                 return False, "tx_id does not match signed fields"
             pub_hex = receipt.get("pub_hex", "")
             sig_hex = receipt.get("sig_hex", "")
+            if not isinstance(pub_hex, str) or not isinstance(sig_hex, str):
+                return False, "pub_hex and sig_hex must be strings"
             pub = pub_from_hex(pub_hex)
+            if pub_hex != pub_to_hex(pub):
+                return False, "non-canonical pub_hex"
             if pub_to_address(pub) != fmap.get("sender"):
                 return False, "sender/pubkey binding mismatch"
             sig = sig_from_hex(sig_hex)
+            _r_sig, s_sig = sig
+            if not (1 <= s_sig <= ECPoint.N // 2):
+                return False, "non-canonical high-S signature"
+            if sig_hex != sig_to_hex(sig):
+                return False, "non-canonical sig_hex"
             if not ecdsa_verify(pub, hashlib.sha256(preimage).digest(), sig):
                 return False, "invalid transaction signature"
-            height = int(receipt.get("block_height", -1))
-            if height < 0:
+            raw_height = receipt.get("block_height")
+            if type(raw_height) is not int or raw_height < 0:
                 return False, "invalid block height"
+            height = raw_height
             block_hash = receipt.get("block_hash", "")
             merkle_root = receipt.get("merkle_root", "")
-            if not (_is_hex(block_hash, 64) and _is_hex(merkle_root, 64)):
+            if not (_is_hex(block_hash, 64) and block_hash == block_hash.lower()
+                    and _is_hex(merkle_root, 64) and merkle_root == merkle_root.lower()):
                 return False, "invalid block commitment"
             proof = receipt.get("merkle_proof")
             if not isinstance(proof, list) or len(proof) > 64:
                 return False, "invalid Merkle proof"
+            for step in proof:
+                if not isinstance(step, dict) or set(step.keys()) != {"hash", "side"}:
+                    return False, "malformed Merkle proof step"
+                side = step["side"]
+                shash = step["hash"]
+                if side == "ODD":
+                    if shash != "":
+                        return False, "malformed ODD Merkle proof step"
+                elif side in ("L", "R"):
+                    if not (_is_hex(shash, 64) and shash == shash.lower()):
+                        return False, "malformed Merkle proof sibling hash"
+                else:
+                    return False, "unknown Merkle proof step side"
             if not SPVClient.verify_merkle_proof(txid, proof, merkle_root):
                 return False, "Merkle proof mismatch"
             if require_canonical:
@@ -227,6 +278,12 @@ class ReceiptRelayManager:
         try:
             with self.storage._aux_lock:
                 c = self._conn()
+                acked = c.execute(
+                    "SELECT 1 FROM relay_receipt_acks WHERE receipt_id=? AND receiver=? LIMIT 1",
+                    (summary["receipt_id"], summary["receiver"]),
+                ).fetchone()
+                if acked is not None:
+                    return False, "receipt already acknowledged"
                 c.execute(
                     """INSERT OR IGNORE INTO relay_receipts
                        (receipt_id,receiver,slot,block_height,block_hash,receipt_json,stored_at,delivered_at)
@@ -421,13 +478,17 @@ class ReceiptRelayManager:
     @staticmethod
     def verify_ack(ack: dict) -> Tuple[bool, str]:
         try:
-            if not isinstance(ack, dict) or ack.get("domain") != _ACK_DOMAIN or ack.get("version") != 1:
+            if (not isinstance(ack, dict)
+                    or ack.get("domain") != _ACK_DOMAIN
+                    or type(ack.get("version")) is not int
+                    or ack.get("version") != 1):
                 return False, "bad ACK domain/version"
-            if str(ack.get("chain_id", "")) != str(Config.CHAIN_ID):
+            if not isinstance(ack.get("chain_id"), str) or ack.get("chain_id") != str(Config.CHAIN_ID):
                 return False, "wrong ACK chain"
-            receiver = str(ack.get("receiver", ""))
-            rid = str(ack.get("receipt_id", ""))
-            if not receiver or not _is_hex(rid,64):
+            receiver = ack.get("receiver")
+            rid = ack.get("receipt_id")
+            if (not isinstance(receiver, str) or not receiver
+                    or not _is_hex(rid, 64) or rid != rid.lower()):
                 return False, "bad ACK receiver/receipt_id"
             pub = pub_from_hex(str(ack.get("pub_hex", "")))
             if pub_to_address(pub) != receiver:
@@ -447,23 +508,21 @@ class ReceiptRelayManager:
         rid=str(ack["receipt_id"]); receiver=str(ack["receiver"]); now=int(time.time())
         try:
             with self.storage._aux_lock:
-                c=self._conn()
+                c = self._conn()
+                c.execute(
+                    """INSERT OR IGNORE INTO relay_receipt_acks
+                       (receipt_id,receiver,ack_json,acked_at) VALUES (?,?,?,?)""",
+                    (rid, receiver, _canonical_json(ack).decode("utf-8"), now))
                 # ACK only authorizes deletion of receipts actually addressed to
                 # the signing receiver.  A valid signature for another wallet
                 # cannot delete this mailbox's data.
-                row=c.execute(
-                    "SELECT 1 FROM relay_receipts WHERE receipt_id=? AND receiver=? LIMIT 1",
-                    (rid,receiver)).fetchone()
-                if row is None:
-                    return True, "ACK valid; receipt not held here"
-                c.execute(
-                    """INSERT OR REPLACE INTO relay_receipt_acks
-                       (receipt_id,receiver,ack_json,acked_at) VALUES (?,?,?,?)""",
-                    (rid,receiver,_canonical_json(ack).decode("utf-8"),now))
-                c.execute(
+                cur = c.execute(
                     "UPDATE relay_receipts SET delivered_at=? WHERE receipt_id=? AND receiver=?",
-                    (now,rid,receiver))
+                    (now, rid, receiver))
                 c.commit()
+                held = (cur.rowcount or 0) > 0
+            if not held:
+                return True, "ACK recorded; receipt not held here"
             return True, "ACK accepted"
         except Exception as exc:
             return False, f"ACK persistence error: {exc}"

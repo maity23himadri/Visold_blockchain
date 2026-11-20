@@ -26,6 +26,7 @@ Origin: visold_vsd_.py L25065-25066, L25069-25119, L25122-25180, L25183-25227
 import json
 import os
 import threading
+from typing import Iterable, Optional
 
 from visold.kernel.logging_setup import log
 from visold.kernel.units import from_satoshi
@@ -90,14 +91,24 @@ _LOCAL_LEDGER_LOCK = threading.Lock()   # serialises concurrent daemon writes
 _LOCAL_LEDGER_INVALIDATED_BLOCKS: set[str] = set()
 
 
-def _ledger_collect_entries(block, owner_address: str) -> list:
+def _ledger_collect_entries(
+    block,
+    owner_address: str,
+    skipped_rollup_tx_ids: Optional[Iterable[str]] = None,
+) -> list:
     """Pure extraction step — no I/O.  Returns a list of dicts for every
     L1 and L2 transaction in *block* that involves *owner_address*.
+
+    ``skipped_rollup_tx_ids`` lists L1 ``tx_id`` values of ``TYPE_ROLLUP``
+    transactions that were skipped by ``_apply_rollup_tx()`` during block
+    application; their L2 payloads were never executed on ``Layer2State`` and
+    must not be archived as confirmed L2 history.
 
     Kept separate from the write step so it can be unit-tested without
     touching the filesystem.
     """
     owner = owner_address.strip()
+    skipped_set: set[str] = {str(x) for x in (skipped_rollup_tx_ids or ()) if x}
     collected: list = []
 
     # ── L1 transactions ──────────────────────────────────────────────────────
@@ -116,9 +127,11 @@ def _ledger_collect_entries(block, owner_address: str) -> list:
                 "Counterparty_Address": counterparty,
             })
 
-    # ── L2 transactions packed inside TYPE_ROLLUP submissions ────────────────
+    # ── L2 transactions packed inside applied TYPE_ROLLUP submissions ────────
     for tx in getattr(block, "transactions", ()):
         if getattr(tx, "tx_type", "") != "rollup":
+            continue
+        if skipped_set and str(getattr(tx, "tx_id", "") or "") in skipped_set:
             continue
         try:
             submission = RollupSubmission.from_json(tx.data or "")
@@ -252,7 +265,11 @@ def invalidate_local_ledger_block(block_data) -> None:
                     block_index, exc)
 
 
-def sync_local_ledger(block_data, owner_address: str) -> None:
+def sync_local_ledger(
+    block_data,
+    owner_address: str,
+    skipped_rollup_tx_ids: Optional[Iterable[str]] = None,
+) -> None:
     """Archive all transactions involving *owner_address* from *block_data*
     into ``vsd_personal_ledger.json`` before the block is pruned.
 
@@ -262,15 +279,11 @@ def sync_local_ledger(block_data, owner_address: str) -> None:
 
     Parameters
     ──────────
-    block_data    : Block  — the Block object about to be pruned / processed.
-    owner_address : str    — the VSD address whose transactions to archive
-                             (checked as both sender and receiver).
-
-    Call site (inside your main block-loop, just before prune_async):
-
-        OWNER_ADDRESS = "VSD<your_address>"
-        sync_local_ledger(block, OWNER_ADDRESS)
-        self._rolling_pruner.prune_async(block.index)
+    block_data            : Block  — the Block object about to be pruned / processed.
+    owner_address         : str    — the VSD address whose transactions to archive
+                                     (checked as both sender and receiver).
+    skipped_rollup_tx_ids : Optional[Iterable[str]] — L1 tx_ids of TYPE_ROLLUP
+                                     transactions skipped during block application.
     """
     if not owner_address or not owner_address.strip():
         return   # no owner configured — silently skip
@@ -280,7 +293,9 @@ def sync_local_ledger(block_data, owner_address: str) -> None:
         # the apply_block thread.  This keeps the daemon thread's work minimal
         # (just file I/O) and avoids passing the entire Block object across
         # thread boundaries.
-        new_entries = _ledger_collect_entries(block_data, owner_address)
+        new_entries = _ledger_collect_entries(
+            block_data, owner_address, skipped_rollup_tx_ids=skipped_rollup_tx_ids
+        )
     except Exception as exc:
         log.warning("sync_local_ledger: extraction failed (block=%s): %s",
                     getattr(block_data, "index", "?"), exc)

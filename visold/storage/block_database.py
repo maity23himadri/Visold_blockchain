@@ -211,6 +211,17 @@ class BlockDatabase:
             height_val = self._encode_height(block.index)
 
             with self._lock:
+                old_hash_key: Optional[bytes] = None
+                try:
+                    existing_raw = self._db.get(height_key)
+                    if existing_raw is not None:
+                        existing_dict = json.loads(existing_raw.decode())
+                        old_hash = existing_dict.get("block_hash")
+                        if old_hash and old_hash != block.block_hash:
+                            old_hash_key = self._hash_key(str(old_hash))
+                except Exception:
+                    old_hash_key = None
+
                 # v7.0.1.2 — Monotonic tip guard.
                 # Only advance the tip; never regress it when writing an
                 # older block (e.g. during a reorg rollback+replay, or when
@@ -235,12 +246,16 @@ class BlockDatabase:
 
                 if self._backend == "leveldb":
                     with self._db.write_batch() as wb:
+                        if old_hash_key is not None:
+                            wb.delete(old_hash_key)
                         wb.put(height_key, data)
                         wb.put(hash_key,   height_val)
                         if advance_tip:
                             wb.put(tip_key, height_val)
                 elif self._backend == "rocksdb":
                     batch = _rocksdb.WriteBatch()
+                    if old_hash_key is not None:
+                        batch.delete(old_hash_key)
                     batch.put(height_key, data)
                     batch.put(hash_key,   height_val)
                     if advance_tip:
@@ -355,7 +370,10 @@ class BlockDatabase:
             if height_val is None:
                 return None
             height = self._decode_height(height_val)
-            return self.get_block_by_height(height)
+            blk = self.get_block_by_height(height)
+            if blk is None or str(blk.get("block_hash", "")) != str(block_hash):
+                return None
+            return blk
         except Exception as exc:
             log.debug(f"BlockDatabase.get_block_by_hash({block_hash[:16]}): {exc}")
             return None

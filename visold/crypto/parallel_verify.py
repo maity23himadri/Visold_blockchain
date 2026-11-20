@@ -60,18 +60,56 @@ _SIG_POOL: Optional[_futures.ProcessPoolExecutor] = None
 _SIG_POOL_LOCK = threading.Lock()
 
 
+def _is_pool_unusable(pool: Optional[_futures.ProcessPoolExecutor]) -> bool:
+    return (
+        pool is None
+        or bool(getattr(pool, "_broken", False))
+        or bool(getattr(pool, "_shutdown_thread", False))
+    )
+
+
 def _get_sig_pool() -> _futures.ProcessPoolExecutor:
     """Lazily create and cache the process pool for signature verification."""
     global _SIG_POOL
-    if _SIG_POOL is None:
+    pool = _SIG_POOL
+    if _is_pool_unusable(pool):
+        stale_pool = None
         with _SIG_POOL_LOCK:
-            if _SIG_POOL is None:
+            if _is_pool_unusable(_SIG_POOL):
+                stale_pool = _SIG_POOL
                 n = max(2, (_mp.cpu_count() or 4))
                 _SIG_POOL = _futures.ProcessPoolExecutor(
                     max_workers=n)
                 log.info("SigPool: started %d workers for parallel "
                          "signature verification", n)
-    return _SIG_POOL
+            pool = _SIG_POOL
+        if stale_pool is not None:
+            try:
+                stale_pool.shutdown(wait=False, cancel_futures=True)
+            except TypeError:  # compatibility with older Python runtimes
+                stale_pool.shutdown(wait=False)
+            except Exception:
+                pass
+    return pool
+
+
+def reset_signature_pool(
+    broken_pool: Optional[_futures.ProcessPoolExecutor] = None,
+) -> None:
+    """Discard a broken/stale signature pool so the next call recreates it."""
+    global _SIG_POOL
+    with _SIG_POOL_LOCK:
+        if broken_pool is not None and _SIG_POOL is not broken_pool:
+            return
+        pool = _SIG_POOL
+        _SIG_POOL = None
+    if pool is not None:
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            pool.shutdown(wait=False)
+        except Exception:
+            pass
 
 
 def shutdown_signature_pool(wait: bool = True) -> None:
@@ -112,8 +150,10 @@ def _par_verify_sig(pub_hex: str, sig_hex: str,
     path would reject.
     """
     try:
+        if not isinstance(sender, str) or not sender:
+            return False
         pub = pub_from_hex(pub_hex)
-        if sender is not None and pub_to_address(pub) != sender:
+        if pub_to_address(pub) != sender:
             return False
         sig = sig_from_hex(sig_hex)
         h = hashlib.sha256(signing_bytes).digest()

@@ -186,12 +186,13 @@ class TestSuite:
                 st  = Storage(db_path)
                 bc  = Blockchain(st)
                 self._check("Genesis block created", bc.height() == 0)
-                st.credit("VSD_TEST", 0.0)
-                cb2  = Transaction.coinbase("VSD_TEST", 10.0, 1)
+                w_miner7 = Wallet.generate()
+                st.credit(w_miner7.address, 0.0)
+                cb2  = Transaction.coinbase(w_miner7.address, 10.0, 1)
                 diff = bc.get_difficulty()
-                expected_sr = bc.dry_run_state_root([cb2], "VSD_TEST", 1)
+                expected_sr = bc.dry_run_state_root([cb2], w_miner7.address, 1)
                 blk2 = Block(index=1, prev_hash=bc.latest_block().block_hash,
-                             transactions=[cb2], miner_address="VSD_TEST",
+                             transactions=[cb2], miner_address=w_miner7.address,
                              difficulty=diff, state_root=expected_sr)
                 blk2.mine()
                 ok2, msg2 = bc.apply_block(blk2)
@@ -395,43 +396,47 @@ class TestSuite:
         print("  \033[93m[13] StateEngine — Event Routing\033[0m")
         with tempfile.TemporaryDirectory() as td:
             db_path = _os.path.join(td, "se.db")
-            st_se   = Storage(db_path)
-            bc_se   = Blockchain(st_se)
-            gov_se  = bc_se._governance
-            engine  = StateEngine(bc_se, gov_se, st_se)
-            engine.start()
-
+            orig_min = Config.MIN_DIFFICULTY
+            orig_init = Config.INITIAL_DIFFICULTY
+            Config.MIN_DIFFICULTY = 1
+            Config.INITIAL_DIFFICULTY = 1
+            engine = None
             try:
+                st_se   = Storage(db_path)
+                bc_se   = Blockchain(st_se)
+                gov_se  = bc_se._governance
+                engine  = StateEngine(bc_se, gov_se, st_se)
+                engine.start()
+
                 # NEW_TX: valid transaction — but no balance so should reject
                 w_se = Wallet.generate()
+                w_se_recv = Wallet.generate()
                 tx_se = Transaction(
-                    w_se.address, "VSDtestrecipient", 1.0, fee=0.01, nonce=0)
+                    w_se.address, w_se_recv.address, 1.0, fee=0.01, nonce=0)
                 tx_se.sign(w_se)
                 ok_tx, msg_tx = engine.post_sync(
                     Event(EventType.NEW_TX, {"tx": tx_se.to_dict()}))
                 # Rejection is expected (no balance), but engine didn't crash
                 self._check("StateEngine: NEW_TX processed without crash", True)
-                self._check("StateEngine: insufficient balance caught",
-                            not ok_tx or "balance" in msg_tx.lower() or
-                            "insufficient" in msg_tx.lower() or
-                            ok_tx)  # accepted into mempool if balance check passes
+                self._check(
+                    "StateEngine: insufficient balance caught",
+                    (not ok_tx) and (
+                        "balance" in msg_tx.lower()
+                        or "insufficient" in msg_tx.lower()
+                    ),
+                    f"ok={ok_tx}, msg={msg_tx!r}",
+                )
 
                 # MINE_RESULT: post a validly-mined block via StateEngine
                 w_miner = Wallet.generate()
                 consensus_se = ConsensusEngine(bc_se, w_miner)
                 cand = consensus_se.build_candidate_block(w_miner.address)
-                orig_min = Config.MIN_DIFFICULTY
-                orig_init = Config.INITIAL_DIFFICULTY
-                Config.MIN_DIFFICULTY   = 1
-                Config.INITIAL_DIFFICULTY = 1
                 cand.difficulty = 1
-                cand.mine()
-                Config.MIN_DIFFICULTY   = orig_min
-                Config.INITIAL_DIFFICULTY = orig_init
-                # Apply directly (bypass difficulty check for test)
-                ok_mine = True  # we trust mine() succeeded
-                self._check("StateEngine: MINE_RESULT block mined for test",
-                            ok_mine)
+                mined = cand.mine()
+                ok_mine, msg_mine = engine.post_sync(
+                    Event(EventType.MINE_RESULT, {"block": cand}))
+                self._check("StateEngine: MINE_RESULT block mined and applied",
+                            bool(mined) and ok_mine, msg_mine)
 
                 # TIMER: fire a timer event — should not crash
                 ok_timer, _ = engine.post_sync(
@@ -439,7 +444,10 @@ class TestSuite:
                 self._check("StateEngine: TIMER event processed", ok_timer)
 
             finally:
-                engine.stop()
+                if engine is not None:
+                    engine.stop()
+                Config.MIN_DIFFICULTY = orig_min
+                Config.INITIAL_DIFFICULTY = orig_init
 
         # ── 14. VVM Engine ────────────────────────────────────────────────────
         print("  \033[93m[14] VVM Engine — Smart Contracts\033[0m")

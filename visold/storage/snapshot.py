@@ -31,6 +31,7 @@ import zlib
 from typing import Optional, TYPE_CHECKING, Tuple
 
 from visold.kernel.config import Config
+from visold.kernel.units import to_satoshi
 from visold.kernel.compression_utils import bounded_zlib_decompress
 from visold.kernel.logging_setup import log
 from visold.kernel.metrics import metrics
@@ -386,7 +387,7 @@ class StateSnapshotEngine:
                 roles = {
                     r["address"]: {
                         "role": r["role"] or "",
-                        "stake_sat": int(round(float(r["stake"] or 0) * Config.SATOSHI_PER_VSD)),
+                        "stake_sat": to_satoshi(r["stake"] or 0),
                         "score": float(r["score"] or 0),
                         "slashed": int(r["slashed"] or 0),
                         "registered_at": int(r["registered_at"] or 0),
@@ -1317,9 +1318,12 @@ class StateSnapshotEngine:
                         "StateSnapshotEngine: post-bootstrap pruning reconciliation "
                         "failed at height=%d: %s", snap_h, _prune_exc)
                     try:
-                        self._storage.set_meta("rolling_pruned_until", "0")
+                        fallback_wm = max(0, int(snap_h) + 1) if int(snap_h) >= 1 else 0
+                        self._storage.set_meta("rolling_pruned_until", str(fallback_wm))
                     except Exception:
                         pass
+            elif int(snap_h) >= 1:
+                self._storage.set_meta("rolling_pruned_until", str(int(snap_h) + 1))
 
             # A successfully authenticated bootstrap snapshot is safe to relay.
             # Persist the exact verified compressed bytes plus the digest that
@@ -1396,6 +1400,8 @@ class StateSnapshotEngine:
 
         Returns None if the snapshot is not available.
         """
+        if not self.is_snapshot_servable(height):
+            return None
         blob = self.get_snapshot_blob(height)
         if blob is None:
             return None
@@ -1420,10 +1426,16 @@ class StateSnapshotEngine:
 
     def get_chunk(self, height: int, chunk_index: int) -> Optional[bytes]:
         """Return raw bytes for a single chunk of the snapshot at ``height``."""
+        if isinstance(chunk_index, bool) or not isinstance(chunk_index, int) or chunk_index < 0:
+            return None
+        if not self.is_snapshot_servable(height):
+            return None
         blob = self.get_snapshot_blob(height)
         if blob is None:
             return None
         chunk_sz = self._chunk_size()
+        if chunk_sz <= 0:
+            return None
         offset   = chunk_index * chunk_sz
         if offset >= len(blob):
             return None

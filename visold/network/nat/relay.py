@@ -90,6 +90,7 @@ class Session:
         self.peer    = None
         self.created = time.time()
         self.matched = threading.Event()
+        self.done    = threading.Event()
 
 
 sessions: dict = {}
@@ -98,7 +99,7 @@ _lock = threading.Lock()
 
 
 def splice(a: socket.socket, b: socket.socket):
-    """Bidirectional splice between two sockets (each direction in own thread)."""
+    """Bidirectional splice between two sockets; blocks until both directions end."""
     def forward(src, dst):
         try:
             while True:
@@ -114,8 +115,12 @@ def splice(a: socket.socket, b: socket.socket):
             try: dst.close()
             except Exception: pass
 
-    threading.Thread(target=forward, args=(a, b), daemon=True).start()
-    threading.Thread(target=forward, args=(b, a), daemon=True).start()
+    t1 = threading.Thread(target=forward, args=(a, b), daemon=True)
+    t2 = threading.Thread(target=forward, args=(b, a), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
 
 
 def handle(conn: socket.socket, addr):
@@ -129,12 +134,13 @@ def handle(conn: socket.socket, addr):
             except Exception: pass
             log.warning(f"Relay: rate-limited {client_ip} (>{MAX_CONN_PER_IP} conns)")
             return
+    sess = None
     try:
         conn.settimeout(15)
         raw = b""
         while b"\n" not in raw:
             chunk = conn.recv(512)
-            if not chunk:
+            if not chunk or len(raw) + len(chunk) > 4096:
                 conn.close()
                 return
             raw += chunk
@@ -167,19 +173,28 @@ def handle(conn: socket.socket, addr):
             if sess.peer is None:
                 conn.close()
                 return
-            conn.sendall(b'{"status":"ok"}\n')
-            sess.peer.sendall(b'{"status":"ok"}\n')
-            splice(conn, sess.peer)
+            try:
+                conn.settimeout(None)
+                sess.peer.settimeout(None)
+                conn.sendall(b'{"status":"ok"}\n')
+                sess.peer.sendall(b'{"status":"ok"}\n')
+                splice(conn, sess.peer)
+            finally:
+                try: conn.close()
+                except Exception: pass
+                try: sess.peer.close()
+                except Exception: pass
+                sess.done.set()
         else:
-            # We are the second peer — signal first
+            # We are the second peer — signal first and hold connection slot until splice ends
             existing.matched.set()
-            time.sleep(0.1)
-            conn.sendall(b'{"status":"ok"}\n')
-            splice(existing.sock, conn)
+            existing.done.wait()
     except Exception as e:
         log.debug(f"handle error {addr}: {e}")
         try: conn.close()
         except Exception: pass
+        if sess is not None:
+            sess.done.set()
     finally:
         with _lock:
             _ip_conns[client_ip] = max(0, _ip_conns.get(client_ip, 1) - 1)
@@ -202,8 +217,21 @@ def cleanup_loop():
 
 
 if __name__ == "__main__":
+    import ipaddress as _ipaddr
     threading.Thread(target=cleanup_loop, daemon=True).start()
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        _is_v6 = _ipaddr.ip_address(RELAY_BIND).version == 6
+    except ValueError:
+        _is_v6 = ":" in RELAY_BIND
+    if _is_v6:
+        srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        if RELAY_BIND == "::":
+            try:
+                srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except (AttributeError, OSError):
+                pass
+    else:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((RELAY_BIND, RELAY_PORT))   # bind address from argv[2], default 127.0.0.1
     srv.listen(64)
@@ -232,6 +260,7 @@ if __name__ == "__main__":
         Returns a socket bridged to the peer sharing the same token,
         or None on failure.
         """
+        sock = None
         try:
             sock = _create_connection_dual_stack(
                 self.relay_host, self.relay_port, timeout=timeout)
@@ -255,6 +284,11 @@ if __name__ == "__main__":
             sock.close()
             return None
         except Exception as exc:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
             log.debug(f"ICE relay connect failed: {exc}")
             return None
 

@@ -26,6 +26,7 @@ Origin: visold_vsd_.py L11308-11418
 
 import hashlib
 import json
+import os
 import time
 from typing import Tuple
 
@@ -166,12 +167,29 @@ class Wallet:
     @classmethod
     def from_dict(cls, d: dict) -> 'Wallet':
         priv = int(d["priv_hex"], 16)
-        pub  = pub_from_hex(d["pub_hex"])
+        if not (1 <= priv < 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141):
+            raise ValueError("Private key scalar out of range")
+        expected_pub = priv * G
+        if "pub_hex" in d and d["pub_hex"]:
+            pub = pub_from_hex(d["pub_hex"])
+            if pub != expected_pub:
+                raise ValueError("Wallet public key does not match private key")
+        else:
+            pub = expected_pub
+        if "address" in d and d["address"] and pub_to_address(pub) != d["address"]:
+            raise ValueError("Wallet address does not match public key")
         return cls(priv, pub)
 
     def save(self, path: str):
-        with open(path, 'w') as f:
-            json.dump(self.to_dict(), f, indent=2)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump(self.to_dict(), f, indent=2)
+        finally:
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
 
     @classmethod
     def load(cls, path: str) -> 'Wallet':
@@ -185,8 +203,15 @@ class Wallet:
         ks = keystore_encrypt(hex(self.priv), password)
         ks["address"] = self.address
         ks["pub_hex"] = self.pub_hex
-        with open(path, 'w') as f:
-            json.dump(ks, f, indent=2)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump(ks, f, indent=2)
+        finally:
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
 
     @classmethod
     def load_keystore(cls, path: str, password: str) -> 'Wallet':
@@ -194,7 +219,17 @@ class Wallet:
             ks = json.load(f)
         priv_hex = keystore_decrypt(ks, password)
         priv = int(priv_hex, 16)
-        pub  = pub_from_hex(ks["pub_hex"])
+        if not (1 <= priv < 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141):
+            raise ValueError("Private key scalar out of range")
+        expected_pub = priv * G
+        if "pub_hex" in ks and ks["pub_hex"]:
+            pub = pub_from_hex(ks["pub_hex"])
+            if pub != expected_pub:
+                raise ValueError("Keystore public key does not match decrypted private key")
+        else:
+            pub = expected_pub
+        if "address" in ks and ks["address"] and pub_to_address(pub) != ks["address"]:
+            raise ValueError("Keystore address does not match public key")
         return cls(priv, pub)
 
     @property

@@ -24,6 +24,7 @@ Defines: StatisticalDetector, AnomalyDetectionEngine
 Origin: visold_vsd_.py L50962-51017, L51020-51094
 """
 
+import math
 import threading
 import time
 from typing import Callable, Dict, List, Tuple
@@ -76,7 +77,10 @@ class StatisticalDetector:
 
             latest = stats.get("latest", 0.0)
             z = baseline_tracker.current_zscore(latest)
-            if abs(z) > threshold:
+            if z > threshold:
+                with baseline_tracker._lock:
+                    b_mean = baseline_tracker._baseline_mean
+                    b_std = math.sqrt(baseline_tracker._baseline_var)
                 anomalies.append(AnomalyReport(
                     kind=kind,
                     detected_at=now,
@@ -89,11 +93,11 @@ class StatisticalDetector:
                         "metric": metric,
                         "value": latest,
                         "z_score": z,
-                        "baseline_mean": stats["mean"],
-                        "baseline_std": stats["std"],
+                        "baseline_mean": b_mean,
+                        "baseline_std": b_std,
                     },
                     source="stat",
-                    confidence=min(0.4 + 0.1 * abs(z), 0.95),
+                    confidence=min(0.4 + 0.1 * z, 0.95),
                     block_height=height,
                     z_score=z,
                 ))
@@ -130,7 +134,7 @@ class AnomalyDetectionEngine:
         self._val_mon  = validator_monitor
         self._reen_det = reentrancy_detector
         self._stat_det = stat_detector
-        self._seen: Dict[Tuple[str, str], float] = {}   # (kind, addr) → last_seen_ts
+        self._seen: Dict[Tuple[str, str, str], float] = {}   # (kind, addr, source) → last_seen_ts
         self._seen_lock = threading.Lock()
         self._listeners: List[Callable[[AnomalyReport], None]] = []
 
@@ -170,7 +174,7 @@ class AnomalyDetectionEngine:
         result = []
         with self._seen_lock:
             for r in reports:
-                key = (r.kind.value, r.affected_addr or "")
+                key = (r.kind.value, r.affected_addr or "", r.source)
                 last = self._seen.get(key, 0.0)
                 if now - last >= self.DEDUP_WINDOW:
                     self._seen[key] = now

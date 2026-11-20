@@ -118,7 +118,10 @@ def _attach_operator_apis(shbs, safe_validator, abuse_guard, signal_window) -> N
 
     def manual_unfreeze(address: str) -> dict:
         """Unfreeze address and register cooldown to prevent rapid re-freeze."""
+        if not address:
+            return {"ok": False, "error": "address required"}
         shbs.hal._freeze.unfreeze(address)
+        shbs.rate_limiter.unlimit(address)
         safe_validator.record_manual_unfreeze(address)
         log.warning(
             f"[OPR] Manual unfreeze: {address[:28]} "

@@ -4,7 +4,7 @@
 
 Visold is a proof-of-work blockchain node written in Python. It includes peer-to-peer networking, a wallet, a small smart-contract virtual machine, and a layer-2 rollup module.
 
-Software version: 11.0.0.0 · Network: Testnet · Chain ID: `vsd-testnet-1`
+Software version: 11.1.3.78 · Network: Testnet · Chain ID: `vsd-testnet-1`
 
 > **Network status:** Visold is currently operating as a testnet; mainnet has not launched. Testnet software is expected to change, so treat it accordingly.
 

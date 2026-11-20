@@ -25,6 +25,8 @@ Origin: visold_vsd_.py L11008-11171, L11174-11206
 
 import hashlib
 
+from visold.crypto.ecc import ECPoint
+
 
 # ── 2H. BIP-39-style mnemonic (24-word subset, entropy backup) ───────────────
 # 2048-word English wordlist subset (first 2048 of BIP-39)
@@ -204,6 +206,10 @@ _MNEMONIC_WORDS = _MNEMONIC_WORDS[:2048]
 
 def mnemonic_from_priv(priv_int: int) -> str:
     """Encode 256-bit private key as 24 mnemonic words (BIP-39 encoding logic)."""
+    if isinstance(priv_int, bool) or not isinstance(priv_int, int):
+        raise TypeError("priv_int must be an int")
+    if not (1 <= priv_int < ECPoint.N):
+        raise ValueError("priv_int must be in valid secp256k1 range [1, N-1]")
     data = priv_int.to_bytes(32, 'big')
     # Append 8-bit checksum
     checksum = hashlib.sha256(data).digest()[0]
@@ -217,6 +223,8 @@ def mnemonic_from_priv(priv_int: int) -> str:
 
 def priv_from_mnemonic(phrase: str) -> int:
     """Recover private key from 24-word mnemonic."""
+    if not isinstance(phrase, str):
+        raise ValueError("Mnemonic phrase must be a string")
     words = phrase.strip().split()
     if len(words) != 24:
         raise ValueError("Mnemonic must be exactly 24 words")
@@ -231,4 +239,7 @@ def priv_from_mnemonic(phrase: str) -> int:
     checksum   = hashlib.sha256(data).digest()[0]
     if full_bytes[32] != checksum:
         raise ValueError("Mnemonic checksum invalid")
-    return int.from_bytes(data, 'big')
+    priv = int.from_bytes(data, 'big')
+    if not (1 <= priv < ECPoint.N):
+        raise ValueError("Mnemonic decodes to out-of-range secp256k1 private key")
+    return priv

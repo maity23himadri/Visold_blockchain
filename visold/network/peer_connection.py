@@ -489,6 +489,7 @@ class PeerConnection:
         self._lock       = threading.Lock()
         # trust_level is set by the handshake; defaults to HIGH until classified
         self.trust_level = trust_level if trust_level is not None else self.TRUST_HIGH
+        self.logic_hash: str = ""
         # ── Soft Ban state (v6.0.0) ──────────────────────────────────────────────
         # Tracks consecutive Full-Audit rejections for this peer session.
         # Resets to 0 whenever the peer sends a valid MSG_TX or MSG_BLOCK.

@@ -138,14 +138,17 @@ def _is_unsafe_backend(backend: 'IProofBackend') -> bool:
 
     A backend is considered unsafe if any of these are true:
       • It is a LocalDevBackend (or subclass).
-      • It is a SubprocessSNARKBackend in unconfigured (stub) state.
-      • Its security() string contains any token from _UNSAFE_SECURITY_TOKENS.
+      • Its security() string contains any token from _UNSAFE_SECURITY_TOKENS
+        (or raises).
+      • Its is_production_ready() method does not return True (or raises).
 
     This check is INTENTIONALLY loose — false positives (a real backend
     flagged as unsafe) cost a startup error message; false negatives
     (an unsafe backend flagged as safe) cost the entire chain.  We
     pick the safer side.
     """
+    if isinstance(backend, LocalDevBackend):
+        return True
     try:
         sec = (backend.security() or "").lower()
     except Exception:
@@ -153,15 +156,11 @@ def _is_unsafe_backend(backend: 'IProofBackend') -> bool:
     for tok in _UNSAFE_SECURITY_TOKENS:
         if tok in sec:
             return True
-    # Class-based check for the two stubs we ship — covers the case where
-    # a future subclass forgets to update security().
-    if isinstance(backend, (LocalDevBackend, SubprocessSNARKBackend)):
-        # SubprocessSNARKBackend can be marked production-ready by an
-        # operator only if it passes its own readiness check.
-        if isinstance(backend, SubprocessSNARKBackend):
-            return not backend.is_production_ready()
+    try:
+        ready = backend.is_production_ready()
+    except Exception:
         return True
-    return False
+    return ready is not True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -567,9 +566,13 @@ class SubprocessSNARKBackend(IProofBackend):
         if not out:
             raise ProofBackendError("backend binary produced no output")
         try:
-            return json.loads(out[-1].decode("utf-8"))
+            parsed = json.loads(out[-1].decode("utf-8"))
         except Exception as e:
             raise ProofBackendError(f"backend output not JSON: {e}")
+        if not isinstance(parsed, dict):
+            raise ProofBackendError(
+                f"backend output must be a JSON object, got {type(parsed).__name__}")
+        return parsed
 
     def prove(self, prev_root: str, new_root: str,
               batch_hash: str, witness: bytes = b"") -> bytes:
@@ -629,6 +632,7 @@ class SubprocessSNARKBackend(IProofBackend):
             result = self._run(
                 self._verifier_bin, payload, self._VERIFY_TIMEOUT_SECS,
                 key_flag="--vk", key_path=self._vk_path)
+            return bool(isinstance(result, dict) and result.get("ok") is True)
         except ProofBackendError as e:
             try:
                 log.warning(f"[L2-PROOF] verifier subprocess error: {e}")
@@ -641,7 +645,6 @@ class SubprocessSNARKBackend(IProofBackend):
             except Exception:
                 pass
             return False
-        return bool(result.get("ok") is True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -747,10 +750,18 @@ class ProofRegistry:
             return b
 
         if mainnet and _is_unsafe_backend(b):
+            try:
+                sec_repr = repr(b.security())
+            except Exception as e:
+                sec_repr = f"<error: {e}>"
+            try:
+                ready_repr = repr(b.is_production_ready())
+            except Exception as e:
+                ready_repr = f"<error: {e}>"
             raise UnsafeBackendOnMainnetError(
                 f"VISOLD_NETWORK=mainnet but the configured backend '{nm}' "
-                f"(security={b.security()!r}, "
-                f"production_ready={b.is_production_ready()}) is not "
+                f"(security={sec_repr}, "
+                f"production_ready={ready_repr}) is not "
                 f"production-safe.  Mainnet REQUIRES a backend that returns "
                 f"is_production_ready()==True and whose security() string "
                 f"does not contain dev/test/stub/hmac tokens.  Refusing to "

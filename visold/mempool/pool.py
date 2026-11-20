@@ -66,6 +66,18 @@ if TYPE_CHECKING:  # annotation-only references (no runtime import, no cycle)
 # The canonical nonce-gap filtering from get_top() is still applied.
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _effective_fee_sat(tx: 'Transaction') -> int:
+    """Return the consensus-enforced fee in satoshis for mempool prioritization."""
+    try:
+        if tx.tx_type in (Transaction.TYPE_DEPLOY, Transaction.TYPE_CALL):
+            return int(gas_fee_to_sat(int(tx.gas_limit), float(tx.gas_price)))
+        if tx.tx_type == Transaction.TYPE_ROLLUP:
+            return 0
+        return int(tx.compute_fee_sat())
+    except Exception:
+        return 0
+
+
 class _MempoolHeap:
     """Thread-safe priority queue for mempool transactions.
 
@@ -73,21 +85,24 @@ class _MempoolHeap:
     Uses lazy deletion: removed tx_ids are tracked in a set and skipped
     during iteration.  Periodic compaction reclaims space.
     """
-    __slots__ = ("_heap", "_removed", "_lock", "_size",
+    __slots__ = ("_heap", "_removed", "_live_ids", "_lock", "_size",
                  "_COMPACT_THRESHOLD")
 
     def __init__(self):
         self._heap: list = []            # heapq of (-fee_sat, ts, tx_id, tx)
         self._removed: set = set()       # tx_ids lazily marked for deletion
+        self._live_ids: set = set()      # tx_ids currently live in _heap
         self._lock = threading.Lock()
         self._size: int = 0              # number of LIVE entries
         self._COMPACT_THRESHOLD = 2000   # compact when removed set exceeds this
 
     def push(self, tx: 'Transaction'):
         """Add a transaction.  Thread-safe, O(log n) in the common case."""
-        fee_sat = to_satoshi(tx.fee) if tx.fee else 0
+        fee_sat = _effective_fee_sat(tx)
         entry = (-fee_sat, tx.timestamp, tx.tx_id, tx)
         with self._lock:
+            if tx.tx_id in self._live_ids:
+                return
             if tx.tx_id in self._removed:
                 # AUDIT-FIX (Batch E): tx_id was previously lazily removed —
                 # remove() never deletes the physical array slot, only
@@ -107,11 +122,15 @@ class _MempoolHeap:
                 self._compact_unlocked()
             _heapq.heappush(self._heap, entry)
             self._removed.discard(tx.tx_id)   # un-remove if re-added
+            self._live_ids.add(tx.tx_id)
             self._size += 1
 
     def remove(self, tx_id: str):
         """Lazily remove a transaction by tx_id.  Thread-safe, O(1)."""
         with self._lock:
+            if tx_id not in self._live_ids:
+                return
+            self._live_ids.discard(tx_id)
             if tx_id not in self._removed:
                 self._removed.add(tx_id)
                 self._size = max(0, self._size - 1)
@@ -139,6 +158,7 @@ class _MempoolHeap:
         with self._lock:
             self._heap.clear()
             self._removed.clear()
+            self._live_ids.clear()
             self._size = 0
 
     def _compact_unlocked(self):
@@ -167,7 +187,7 @@ class Mempool:
     """
 
     MIN_FEE_RATE        = 0.001
-    DUST_THRESHOLD      = 0.0001
+    DUST_THRESHOLD      = 0.001
     # v7.5.x: PER_SENDER_LIMIT raised from 20 → 60 to accommodate honest
     # high-frequency senders (payroll batches, market makers, exchange
     # withdrawal queues, automated payment services).  60 tx per 60-second
@@ -188,6 +208,7 @@ class Mempool:
             lambda: deque(maxlen=self.PER_SENDER_LIMIT + 1))
         # Track pending nonces per sender: sender → set of nonces in pool
         self._pending_nonces: Dict[str, set] = defaultdict(set)
+        self._pending_nonce_counts: Dict[Tuple[str, int], int] = defaultdict(int)
         # Track (sender, receiver) pairs for circular-trade detection
         self._pending_pairs: Dict[Tuple[str,str], int] = defaultdict(int)
         self._base_fee_multiplier: float = 1.0
@@ -243,12 +264,18 @@ class Mempool:
         """
         try:
             for tx in self.storage.mempool_all():  # v7.1.17: was mempool_get_all() (non-existent method)
+                if tx.sender == "COINBASE":
+                    try:
+                        self.storage.mempool_remove(tx.tx_id)
+                    except Exception:
+                        pass
+                    continue
                 self._pending_tx_ids.add(tx.tx_id)  # v7.1.17 clutter guard
                 # TPS-OPT-3: populate the in-memory priority queue
                 self._heap.push(tx)
-                if tx.sender == "COINBASE":
-                    continue
                 self._pending_nonces[tx.sender].add(tx.nonce)
+                nkey = (tx.sender, tx.nonce)
+                self._pending_nonce_counts[nkey] = self._pending_nonce_counts.get(nkey, 0) + 1
                 if tx.receiver:
                     self._pending_pairs[(tx.sender, tx.receiver)] += 1
         except Exception as e:
@@ -291,14 +318,27 @@ class Mempool:
 
     def add(self, tx: Transaction) -> Tuple[bool, str]:
         with self._lock:
-            # ── Expiry check ──────────────────────────────────────────────────
-            if tx.is_expired():
-                return False, f"Transaction expired (expiry={tx.expiry})"
+            if tx.sender == "COINBASE":
+                return False, "COINBASE transactions cannot be submitted to the mempool"
 
             # ── Basic structural validation ───────────────────────────────────
             ok, msg = tx.is_valid()
             if not ok:
                 return False, msg
+
+            if not getattr(tx, "tx_id", "") or tx.tx_id != tx._compute_id():
+                return False, "Transaction tx_id mismatch"
+
+            # ── Expiry check ──────────────────────────────────────────────────
+            if tx.is_expired():
+                return False, f"Transaction expired (expiry={tx.expiry})"
+
+            next_height = max(0, self.storage.chain_height() + 1)
+            expiry_req_height = int(getattr(
+                Config, "EXPIRY_REQUIRED_ACTIVATION_HEIGHT", 0))
+            if (tx.sender != "COINBASE" and tx.expiry == 0
+                    and next_height >= expiry_req_height):
+                return False, "expiry=0 not permitted for non-coinbase transactions"
 
             # Consensus role-registration minimums require state context and
             # therefore cannot be enforced by Transaction.is_valid() alone.
@@ -308,7 +348,6 @@ class Mempool:
             # are additive top-ups and remain allowed at any positive amount.
             role_stake_activation = int(getattr(
                 Config, "ROLE_STAKE_MIN_ACTIVATION_HEIGHT", 0))
-            next_height = max(0, self.storage.chain_height() + 1)
             if (tx.tx_type == Transaction.TYPE_REGISTER
                     and not Transaction.is_identity_claim(tx)
                     and next_height >= role_stake_activation):
@@ -359,6 +398,7 @@ class Mempool:
                         "Insufficient spendable balance for REGISTER stake+fee: "
                         f"need {from_satoshi(required_sat):.8f} VSD, "
                         f"have {from_satoshi(max(0, free_sat)):.8f} VSD")
+
 
             # ── MEV protected transfers (see visold/mempool/mev.py) ───────────────
             # A reveal is admitted only when its commitment is on-chain, from the same
@@ -413,6 +453,11 @@ class Mempool:
                             f"current L2 root {cur_root[:16]}.... "
                             f"The L2 state changed since this batch was sealed; "
                             f"the sequencer should reseal a fresh batch.")
+                    last_bid = getattr(self._layer2_ref, "_last_batch_id", None)
+                    if isinstance(last_bid, int) and sub.batch_id <= last_bid:
+                        return False, (
+                            f"Stale rollup: batch_id {sub.batch_id} is not "
+                            f"strictly greater than committed batch_id {last_bid}.")
                 except Exception as _pre_e:
                     # Don't reject on internal pre-check errors — let the
                     # apply-time path handle malformed payloads with its
@@ -421,12 +466,20 @@ class Mempool:
                     log.debug(f"Mempool rollup pre-check internal error: {_pre_e}")
             # F-01 COMPLETION: compare in satoshi to avoid float edge cases.
             dust_sat = to_satoshi(self.DUST_THRESHOLD)
+            abs_floor_sat = int(getattr(Config, "MIN_TX_FEE_SAT", 0))
+            tx_fee_rate_bps = int(round(Config.TX_FEE_RATE * 10000))
+            if abs_floor_sat > 0 and tx_fee_rate_bps > 0:
+                min_amount_for_floor_sat = (
+                    abs_floor_sat * 10000 + tx_fee_rate_bps - 1
+                ) // tx_fee_rate_bps
+                if dust_sat < min_amount_for_floor_sat:
+                    dust_sat = min_amount_for_floor_sat
             # v7.2.0: REGISTER txs have amount == stake (may be 0 for unstake);
             # skip the dust threshold for them.
             if (not is_vvm_tx and not is_register_tx and not is_rollup_tx
                     and not is_mev_commit_tx
                     and to_satoshi(tx.amount) < dust_sat):
-                return False, f"Amount below dust threshold ({self.DUST_THRESHOLD} VSD)"
+                return False, f"Amount below dust threshold ({from_satoshi(dust_sat):.8f} VSD)"
 
             # ── Minimum fee enforcement ───────────────────────────────────────
             # BUG-FIX: For VVM transactions the economic fee is gas_limit * gas_price,
@@ -503,6 +556,15 @@ class Mempool:
                         f"({consensus_fee_sat} sat).  Set tx.fee exactly "
                         f"to amount * {Config.TX_FEE_RATE} until fee "
                         f"tipping is enabled in a coordinated upgrade.")
+            elif is_register_tx and tx.sender != "COINBASE":
+                tx_fee_sat = to_satoshi(tx.fee)
+                consensus_fee_sat = tx.compute_fee_sat()
+                if tx_fee_sat != consensus_fee_sat:
+                    return False, (
+                        f"Fee mismatch: tx.fee={tx.fee:.8f} VSD "
+                        f"({tx_fee_sat} sat), consensus charges "
+                        f"{from_satoshi(consensus_fee_sat):.8f} VSD "
+                        f"({consensus_fee_sat} sat).")
 
             # ── Already in mempool (in-memory O(1) check, v7.1.17) ────────────
             # Reject a tx whose tx_id already sits in the pending set before
@@ -513,15 +575,43 @@ class Mempool:
                 return False, "Already in mempool"
 
             # ── Already confirmed ─────────────────────────────────────────────
-            if self.storage.tx_exists(tx.tx_id):
+            if self.storage.tx_exists(tx.tx_id) or self.storage.replay_guard_exists(tx.tx_id):
                 return False, "Already in chain"
 
             # ── Hard pool cap ─────────────────────────────────────────────────
             if self.storage.mempool_size() >= Config.MEMPOOL_MAX:
-                return False, "Mempool full — try again later or increase fee"
+                self._purge_expired()
+                if self.storage.mempool_size() >= Config.MEMPOOL_MAX:
+                    return False, "Mempool full — try again later or increase fee"
+
+            if (tx.sender != "COINBASE"
+                    and not is_protected_reveal(tx)
+                    and (tx.tx_type in (Transaction.TYPE_DEPLOY, Transaction.TYPE_CALL)
+                         or (tx.tx_type == Transaction.TYPE_TRANSFER
+                             and tx.receiver != L2_WITHDRAW_ADDRESS))):
+                existing = self.storage.get_role(tx.sender)
+                current_stake_sat = 0
+                if existing and existing.get("role") in ("miner", "investor"):
+                    current_stake_sat = to_satoshi(float(existing.get("stake", 0.0)))
+                pending_reg_sat, pending_xfer_sat, pending_fee_sat =                     self.pending_outflow_sat(tx.sender)
+                free_sat = (self.storage.get_balance_sat(tx.sender)
+                            - current_stake_sat - pending_reg_sat
+                            - pending_xfer_sat - pending_fee_sat)
+                if tx.tx_type in (Transaction.TYPE_DEPLOY, Transaction.TYPE_CALL):
+                    required_sat = (
+                        to_satoshi(tx.amount)
+                        + gas_fee_to_sat(int(tx.gas_limit), float(tx.gas_price))
+                    )
+                else:
+                    required_sat = to_satoshi(tx.amount) + tx.compute_fee_sat()
+                if free_sat < required_sat:
+                    return False, (
+                        "Insufficient spendable balance: "
+                        f"need {from_satoshi(required_sat):.8f} VSD, "
+                        f"have {from_satoshi(max(0, free_sat)):.8f} VSD")
 
             # ── Nonce enforcement (non-coinbase only) ─────────────────────────
-            if tx.sender != "COINBASE" and tx.receiver != VSD_GLOBAL_MARKET:
+            if tx.sender != "COINBASE":
                 chain_nonce = self.storage.get_nonce(tx.sender)
                 pending_set = self._pending_nonces[tx.sender]
                 pending_count = len(pending_set)
@@ -622,6 +712,8 @@ class Mempool:
                 self._record_signature_verified(tx)
             if tx.sender != "COINBASE":
                 self._pending_nonces[tx.sender].add(tx.nonce)
+                nkey = (tx.sender, tx.nonce)
+                self._pending_nonce_counts[nkey] = self._pending_nonce_counts.get(nkey, 0) + 1
                 pair = (tx.sender, tx.receiver)
                 self._pending_pairs[pair] = self._pending_pairs.get(pair, 0) + 1
             return True, "OK"
@@ -661,23 +753,38 @@ class Mempool:
         cause an already-honored transaction to be lost a second time.
         """
         with self._lock:
-            if tx.is_expired():
-                return False, f"Transaction expired (expiry={tx.expiry})"
+            if tx.sender == "COINBASE":
+                return False, "COINBASE transactions cannot be restored to the mempool"
 
             ok, msg = tx.is_valid()
             if not ok:
                 return False, msg
 
+            if not getattr(tx, "tx_id", "") or tx.tx_id != tx._compute_id():
+                return False, "Transaction tx_id mismatch"
+
+            if tx.is_expired():
+                return False, f"Transaction expired (expiry={tx.expiry})"
+
+            next_height = max(0, self.storage.chain_height() + 1)
+            expiry_req_height = int(getattr(
+                Config, "EXPIRY_REQUIRED_ACTIVATION_HEIGHT", 0))
+            if (tx.sender != "COINBASE" and tx.expiry == 0
+                    and next_height >= expiry_req_height):
+                return False, "expiry=0 not permitted for non-coinbase transactions"
+
             if tx.tx_id in self._pending_tx_ids:
                 return False, "Already in mempool"
 
-            if self.storage.tx_exists(tx.tx_id):
+            if self.storage.tx_exists(tx.tx_id) or self.storage.replay_guard_exists(tx.tx_id):
                 return False, "Already in chain"
 
             if self.storage.mempool_size() >= Config.MEMPOOL_MAX:
-                return False, "Mempool full — try again later or increase fee"
+                self._purge_expired()
+                if self.storage.mempool_size() >= Config.MEMPOOL_MAX:
+                    return False, "Mempool full — try again later or increase fee"
 
-            if tx.sender != "COINBASE" and tx.receiver != VSD_GLOBAL_MARKET:
+            if tx.sender != "COINBASE":
                 chain_nonce = self.storage.get_nonce(tx.sender)
                 if tx.nonce < chain_nonce:
                     return False, (
@@ -698,6 +805,8 @@ class Mempool:
                     self._prune_verified_cache(live_ids)
                 self._record_signature_verified(tx)
                 self._pending_nonces[tx.sender].add(tx.nonce)
+                nkey = (tx.sender, tx.nonce)
+                self._pending_nonce_counts[nkey] = self._pending_nonce_counts.get(nkey, 0) + 1
                 pair = (tx.sender, tx.receiver)
                 self._pending_pairs[pair] = self._pending_pairs.get(pair, 0) + 1
             return True, "OK"
@@ -718,7 +827,24 @@ class Mempool:
             self._verified.discard(tx_id)
             self._verified_fingerprints.pop(tx_id, None)
             if tx and tx.sender != "COINBASE":
-                self._pending_nonces[tx.sender].discard(tx.nonce)
+                nkey = (tx.sender, tx.nonce)
+                if nkey in self._pending_nonce_counts:
+                    self._pending_nonce_counts[nkey] -= 1
+                    if self._pending_nonce_counts[nkey] <= 0:
+                        del self._pending_nonce_counts[nkey]
+                        still_has_nonce = any(
+                            t.sender == tx.sender and t.nonce == tx.nonce
+                            for t in self._heap.get_all_live()
+                        )
+                        if not still_has_nonce:
+                            self._pending_nonces[tx.sender].discard(tx.nonce)
+                else:
+                    still_has_nonce = any(
+                        t.sender == tx.sender and t.nonce == tx.nonce
+                        for t in self._heap.get_all_live()
+                    )
+                    if not still_has_nonce:
+                        self._pending_nonces[tx.sender].discard(tx.nonce)
                 pair = (tx.sender, tx.receiver)
                 if pair in self._pending_pairs:
                     self._pending_pairs[pair] = max(0, self._pending_pairs[pair] - 1)
@@ -768,12 +894,10 @@ class Mempool:
 
         # Group by sender
         by_sender: Dict[str, List[Transaction]] = defaultdict(list)
-        coinbase_txs: List[Transaction] = []
         for tx in all_txs:
             if tx.sender == "COINBASE":
-                coinbase_txs.append(tx)
-            else:
-                by_sender[tx.sender].append(tx)
+                continue
+            by_sender[tx.sender].append(tx)
 
         # One queue per sender: the contiguous, gap-free run of nonces that
         # starts at that sender's chain nonce, in ascending nonce order.
@@ -802,9 +926,7 @@ class Mempool:
             if run:
                 queues.append(run)
 
-        # Coinbase entries have no nonce: each is its own one-element queue.
-        for tx in coinbase_txs:
-            queues.append([tx])
+
 
         # NONCE-ORDER FIX: k-way merge of the queues instead of one global
         # fee sort.  Priority is unchanged — fee DESC, timestamp ASC, tx_id ASC
@@ -819,7 +941,7 @@ class Mempool:
             # head.  Only queue heads compete, so per-sender nonce order is kept.
             # Non-rollup transactions keep their exact previous relative order.
             rank = 0 if t.tx_type == Transaction.TYPE_ROLLUP else 1
-            return (rank, -t.fee, t.timestamp, t.tx_id, qi, pos)
+            return (rank, -_effective_fee_sat(t), t.timestamp, t.tx_id, qi, pos)
 
         heap = [_prio(q[0], qi, 0) for qi, q in enumerate(queues)]
         _heapq.heapify(heap)
@@ -841,6 +963,7 @@ class Mempool:
         """
         all_txs = self._heap.get_all_live()
         now = int(time.time())
+        expired_sender_nonces: List[Tuple[str, int]] = []
         for tx in all_txs:
             if tx.expiry > 0 and now > tx.expiry:
                 self.storage.mempool_remove(tx.tx_id)
@@ -850,7 +973,7 @@ class Mempool:
                 self._verified.discard(tx.tx_id)
                 self._verified_fingerprints.pop(tx.tx_id, None)
                 if tx.sender != "COINBASE":
-                    self._pending_nonces[tx.sender].discard(tx.nonce)
+                    expired_sender_nonces.append((tx.sender, tx.nonce))
                     # BUG-FIX: _pending_pairs was never updated on expiry, so
                     # stale entries accumulated indefinitely.  Any future reverse
                     # transaction (B→A after A→B expired) was wrongly flagged as
@@ -860,12 +983,38 @@ class Mempool:
                         self._pending_pairs[pair] = max(0, self._pending_pairs[pair] - 1)
                         if self._pending_pairs[pair] == 0:
                             del self._pending_pairs[pair]
+        if expired_sender_nonces:
+            live_sender_nonces = {
+                (t.sender, t.nonce)
+                for t in self._heap.get_all_live()
+                if t.sender != "COINBASE"
+            }
+            for sender, nonce in expired_sender_nonces:
+                nkey = (sender, nonce)
+                if nkey in self._pending_nonce_counts:
+                    self._pending_nonce_counts[nkey] -= 1
+                    if self._pending_nonce_counts[nkey] <= 0:
+                        del self._pending_nonce_counts[nkey]
+                        if nkey not in live_sender_nonces:
+                            self._pending_nonces[sender].discard(nonce)
+                elif nkey not in live_sender_nonces:
+                    self._pending_nonces[sender].discard(nonce)
 
     def size(self) -> int:
         return self.storage.mempool_size()
 
     def all_txs(self) -> List[Transaction]:
         return self.storage.mempool_all()
+
+    def next_nonce(self, sender: str) -> int:
+        """Return the lowest available nonce >= chain_nonce not in _pending_nonces."""
+        with self._lock:
+            expected = self.storage.get_nonce(sender)
+            pending = self._pending_nonces.get(sender)
+            if pending:
+                while expected in pending:
+                    expected += 1
+            return expected
 
     def pending_outflow_sat(self, sender: str) -> Tuple[int, int, int]:
         """
@@ -1019,6 +1168,7 @@ class Mempool:
 
             # ── Reset all in-memory tracking structures ────────────────
             self._pending_nonces.clear()
+            self._pending_nonce_counts.clear()
             self._pending_pairs.clear()
             self._pending_tx_ids.clear()
             self._rate_tracker.clear()

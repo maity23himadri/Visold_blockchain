@@ -26,6 +26,7 @@ Origin: visold_vsd_.py L43643-44543, L44548-44851
 
 import hashlib
 import hmac
+import inspect
 import json
 import math
 import os
@@ -97,6 +98,8 @@ class VisoldNode:
         self._shutdown_started = False
         self._shutdown_complete = False
         self._startup_timers: list = []
+        self._status_writer_stop = threading.Event()
+        self._status_writer_thread: Optional[threading.Thread] = None
         # Serialises updates to the local incoming-transfer inbox.  Inbox data
         # lives in node_meta (not consensus state) and must never affect blocks.
         self._incoming_transfer_lock = threading.RLock()
@@ -121,6 +124,16 @@ class VisoldNode:
         ok, gmsg = SecurityGate.verify_genesis_hash(self.storage, self.blockchain)
         if not ok:
             log.critical(gmsg)
+            try:
+                block_db = getattr(self.storage, "_block_db", None)
+                if block_db is not None and callable(getattr(block_db, "close", None)):
+                    block_db.close()
+            except Exception:
+                pass
+            try:
+                self.storage.close()
+            except Exception:
+                pass
             sys.exit(1)
 
         # ── Hybrid difficulty system activation ───────────────────────────────
@@ -314,8 +327,9 @@ class VisoldNode:
         #   5. ResourceCap           — recursion guard + memory ceiling + timeout
         #   6. GracefulDegradation   — secondary component isolation
         # All patches are instance-level — zero class-level mutations.
+        self._hc_panic_cb = None
         try:
-            apply_hardened_overlay(
+            self._hc_panic_cb = apply_hardened_overlay(
                 blockchain_instance  = self.blockchain,
                 storage_instance     = self.storage,
                 vvm_engine_instance  = getattr(self.blockchain, '_vvm_engine', None),
@@ -371,8 +385,9 @@ class VisoldNode:
         # keys that don't own the user's funds.
         _account_data = None
         try:
-            if os.path.exists(UserAccount.ACCOUNTS_FILE):
-                with open(UserAccount.ACCOUNTS_FILE) as _af:
+            _acct_file = UserAccount._get_accounts_file()
+            if os.path.exists(_acct_file):
+                with open(_acct_file) as _af:
                     _account_data = json.load(_af)
         except Exception as _ae:
             log.warning(f"Could not read account.json: {_ae}")
@@ -394,7 +409,7 @@ class VisoldNode:
                     log.critical(
                         "  Hint: this account was created with deterministic "
                         "wallet derivation.  You can recover by deleting "
-                        f"{Config.KEYSTORE_FILE} and {UserAccount.ACCOUNTS_FILE} "
+                        f"{Config.KEYSTORE_FILE} and {UserAccount._get_accounts_file()} "
                         "then choosing 'Restore my existing account' on next start."
                     )
                 sys.exit(1)
@@ -418,6 +433,17 @@ class VisoldNode:
         if os.path.exists(Config.WALLET_FILE):
             log.warning("Migrating plaintext wallet to encrypted keystore…")
             w = Wallet.load(Config.WALLET_FILE)
+            if _is_v1_hkdf and _expected_addr and w.address != _expected_addr:
+                log.critical(
+                    "Plaintext wallet address does not match account.json "
+                    f"declared address.\n"
+                    f"  wallet  : {w.address}\n"
+                    f"  account : {_expected_addr}\n"
+                    f"Refusing to migrate stale plaintext wallet over a "
+                    f"deterministic v1-hkdf account.  Remove {Config.WALLET_FILE} "
+                    f"and recover using your User ID + Secret Key."
+                )
+                sys.exit(1)
             machine_secret = self._get_or_create_machine_secret()
             w.save_keystore(Config.KEYSTORE_FILE, machine_secret)
             try:
@@ -437,7 +463,7 @@ class VisoldNode:
                 "Account.json indicates a deterministic wallet "
                 f"({_expected_addr}) but no keystore was found on disk.  "
                 f"To rebuild the keystore on this device, delete "
-                f"{UserAccount.ACCOUNTS_FILE} and choose 'Restore my "
+                f"{UserAccount._get_accounts_file()} and choose 'Restore my "
                 f"existing account' on the next start, providing your "
                 f"User ID + Secret Key.  The node refuses to generate a "
                 f"random replacement wallet because that would silently "
@@ -483,12 +509,17 @@ class VisoldNode:
             with open(secret_path, 'r') as f:
                 return f.read().strip()
         secret = secrets.token_hex(32)
-        with open(secret_path, 'w') as f:
-            f.write(secret)
         try:
-            os.chmod(secret_path, 0o600)
-        except Exception:
-            pass
+            fd = os.open(secret_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'w') as f:
+                try:
+                    os.fchmod(f.fileno(), 0o600)
+                except (AttributeError, OSError):
+                    pass
+                f.write(secret)
+        except FileExistsError:
+            with open(secret_path, 'r') as f:
+                return f.read().strip()
         log.warning(
             "SECURITY: Machine secret written to %s (chmod 600). "
             "Do NOT sync ~/.visold/ to cloud storage — see _get_or_create_machine_secret() "
@@ -542,16 +573,50 @@ class VisoldNode:
         # We write an initial status immediately and refresh once ICE is ready.
         _rpc_port   = self.port + Config.RPC_PORT_OFFSET
         _relay_port = self.port + Config.RELAY_PORT_OFFSET  # default fallback
-        _write_node_status(self.port, _rpc_port, _relay_port)
+        _status_path = Config.NODE_STATUS_FILE
+        _status_stop = getattr(self, "_status_writer_stop", None)
+        if _status_stop is None:
+            _status_stop = threading.Event()
+            self._status_writer_stop = _status_stop
+        else:
+            _status_stop.clear()
+
+        def _write_status_scoped(p2p_p: int, rpc_p: int, relay_p: int) -> None:
+            try:
+                if "path" in inspect.signature(_write_node_status).parameters:
+                    _write_node_status(p2p_p, rpc_p, relay_p, path=_status_path)
+                    return
+            except Exception:
+                pass
+            if _status_path == Config.NODE_STATUS_FILE:
+                _write_node_status(p2p_p, rpc_p, relay_p)
+            elif _status_path:
+                try:
+                    tmp = _status_path + ".tmp"
+                    with open(tmp, "w") as sf:
+                        json.dump({"p2p_port": p2p_p, "rpc_port": rpc_p, "relay_port": relay_p}, sf)
+                    os.replace(tmp, _status_path)
+                except Exception as exc:
+                    log.warning(f"Could not write node status file: {exc}")
+
+        _write_status_scoped(self.port, _rpc_port, _relay_port)
 
         def _refresh_status_after_ice():
             """Wait for ICE gather to finish, then rewrite with actual relay port."""
             try:
                 ice = getattr(self.network, "_ice", None)
                 if ice is not None:
-                    ice._ready.wait(timeout=15.0)
+                    deadline = time.monotonic() + 15.0
+                    while not _status_stop.is_set() and not self._shutdown_started:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        if ice._ready.wait(timeout=min(0.2, remaining)):
+                            break
+                    if _status_stop.is_set() or self._shutdown_started or self._shutdown_complete:
+                        return
                     actual_relay = ice._relay_port
-                    _write_node_status(self.port, _rpc_port, actual_relay)
+                    _write_status_scoped(self.port, _rpc_port, actual_relay)
                     log.info(
                         f"Node status updated: p2p={self.port} "
                         f"rpc={_rpc_port} relay={actual_relay}"
@@ -559,11 +624,12 @@ class VisoldNode:
             except Exception as exc:
                 log.debug(f"Node status refresh error (non-fatal): {exc}")
 
-        threading.Thread(
+        self._status_writer_thread = threading.Thread(
             target=_refresh_status_after_ice,
             daemon=True,
             name="node-status-writer",
-        ).start()
+        )
+        self._status_writer_thread.start()
 
         user_id = self.storage.get_meta("user_id")
         if user_id:
@@ -788,6 +854,16 @@ class VisoldNode:
                     except Exception:
                         pass
 
+            status_stop = getattr(self, "_status_writer_stop", None)
+            if status_stop is not None:
+                status_stop.set()
+            status_thread = getattr(self, "_status_writer_thread", None)
+            if (status_thread is not None
+                    and status_thread is not threading.current_thread()
+                    and status_thread.is_alive()):
+                status_thread.join(timeout=1.0)
+            self._status_writer_thread = None
+
             # Cancel delayed startup broadcasts before shutting down their target
             # network. Non-daemon Timer threads used to keep Termux sessions alive
             # for up to five seconds after menu option 0.
@@ -803,7 +879,14 @@ class VisoldNode:
             # Stop producers first so no new work should be added while the
             # network and state-processing components are being closed.
             mining = getattr(self, "mining", None)
-            _stop_component("mining", getattr(mining, "stop", None))
+            def _stop_mining():
+                stop_fn = getattr(mining, "stop", None)
+                if not callable(stop_fn):
+                    return
+                res = stop_fn()
+                if isinstance(res, tuple) and len(res) >= 1 and res[0] is False:
+                    raise RuntimeError(res[1] if len(res) > 1 else "mining stop incomplete")
+            _stop_component("mining", _stop_mining)
             sequencer = getattr(self, "sequencer", None)
             _stop_component("sequencer", getattr(sequencer, "stop", None))
             _stop_component("P2P network", getattr(getattr(self, "network", None), "stop", None))
@@ -1077,9 +1160,16 @@ class VisoldNode:
                            f"(need {amount+fee:.8f} incl. {fee:.8f} fee)")
 
         # ── Auto-derive correct nonce ──────────────────────────────────────────
-        chain_nonce   = self.storage.get_nonce(sender)
-        pending_count = len(self.blockchain.mempool._pending_nonces.get(sender, set()))
-        nonce         = chain_nonce + pending_count
+        mempool = self.blockchain.mempool
+        if hasattr(mempool, "next_nonce"):
+            nonce = mempool.next_nonce(sender)
+        else:
+            with mempool._lock:
+                nonce = self.storage.get_nonce(sender)
+                pending = mempool._pending_nonces.get(sender)
+                if pending:
+                    while nonce in pending:
+                        nonce += 1
 
         # ── MEV protection: the commitment goes on-chain first; the transfer follows ──
         use_protection = (protection_default(self.storage) if protected is None
@@ -1154,9 +1244,16 @@ class VisoldNode:
         if fee_sat > amount_sat:
             return False, "withdrawal amount is too small to cover its fee"
 
-        chain_nonce = self.storage.get_nonce(sender)
-        pending_count = len(self.blockchain.mempool._pending_nonces.get(sender, set()))
-        nonce = chain_nonce + pending_count
+        mempool = self.blockchain.mempool
+        if hasattr(mempool, "next_nonce"):
+            nonce = mempool.next_nonce(sender)
+        else:
+            with mempool._lock:
+                nonce = self.storage.get_nonce(sender)
+                pending = mempool._pending_nonces.get(sender)
+                if pending:
+                    while nonce in pending:
+                        nonce += 1
         tx = Transaction(
             sender=sender, receiver=L2_WITHDRAW_ADDRESS,
             amount=amount_vsd, fee=fee, memo="L2_WITHDRAW", nonce=nonce)
@@ -1230,11 +1327,22 @@ class VisoldNode:
 # SECTION 19: USER ACCOUNT SYSTEM
 # ─────────────────────────────────────────────────────────────────────────────
 class UserAccount:
-    ACCOUNTS_FILE = os.path.join(Config.DATA_DIR, "account.json")
+    _DEFAULT_ACCOUNTS_FILE = os.path.join(Config.DATA_DIR, "account.json")
+    ACCOUNTS_FILE = _DEFAULT_ACCOUNTS_FILE
+
+    @classmethod
+    def _get_accounts_file(cls) -> str:
+        if cls.ACCOUNTS_FILE and cls.ACCOUNTS_FILE != cls._DEFAULT_ACCOUNTS_FILE:
+            return cls.ACCOUNTS_FILE
+        return os.path.join(Config.DATA_DIR, "account.json")
+
+    @classmethod
+    def _accounts_file(cls) -> str:
+        return cls._get_accounts_file()
 
     @classmethod
     def is_registered(cls) -> bool:
-        return os.path.exists(cls.ACCOUNTS_FILE)
+        return os.path.exists(cls._get_accounts_file())
 
     # ── VSD-H02 FIX: scrypt key-derivation helpers ───────────────────────────
     @staticmethod
@@ -1316,6 +1424,18 @@ class UserAccount:
           node boots straight into the correct wallet without re-deriving.
         """
         Config.ensure_dirs()
+        if cls.is_registered():
+            existing = cls.get_user_id()
+            return False, (
+                f"An account ({existing}) is already registered on this device. "
+                f"Delete {cls._get_accounts_file()} first if you want to create a new account."
+            ), ""
+        username = (username or "").strip()
+        if not re.match(r'^[a-zA-Z0-9_]{3,32}$', username):
+            return False, (
+                "Invalid username format. "
+                "Use only letters, numbers, and underscores (3-32 chars)."
+            ), ""
         unique              = secrets.token_hex(5)
         user_id             = f"{username}#{unique}"
         secret              = secrets.token_hex(16)
@@ -1350,7 +1470,7 @@ class UserAccount:
             "wallet_derivation":  _WALLET_DERIV_VERSION,
             "wallet_addr":        wallet_addr,
         }
-        with open(cls.ACCOUNTS_FILE, 'w') as f:
+        with open(cls._get_accounts_file(), 'w') as f:
             json.dump(data, f, indent=2)
         return True, user_id, secret
 
@@ -1383,7 +1503,7 @@ class UserAccount:
         # register() always produces (secrets.token_hex(16) = 32 hex chars).
         # Accepting any 8-char string silently derived a weaker key and the
         # resulting wallet address silently mismatched the original.
-        _secret_stripped = secret.strip()
+        _secret_stripped = (secret or "").strip()
         if not re.match(r'^[0-9a-fA-F]{32}$', _secret_stripped):
             _len = len(_secret_stripped)
             if _len < 32:
@@ -1417,8 +1537,9 @@ class UserAccount:
                 )
             # Same user_id → allow re-import (updates stored secret hash)
 
+        _secret_norm              = _secret_stripped.lower()
         username                  = user_id.split("#")[0]
-        salt_hex, hash_h, kdf_str = cls._hash_secret(secret)
+        salt_hex, hash_h, kdf_str = cls._hash_secret(_secret_norm)
 
         # ── v7.5.x: deterministic wallet recovery ─────────────────────────
         # Derive the wallet from (secret, user_id).  This is THE step that
@@ -1439,7 +1560,7 @@ class UserAccount:
         # real.
         wallet_addr_derived = ""
         try:
-            _wallet = derive_wallet_from_secret(_secret_stripped, user_id)
+            _wallet = derive_wallet_from_secret(_secret_norm, user_id)
             wallet_addr_derived = _wallet.address
         except Exception as _ke:
             return False, f"Failed to rebuild wallet from secret: {_ke}"
@@ -1479,7 +1600,7 @@ class UserAccount:
             "wallet_derivation":  _WALLET_DERIV_VERSION,
             "wallet_addr":        wallet_addr_derived,
         }
-        with open(cls.ACCOUNTS_FILE, 'w') as f:
+        with open(cls._get_accounts_file(), 'w') as f:
             json.dump(data, f, indent=2)
         return True, (
             f"Account restored successfully.  Wallet {wallet_addr_derived[:16]}... "
@@ -1489,16 +1610,20 @@ class UserAccount:
     def login(cls, user_id: str, secret: str) -> Tuple[bool, str]:
         if not cls.is_registered():
             return False, "Not registered"
-        with open(cls.ACCOUNTS_FILE) as f:
+        with open(cls._get_accounts_file()) as f:
             data = json.load(f)
         if data["user_id"] != user_id:
             return False, "Invalid user_id"
+
+        _secret_norm = (secret or "").strip()
+        if re.fullmatch(r"[0-9a-fA-F]{32}", _secret_norm):
+            _secret_norm = _secret_norm.lower()
 
         stored_salt = data.get("secret_salt")
         if stored_salt:
             # Modern account: scrypt or PBKDF2 hash stored with explicit salt.
             kdf = data.get("kdf", "scrypt-n32768-r8-p1")
-            if not cls._verify_secret(secret, stored_salt, data["secret_h"], kdf):
+            if not cls._verify_secret(_secret_norm, stored_salt, data["secret_h"], kdf):
                 return False, "Invalid secret key"
         else:
             # ── Legacy account (pre-VSD-H02): bare SHA-256, no salt ──────────
@@ -1506,17 +1631,17 @@ class UserAccount:
             # then IMMEDIATELY re-derive with the strongest available KDF and
             # overwrite account.json.  After this first successful login the
             # bare-SHA-256 credential no longer exists on disk.
-            legacy_h = hashlib.sha256(secret.strip().encode()).hexdigest()
+            legacy_h = hashlib.sha256(_secret_norm.encode()).hexdigest()
             if not hmac.compare_digest(data.get("secret_h", ""), legacy_h):
                 return False, "Invalid secret key"
             # Transparent migration: re-hash with scrypt/Argon2id and persist.
             try:
-                salt_hex, hash_h, kdf_str = cls._hash_secret(secret)
+                salt_hex, hash_h, kdf_str = cls._hash_secret(_secret_norm)
                 data["secret_h"]    = hash_h
                 data["secret_salt"] = salt_hex
                 data["kdf"]         = kdf_str
                 data["kdf_migrated_at"] = int(time.time())
-                with open(cls.ACCOUNTS_FILE, 'w') as _f:
+                with open(cls._get_accounts_file(), 'w') as _f:
                     json.dump(data, _f, indent=2)
                 log.info(
                     "KDF-MIGRATE: legacy SHA-256 credential upgraded to %s "
@@ -1531,5 +1656,5 @@ class UserAccount:
     @classmethod
     def get_user_id(cls) -> Optional[str]:
         if not cls.is_registered(): return None
-        with open(cls.ACCOUNTS_FILE) as f:
+        with open(cls._get_accounts_file()) as f:
             return json.load(f).get("user_id")

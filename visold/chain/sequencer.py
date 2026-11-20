@@ -86,8 +86,10 @@ class Sequencer:
         self._state_engine = state_engine
         self._lock        = threading.Lock()
         self._pending:    List[L2Transaction] = []
+        self._enqueued_at: Dict[str, float] = {}
         self._seen_ids:   set = set()
         self._next_batch_id: int = 0
+        self._last_submitted_l1_nonce: int = -1
         self._running     = False
         self._thread: Optional[threading.Thread] = None
         self._stop_evt    = threading.Event()
@@ -145,27 +147,47 @@ class Sequencer:
         still checked by apply_l2_tx at the next seal, so nonce and balance
         rules keep applying.  Returns the number of transfers re-queued.
         """
-        requeued = 0
+        dropped_ids: List[str] = []
         while True:
             try:
-                tx_id = self._dropped_rollups.popleft()
+                dropped_ids.append(self._dropped_rollups.popleft())
             except IndexError:
                 break
-            with self._lock:
+        if not dropped_ids:
+            return 0
+
+        requeued = 0
+        requeued_batches: List[Tuple[str, int, int]] = []
+        with self._lock:
+            records: List[Tuple[str, int, List[L2Transaction]]] = []
+            for tx_id in dropped_ids:
                 record = self._sealed_by_l1.pop(tx_id, None)
-                if record is None:
-                    continue
-                batch_id, txs = record
-                pending_ids = {t.l2_tx_id for t in self._pending}
+                if record is not None:
+                    batch_id, txs = record
+                    records.append((tx_id, batch_id, txs))
+            # Preserve causal/nonce order across multiple dropped batches.
+            records.sort(key=lambda item: item[1])
+
+            pending_ids = {t.l2_tx_id for t in self._pending}
+            all_back: List[L2Transaction] = []
+            now = time.time()
+            for tx_id, batch_id, txs in records:
                 back = [t for t in txs if t.l2_tx_id not in pending_ids]
                 if back:
-                    self._pending = back + self._pending
-                    requeued += len(back)
-            if back:
-                log.warning(
-                    f"[SEQUENCER] rollup {tx_id[:12]} for batch {batch_id} was "
-                    f"skipped on-chain; re-queued {len(back)} L2 transfer(s)")
-                metrics.inc("l2_requeued_txs", float(len(back)))
+                    for t in back:
+                        pending_ids.add(t.l2_tx_id)
+                        self._enqueued_at.setdefault(t.l2_tx_id, now)
+                    all_back.extend(back)
+                    requeued_batches.append((tx_id, batch_id, len(back)))
+            if all_back:
+                self._pending = all_back + self._pending
+                requeued = len(all_back)
+
+        for tx_id, batch_id, count in requeued_batches:
+            log.warning(
+                f"[SEQUENCER] rollup {tx_id[:12]} for batch {batch_id} was "
+                f"skipped on-chain; re-queued {count} L2 transfer(s)")
+            metrics.inc("l2_requeued_txs", float(count))
         return requeued
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
@@ -233,6 +255,9 @@ class Sequencer:
         ok, msg = tx.is_valid()
         if not ok:
             return False, msg
+        max_future_skew = int(getattr(Config, "L2_MAX_FUTURE_DRIFT", 300))
+        if tx.timestamp > int(time.time()) + max_future_skew:
+            return False, "l2_tx timestamp too far in the future"
         with self._lock:
             if tx.l2_tx_id in self._seen_ids:
                 return False, "duplicate l2_tx_id"
@@ -241,6 +266,7 @@ class Sequencer:
                 # max batch size.
                 return False, "sequencer pending pool full"
             self._pending.append(tx)
+            self._enqueued_at[tx.l2_tx_id] = time.time()
             if len(self._seen_ids) >= self._SEEN_MAX:
                 # Cheap eviction — drop half the seen set.  A tx that was
                 # seen long ago and is re-gossipped will now get a second
@@ -252,14 +278,31 @@ class Sequencer:
         return True, "OK"
 
     # ── Batch sealing ─────────────────────────────────────────────────────
+    def _oldest_pending_age_locked(self, now: float) -> float:
+        """Compute the oldest effective age across _pending.
+
+        Uses local enqueue time as a floor so a sender-supplied future
+        timestamp on _pending[0] can never yield a negative age or starve
+        age-based sealing for other queued transactions.
+        """
+        if not self._pending:
+            return 0.0
+        oldest = 0.0
+        for tx in self._pending:
+            enq_age = max(0.0, now - self._enqueued_at.get(tx.l2_tx_id, now))
+            tx_age = now - tx.timestamp
+            eff_age = enq_age if tx_age < enq_age else tx_age
+            if eff_age > oldest:
+                oldest = eff_age
+        return oldest
+
     def _should_seal(self) -> bool:
         with self._lock:
             if not self._pending:
                 return False
             if len(self._pending) >= Config.L2_MAX_BATCH_SIZE:
                 return True
-            age = time.time() - self._pending[0].timestamp
-            if age >= Config.L2_BATCH_MAX_AGE_SECS:
+            if self._oldest_pending_age_locked(time.time()) >= Config.L2_BATCH_MAX_AGE_SECS:
                 return True
         return False
 
@@ -370,8 +413,9 @@ class Sequencer:
             # still at prev_root, the stateful check passes, and re-execution
             # advances the tree exactly as it does on every other node.
             # Symmetric: same code path runs everywhere.
-            batch_id  = self._next_batch_id
             with self.layer2._lock:
+                last_committed = int(getattr(self.layer2, "_last_batch_id", -1))
+                batch_id = max(self._next_batch_id, max(0, last_committed + 1))
                 prev_root = self.layer2._tree.root()
                 # Take a snapshot of every account before any mutation so we
                 # can restore to exactly prev_root regardless of which txs
@@ -380,12 +424,18 @@ class Sequencer:
                 batch = RollupBatch(batch_id, prev_root)
                 applied: List[L2Transaction] = []
                 failed_ids: set = set()
+                future_nonce_ids: set = set()
                 for tx in to_seal:
                     ok, msg = self.layer2.apply_l2_tx(tx)
                     if not ok:
                         log.debug(f"[SEQUENCER] tx {tx.l2_tx_id[:12]} did not "
                                   f"apply this round: {msg}")
-                        failed_ids.add(tx.l2_tx_id)
+                        acct = self.layer2._tree.peek(tx.sender)
+                        expected_nonce = acct.nonce if acct is not None else 0
+                        if tx.nonce > expected_nonce:
+                            future_nonce_ids.add(tx.l2_tx_id)
+                        else:
+                            failed_ids.add(tx.l2_tx_id)
                         continue
                     batch.add_tx(tx)
                     applied.append(tx)
@@ -409,7 +459,8 @@ class Sequencer:
                 # stale nonce lower than the sender's current one) doesn't
                 # sit in the pool forever and eventually starve add_l2_tx's
                 # pending-pool cap.
-                if failed_ids:
+                if failed_ids or future_nonce_ids:
+                    future_max = max(120, self._max_seal_attempts * 12)
                     with self._lock:
                         dead_ids = set()
                         for tx_id in failed_ids:
@@ -417,15 +468,22 @@ class Sequencer:
                             self._fail_counts[tx_id] = n
                             if n >= self._max_seal_attempts:
                                 dead_ids.add(tx_id)
+                        for tx_id in future_nonce_ids:
+                            n = self._fail_counts.get(tx_id, 0) + 1
+                            self._fail_counts[tx_id] = n
+                            if n >= future_max:
+                                dead_ids.add(tx_id)
                         if dead_ids:
                             log.warning(
                                 f"[SEQUENCER] dropping {len(dead_ids)} tx(s) "
-                                f"after {self._max_seal_attempts} failed seal "
-                                f"attempts: {[i[:12] for i in dead_ids]}")
+                                f"after exceeding failed seal attempt cap: "
+                                f"{[i[:12] for i in dead_ids]}")
                             self._pending = [t for t in self._pending
                                              if t.l2_tx_id not in dead_ids]
                             for tx_id in dead_ids:
                                 self._fail_counts.pop(tx_id, None)
+                                self._enqueued_at.pop(tx_id, None)
+                                self._seen_ids.discard(tx_id)
 
                 if not batch.txs:
                     # Nothing applied this round — restore (defensive no-op:
@@ -450,15 +508,50 @@ class Sequencer:
             # it only reads the frozen batch contents.
             compressed = RollupSubmission.compress_batch(batch.txs)
             if len(compressed) > RollupSubmission.MAX_COMPRESSED_BYTES:
-                log.error(f"[SEQUENCER] batch {batch_id} compressed to "
-                          f"{len(compressed)} bytes > cap; abandoning batch")
-                # L2-2 FIX side-effect: the live tree was already restored to
-                # prev_root inside the seal lock above, so there is nothing
-                # to roll back here — we simply abandon this batch.  The
-                # consumed pending entries get re-queued by NOT popping them
-                # below.
-                self._seal_cycle_lock.release()
-                return None
+                max_bytes = RollupSubmission.MAX_COMPRESSED_BYTES
+                if len(applied) <= 1 or len(RollupSubmission.compress_batch(applied[:1])) > max_bytes:
+                    oversized = applied[0]
+                    log.error(
+                        f"[SEQUENCER] single tx {oversized.l2_tx_id[:12]} "
+                        f"exceeds MAX_COMPRESSED_BYTES ({max_bytes} B); evicting")
+                    with self._lock:
+                        self._pending = [
+                            t for t in self._pending if t.l2_tx_id != oversized.l2_tx_id
+                        ]
+                        self._fail_counts.pop(oversized.l2_tx_id, None)
+                        self._enqueued_at.pop(oversized.l2_tx_id, None)
+                        self._seen_ids.discard(oversized.l2_tx_id)
+                    self._seal_cycle_lock.release()
+                    return None
+
+                lo, hi = 1, len(applied) - 1
+                best_k = 1
+                best_compressed = RollupSubmission.compress_batch(applied[:1])
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    cand = RollupSubmission.compress_batch(applied[:mid])
+                    if len(cand) <= max_bytes:
+                        best_k = mid
+                        best_compressed = cand
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+
+                applied = applied[:best_k]
+                compressed = best_compressed
+                with self.layer2._lock:
+                    self.layer2._tree.restore(seal_snap)
+                    batch = RollupBatch(batch_id, prev_root)
+                    for tx in applied:
+                        ok_re, msg_re = self.layer2.apply_l2_tx(tx)
+                        if not ok_re:
+                            self.layer2._tree.restore(seal_snap)
+                            raise RuntimeError(
+                                f"re-apply failed while shrinking batch {batch_id}: {msg_re}")
+                        batch.add_tx(tx)
+                    batch.new_root = self.layer2._tree.root()
+                    batch.sealed = True
+                    self.layer2._tree.restore(seal_snap)
 
             proof_bytes = self.generate_batch_proof(batch, compressed, seal_snap)
             backend     = ProofRegistry.get_configured()
@@ -482,6 +575,18 @@ class Sequencer:
             # tx.compute_fee_sat().  For amount=0 that is also 0.  We set
             # fee=0.0 explicitly.
             l1_chain_nonce = self.blockchain.storage.get_nonce(self.wallet.address)
+            _mp = getattr(self._state_engine, "mempool", None) or getattr(self.blockchain, "mempool", None)
+            if _mp is not None and callable(getattr(_mp, "next_nonce", None)):
+                try:
+                    l1_chain_nonce = max(l1_chain_nonce, int(_mp.next_nonce(self.wallet.address)))
+                except Exception:
+                    pass
+            elif _mp is not None and hasattr(_mp, "_pending_nonces"):
+                _pending = _mp._pending_nonces.get(self.wallet.address, set())
+                while l1_chain_nonce in _pending:
+                    l1_chain_nonce += 1
+            elif self._last_submitted_l1_nonce >= 0:
+                l1_chain_nonce = max(l1_chain_nonce, self._last_submitted_l1_nonce + 1)
             l1_tx = Transaction(
                 sender    = self.wallet.address,
                 receiver  = L2_BRIDGE_ADDRESS,
@@ -522,6 +627,7 @@ class Sequencer:
                      f"backend={backend.name()}")
             # AUDIT-FIX-L4: lock intentionally still held -- caller now owns
             # it and must release via _finalize_seal() or _abandon_seal().
+            self._last_seal_l1_nonce = l1_chain_nonce
             self._record_sealed(l1_tx.tx_id, batch_id, applied)
             return l1_tx, batch_id, applied
         except Exception:
@@ -551,7 +657,12 @@ class Sequencer:
                                  if t.l2_tx_id not in consumed]
                 for tx_id in consumed:
                     self._fail_counts.pop(tx_id, None)
-            self._next_batch_id = batch_id + 1
+                    self._enqueued_at.pop(tx_id, None)
+            self._next_batch_id = max(self._next_batch_id, batch_id + 1)
+            if hasattr(self, "_last_seal_l1_nonce"):
+                self._last_submitted_l1_nonce = max(
+                    self._last_submitted_l1_nonce, self._last_seal_l1_nonce
+                )
         finally:
             self._seal_cycle_lock.release()
 
@@ -657,13 +768,14 @@ class Sequencer:
     def status(self) -> dict:
         with self._lock:
             pending_n = len(self._pending)
-            oldest_age = (time.time() - self._pending[0].timestamp
-                          if self._pending else 0.0)
+            oldest_age = self._oldest_pending_age_locked(time.time())
+        last_committed = int(getattr(self.layer2, "_last_batch_id", -1))
+        next_bid = max(self._next_batch_id, max(0, last_committed + 1))
         return {
             "running":         self._running,
             "pending":         pending_n,
             "oldest_tx_age":   oldest_age,
-            "next_batch_id":   self._next_batch_id,
+            "next_batch_id":   next_bid,
             "backend":         ProofRegistry.get_configured().name(),
             "backend_security": ProofRegistry.get_configured().security(),
         }

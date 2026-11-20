@@ -272,7 +272,7 @@ class P2PNetwork:
         "VALIDATOR_SIG":     50,
         "EMERGENCY_VOTE":    20,
         "IDENTITY":          30,
-        "ALERT":             10,
+        "INVALID_NODE_ALERT": 10,
         "GET_BLOCK_MANIFEST": 10,
         "GET_BLOCK_CHUNK":   200,   # Accommodates 512KB chunking of large blocks
         # ── v7.6.0 Hashrate optimization gossip ──────────────────────────────
@@ -607,6 +607,17 @@ class P2PNetwork:
         except Exception:
             self._udp.release_inbound(addr)
 
+    def _udp_handshake_state(self):
+        lock = getattr(self, "_udp_handshakes_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._udp_handshakes_lock = lock
+        inflight = getattr(self, "_udp_handshakes", None)
+        if inflight is None:
+            inflight = {}
+            self._udp_handshakes = inflight
+        return lock, inflight
+
     def _udp_handle_inbound(self, addr: tuple):
         """
         Perform the VSD handshake (HELLO → VERIFY → CHALLENGE_RESP → ACCEPT)
@@ -622,7 +633,15 @@ class P2PNetwork:
         • The PoW, TOFU TLS pinning, and logic_hash trust checks from the TCP
           path are replicated here identically.
         """
+        addr = _udp_normalize_addr(addr)
         ip, port = addr
+        hs_lock, hs_map = self._udp_handshake_state()
+        hs_event = threading.Event()
+        with hs_lock:
+            if addr in hs_map:
+                # Outbound dial already owns this endpoint's handshake; yield to it.
+                return
+            hs_map[addr] = hs_event
         admission_released = False
         handshake_registered = False
         sess = None
@@ -655,13 +674,43 @@ class P2PNetwork:
             except (TypeError, ValueError):
                 peer_chain_height = -1
             peer_chain_tip_hash = str(msg.get("chain_tip_hash", "") or "")
-            peer_logic_hash  = msg.get("logic_hash", "")
+            peer_logic_hash  = str(msg.get("logic_hash", "") or "").strip()
             peer_hello_caps  = msg.get("capabilities", [])
-            peer_listen_port = int(msg.get("listen_port", Config.DEFAULT_PORT))
-            peer_udp_port    = int(msg.get("udp_port", port))
+            responder_challenge = str(msg.get("challenge", "") or "")
+            try:
+                peer_listen_port = int(msg.get("listen_port", Config.DEFAULT_PORT))
+                if not (1 <= peer_listen_port <= 65535):
+                    peer_listen_port = Config.DEFAULT_PORT
+            except (TypeError, ValueError):
+                peer_listen_port = Config.DEFAULT_PORT
+            try:
+                peer_udp_port = int(msg.get("udp_port", port))
+                if not (1 <= peer_udp_port <= 65535):
+                    peer_udp_port = port
+            except (TypeError, ValueError):
+                peer_udp_port = port
 
-            if not peer_id or not pub_hex:
+            if (not isinstance(peer_id, str) or not isinstance(pub_hex, str)
+                    or not peer_id or not pub_hex):
                 peer.send({"type": MSG_REJECT, "reason": "Missing identity"})
+                peer.close(); return
+            if not hmac.compare_digest(sha256(pub_hex.encode()), peer_id):
+                log.warning(
+                    f"[UDP] Inbound {ip} node_id {peer_id[:12]} does not match "
+                    f"sha256(pub_hex) — rejecting impersonation attempt")
+                _pa_push("IN", ip, peer_listen_port, "REJECTED:Identity")
+                peer.send({"type": MSG_REJECT, "reason": "Identity mismatch"})
+                peer.close(); return
+            if self._is_peer_blacklisted(peer_id):
+                _pa_push("IN", ip, peer_listen_port, "REJECTED:Blacklisted")
+                peer.send({"type": MSG_REJECT, "reason": "Peer blacklisted"})
+                peer.close(); return
+            if self._is_logic_hash_banned(peer_logic_hash):
+                log.debug(
+                    f"[SoftBan] Inbound UDP connection from banned logic_hash "
+                    f"{peer_logic_hash[:16]}... rejected")
+                _pa_push("IN", ip, peer_listen_port, "BANNED:LogicHash")
+                peer.send({"type": MSG_REJECT, "reason": "Logic hash banned"})
                 peer.close(); return
 
             # ── PoW verification ──────────────────────────────────────────
@@ -702,12 +751,8 @@ class P2PNetwork:
                 peer.close(); return
 
             # ── Trust classification ──────────────────────────────────────
-            if (peer_logic_hash
-                    and peer_logic_hash != _NODE_LOGIC_HASH
-                    and peer_logic_hash not in Config.KNOWN_GOOD_LOGIC_HASHES):
-                _inbound_trust = UDPPeerConnection.TRUST_LOW
-            else:
-                _inbound_trust = UDPPeerConnection.TRUST_HIGH
+            _inbound_trust = self._classify_logic_hash_trust(
+                peer_logic_hash, UDPPeerConnection.TRUST_HIGH, UDPPeerConnection.TRUST_LOW)
 
             # Reserve a real peer/subnet slot before ACCEPT. Sending ACCEPT first
             # allowed the dialer to display CONNECTED while we rejected it later.
@@ -722,8 +767,16 @@ class P2PNetwork:
                 peer.close()
                 return
 
+            _accept_sig = ""
+            if responder_challenge:
+                _resp_h = hashlib.sha256(
+                    f"VSD_UDP_ACCEPT:{responder_challenge}:{self.node_id}:{peer_id}".encode()
+                ).digest()
+                _accept_sig = sig_to_hex(ecdsa_sign(self.wallet.priv, _resp_h))
+
             _accept_message = {"type": MSG_ACCEPT, "node_id": self.node_id,
                        "pub_hex": self.wallet.pub_hex,
+                       "sig": _accept_sig,
                        "user_id": str(self.storage.get_meta("user_id") or ""),
                        "wallet_addr": str(getattr(self.wallet, "address", "") or ""),
                        "seed_node": self._is_seed_node_mode(),
@@ -760,8 +813,9 @@ class P2PNetwork:
             final_peer.chain_height = peer_chain_height
             final_peer.advertised_chain_height = peer_chain_height
             final_peer.chain_tip_hash = peer_chain_tip_hash
+            final_peer.logic_hash = peer_logic_hash
             # Register capabilities
-            if peer_hello_caps and hasattr(self, "_capability_router"):
+            if peer_hello_caps and getattr(self, "_capability_router", None) is not None:
                 try:
                     self._capability_router.handle_adv(peer_id, peer_hello_caps)
                 except Exception:
@@ -791,6 +845,10 @@ class P2PNetwork:
         except Exception as e:
             log.debug(f"[UDP] Inbound handler error {ip}:{port}: {e}")
         finally:
+            with hs_lock:
+                if hs_map.get(addr) is hs_event:
+                    hs_map.pop(addr, None)
+            hs_event.set()
             self._release_peer_admission(admission_token)
             if not handshake_registered:
                 # Do not leave a failed final peer in the address-indexed UDP
@@ -868,6 +926,21 @@ class P2PNetwork:
             except Exception:
                 pass
 
+        hs_lock, hs_map = self._udp_handshake_state()
+        hs_event = threading.Event()
+        while True:
+            with hs_lock:
+                existing_evt = hs_map.get(addr)
+                if existing_evt is None:
+                    hs_map[addr] = hs_event
+                    break
+            wait_secs = self._budget(self._UDP_CHALLENGE_WAIT_SECS, deadline)
+            if not existing_evt.wait(timeout=max(0.1, wait_secs)):
+                return False
+            with self._udp_peers_lock:
+                if addr in self._udp_peers and getattr(self._udp_peers[addr], "connected", False):
+                    return True
+
         sess = self._udp.get_session(addr)
         peer = UDPPeerConnection("outbound", ip, port, sess)
         final_peer = None
@@ -892,10 +965,12 @@ class P2PNetwork:
                 pow_nonce  = _pow_solve(_challenge, _diff)
 
             # ── Send HELLO ────────────────────────────────────────────────
+            responder_challenge = secrets.token_hex(16)
             hello = {
                 "type":         MSG_HELLO,
                 "node_id":      self.node_id,
                 "pub_hex":      self.wallet.pub_hex,
+                "challenge":    responder_challenge,
                 "user_id":      str(self.storage.get_meta("user_id") or getattr(self.wallet, "user_id", "") or ""),
                 "wallet_addr":  str(getattr(self.wallet, "address", "") or ""),
                 "seed_node":    self._is_seed_node_mode(),
@@ -967,13 +1042,35 @@ class P2PNetwork:
             except (TypeError, ValueError):
                 accept_chain_height = -1
             accept_chain_tip_hash = str(accept_msg.get("chain_tip_hash", "") or "")
-            remote_logic_hash = accept_msg.get("logic_hash", "")
+            remote_logic_hash = str(accept_msg.get("logic_hash", "") or "").strip()
             remote_caps       = accept_msg.get("capabilities", [])
 
-            if not remote_peer_id or not remote_pub_hex:
+            if (not isinstance(remote_peer_id, str)
+                    or not isinstance(remote_pub_hex, str)
+                    or not remote_peer_id or not remote_pub_hex):
                 peer.close(); return False
             if remote_id_from_verify and remote_peer_id != remote_id_from_verify:
                 log.warning("[UDP] peer identity changed between VERIFY and ACCEPT; rejecting")
+                peer.close(); return False
+            if not hmac.compare_digest(sha256(remote_pub_hex.encode()), remote_peer_id):
+                log.warning("[UDP] responder node_id does not match sha256(pub_hex); rejecting")
+                peer.close(); return False
+            try:
+                _remote_pub = pub_from_hex(remote_pub_hex)
+                _resp_sig = sig_from_hex(accept_msg.get("sig", "[]"))
+                _resp_h = hashlib.sha256(
+                    f"VSD_UDP_ACCEPT:{responder_challenge}:{remote_peer_id}:{self.node_id}".encode()
+                ).digest()
+                if not ecdsa_verify(_remote_pub, _resp_h, _resp_sig):
+                    log.warning("[UDP] responder ACCEPT signature invalid; rejecting")
+                    peer.close(); return False
+            except Exception:
+                log.warning("[UDP] responder ACCEPT signature verification failed; rejecting")
+                peer.close(); return False
+            if self._is_logic_hash_banned(remote_logic_hash):
+                log.debug(
+                    f"[SoftBan] Outbound UDP connection to banned logic_hash "
+                    f"{remote_logic_hash[:16]}... rejected")
                 peer.close(); return False
             if admission_token is None:
                 admission_token = self._reserve_peer_admission(
@@ -985,12 +1082,8 @@ class P2PNetwork:
                 return False
 
             # ── Trust classification ──────────────────────────────────────
-            if (remote_logic_hash
-                    and remote_logic_hash != _NODE_LOGIC_HASH
-                    and remote_logic_hash not in Config.KNOWN_GOOD_LOGIC_HASHES):
-                _trust = UDPPeerConnection.TRUST_LOW
-            else:
-                _trust = UDPPeerConnection.TRUST_HIGH
+            _trust = self._classify_logic_hash_trust(
+                remote_logic_hash, UDPPeerConnection.TRUST_HIGH, UDPPeerConnection.TRUST_LOW)
 
             # Stop the temporary handshake wrapper's idle writer before the
             # same UDP session is owned by the registered peer.
@@ -1005,8 +1098,9 @@ class P2PNetwork:
             final_peer.chain_height = accept_chain_height
             final_peer.advertised_chain_height = accept_chain_height
             final_peer.chain_tip_hash = accept_chain_tip_hash
+            final_peer.logic_hash = remote_logic_hash
 
-            if remote_caps and hasattr(self, "_capability_router"):
+            if remote_caps and getattr(self, "_capability_router", None) is not None:
                 try:
                     self._capability_router.handle_adv(remote_peer_id, remote_caps)
                 except Exception:
@@ -1038,6 +1132,10 @@ class P2PNetwork:
             log.debug(f"[UDP] connect_to {ip}:{port} error: {e}")
             return False
         finally:
+            with hs_lock:
+                if hs_map.get(addr) is hs_event:
+                    hs_map.pop(addr, None)
+            hs_event.set()
             self._release_peer_admission(admission_token)
             if not handshake_registered:
                 # A rejected _register_peer() can happen after final_peer has
@@ -1123,7 +1221,10 @@ class P2PNetwork:
         # Clean up only this session.  A reconnect may already have installed a
         # newer peer at the same endpoint while the old receive loop was
         # unwinding; an unconditional pop here would erase the replacement.
-        addr = _udp_normalize_addr((peer.ip, peer.port))
+        sess_addr = getattr(getattr(peer, "_session", None), "addr", None)
+        addr = _udp_normalize_addr(
+            sess_addr if sess_addr is not None else (peer.ip, peer.port)
+        )
         with self._udp_peers_lock:
             if self._udp_peers.get(addr) is peer:
                 self._udp_peers.pop(addr, None)
@@ -1238,18 +1339,32 @@ class P2PNetwork:
         with self._msg_rate_lock:
             rec = self._msg_rate.get(peer.peer_id)
             if rec is None:
-                rec = {"global": deque(), "types": defaultdict(deque)}
+                rec = {
+                    "global": deque(),
+                    "global_dropped": deque(),
+                    "types": defaultdict(deque),
+                    "types_dropped": defaultdict(deque),
+                }
                 self._msg_rate[peer.peer_id] = rec
             g = rec["global"]
             while g and g[0] < cutoff:
                 g.popleft()
+            g_dropped = rec.setdefault("global_dropped", deque())
+            while g_dropped and g_dropped[0] < cutoff:
+                g_dropped.popleft()
             t_deque = rec["types"][mtype]
             while t_deque and t_deque[0] < cutoff:
                 t_deque.popleft()
+            t_dropped = rec.setdefault("types_dropped", defaultdict(deque))[mtype]
+            while t_dropped and t_dropped[0] < cutoff:
+                t_dropped.popleft()
 
             # Global cap
             if len(g) >= self._MSG_RATE_GLOBAL:
-                over = len(g) / max(1, self._MSG_RATE_GLOBAL)
+                if len(g) + len(g_dropped) <= self._MSG_RATE_GLOBAL * 2 + 1:
+                    g_dropped.append(now)
+                total_g = len(g) + len(g_dropped)
+                over = total_g / max(1, self._MSG_RATE_GLOBAL)
                 if over > 2.0:
                     try:
                         self.storage.add_ban_score(
@@ -1259,18 +1374,21 @@ class P2PNetwork:
                         pass
                     log.warning(
                         "Peer %s: global msg-rate %d/%ds (%.1fx over) — penalizing",
-                        peer.peer_id[:12], len(g),
+                        peer.peer_id[:12], total_g,
                         self._MSG_RATE_WINDOW, over)
                 else:
                     log.debug(
                         "Peer %s: global msg-rate %d/%ds — dropping",
-                        peer.peer_id[:12], len(g), self._MSG_RATE_WINDOW)
+                        peer.peer_id[:12], total_g, self._MSG_RATE_WINDOW)
                 return False
 
             # Per-type cap
             limit = self._MSG_RATE_PERTYPE.get(mtype)
             if limit is not None and len(t_deque) >= limit:
-                over = len(t_deque) / max(1, limit)
+                if len(t_deque) + len(t_dropped) <= limit * 2 + 1:
+                    t_dropped.append(now)
+                total_t = len(t_deque) + len(t_dropped)
+                over = total_t / max(1, limit)
                 if over > 2.0:
                     try:
                         self.storage.add_ban_score(
@@ -1281,12 +1399,12 @@ class P2PNetwork:
                     log.warning(
                         "Peer %s: type=%s rate %d/%ds (%.1fx over) — penalizing",
                         peer.peer_id[:12], mtype,
-                        len(t_deque), self._MSG_RATE_WINDOW, over)
+                        total_t, self._MSG_RATE_WINDOW, over)
                 else:
                     log.debug(
                         "Peer %s: type=%s rate %d/%ds — dropping",
                         peer.peer_id[:12], mtype,
-                        len(t_deque), self._MSG_RATE_WINDOW)
+                        total_t, self._MSG_RATE_WINDOW)
                 return False
 
             g.append(now)
@@ -1737,9 +1855,13 @@ class P2PNetwork:
             except (TypeError, ValueError):
                 peer_chain_height = -1
             peer_chain_tip_hash = str(msg.get("chain_tip_hash", "") or "")
-            peer_tls_fp = msg.get("tls_fp", "")   # advertised TLS fingerprint
+            raw_tls_fp = msg.get("tls_fp", "")   # advertised TLS fingerprint
+            peer_tls_fp = (
+                raw_tls_fp.strip().lower().replace(":", "")
+                if isinstance(raw_tls_fp, str) else ""
+            )
             # NEW: software identity hash for trust classification
-            peer_logic_hash = msg.get("logic_hash", "")
+            peer_logic_hash = str(msg.get("logic_hash", "") or "").strip()
             # v6.9.9.7: read peer capabilities from HELLO so capability router
             # is populated immediately (was delayed up to 120 s before).
             peer_hello_caps = msg.get("capabilities", [])
@@ -1750,23 +1872,35 @@ class P2PNetwork:
             # addr[1] is the ephemeral OS source port of this TCP connection —
             # NOT the port the remote is listening on.  Old nodes that don't
             # send this field fall back to DEFAULT_PORT as a safe assumption.
-            peer_listen_port = int(msg.get("listen_port", Config.DEFAULT_PORT))
+            try:
+                peer_listen_port = int(msg.get("listen_port", Config.DEFAULT_PORT))
+                if not (1 <= peer_listen_port <= 65535):
+                    peer_listen_port = Config.DEFAULT_PORT
+            except (TypeError, ValueError):
+                peer_listen_port = Config.DEFAULT_PORT
 
-            if not peer_id or not pub_hex:
+            if (not isinstance(peer_id, str) or not isinstance(pub_hex, str)
+                    or not peer_id or not pub_hex):
                 tmp.send({"type": MSG_REJECT, "reason": "Missing identity"})
                 tmp.close(); return
-
-            # ── TLS fingerprint pinning (TOFU) ────────────────────────────────
-            if tls_ctx and peer_tls_fp:
-                stored_fp = self.storage.get_peer_tls_fp(peer_id)
-                if stored_fp and not hmac.compare_digest(stored_fp, peer_tls_fp):
-                    log.warning(
-                        f"TLS fingerprint mismatch for {peer_id[:12]} — "
-                        f"possible MITM! Rejecting.")
-                    tmp.send({"type": MSG_REJECT, "reason": "TLS fingerprint mismatch"})
-                    tmp.close(); return
-                elif not stored_fp and peer_tls_fp:
-                    self.storage.set_peer_tls_fp(peer_id, peer_tls_fp)
+            if not hmac.compare_digest(sha256(pub_hex.encode()), peer_id):
+                log.warning(
+                    f"Inbound {client_ip} node_id {peer_id[:12]} does not match "
+                    f"sha256(pub_hex) — rejecting impersonation attempt")
+                _pa_push("IN", client_ip, peer_listen_port, "REJECTED:Identity")
+                tmp.send({"type": MSG_REJECT, "reason": "Identity mismatch"})
+                tmp.close(); return
+            if self._is_peer_blacklisted(peer_id):
+                _pa_push("IN", client_ip, peer_listen_port, "REJECTED:Blacklisted")
+                tmp.send({"type": MSG_REJECT, "reason": "Peer blacklisted"})
+                tmp.close(); return
+            if self._is_logic_hash_banned(peer_logic_hash):
+                log.debug(
+                    f"[SoftBan] Inbound TCP connection from banned logic_hash "
+                    f"{peer_logic_hash[:16]}... rejected")
+                _pa_push("IN", client_ip, peer_listen_port, "BANNED:LogicHash")
+                tmp.send({"type": MSG_REJECT, "reason": "Logic hash banned"})
+                tmp.close(); return
 
             challenge = secrets.token_hex(16)
             tmp.send({"type": MSG_VERIFY, "challenge": challenge,
@@ -1834,6 +1968,25 @@ class P2PNetwork:
                     tmp.close()
                     return
 
+            # ── TLS fingerprint pinning check (post-ECDSA & post-PoW) ────────
+            stored_fp = None
+            if tls_ctx:
+                if not peer_tls_fp:
+                    log.warning(
+                        f"Missing TLS fingerprint from {peer_id[:12]} — rejecting.")
+                    _pa_push("IN", client_ip, peer_listen_port, "REJECTED:TLS")
+                    tmp.send({"type": MSG_REJECT, "reason": "Missing TLS fingerprint"})
+                    tmp.close(); return
+                stored_fp = self.storage.get_peer_tls_fp(peer_id)
+                if stored_fp and not hmac.compare_digest(
+                        stored_fp.strip().lower(), peer_tls_fp):
+                    log.warning(
+                        f"TLS fingerprint mismatch for {peer_id[:12]} — "
+                        f"possible MITM! Rejecting.")
+                    _pa_push("IN", client_ip, peer_listen_port, "REJECTED:TLS")
+                    tmp.send({"type": MSG_REJECT, "reason": "TLS fingerprint mismatch"})
+                    tmp.close(); return
+
             # Reserve before ACCEPT; otherwise the dialer can register a ghost
             # peer if local capacity/subnet admission later rejects registration.
             _admission_rejection = {}
@@ -1848,8 +2001,17 @@ class P2PNetwork:
                 tmp.close()
                 return
 
+            _tcp_resp_chal = str(resp.get("responder_challenge", "") or "")
+            _tcp_accept_sig = ""
+            if _tcp_resp_chal:
+                _tcp_resp_h = hashlib.sha256(
+                    f"VSD_TCP_ACCEPT:{_tcp_resp_chal}:{self.node_id}:{peer_id}".encode()
+                ).digest()
+                _tcp_accept_sig = sig_to_hex(ecdsa_sign(self.wallet.priv, _tcp_resp_h))
+
             _accept_message = {"type": MSG_ACCEPT, "node_id": self.node_id,
                       "pub_hex": self.wallet.pub_hex,
+                      "sig": _tcp_accept_sig,
                       "user_id": str(self.storage.get_meta("user_id") or ""),
                       "wallet_addr": str(getattr(self.wallet, "address", "") or ""),
                       "seed_node": self._is_seed_node_mode(),
@@ -1874,7 +2036,7 @@ class P2PNetwork:
 
             # v6.9.9.7: register inbound peer's capabilities immediately from HELLO
             # (was delayed until first MSG_CAPABILITY_ADV, up to 120 s later).
-            if peer_hello_caps and hasattr(self, "_capability_router"):
+            if peer_hello_caps and getattr(self, "_capability_router", None) is not None:
                 try:
                     self._capability_router.handle_adv(peer_id, peer_hello_caps)
                     log.debug(f"Inbound {peer_id[:12]} capabilities from HELLO: "
@@ -1886,17 +2048,14 @@ class P2PNetwork:
             # be running a legitimate but older or custom build.
             # Instead we flag the peer TRUST_LEVEL_LOW and activate Full Audit
             # Mode so every message from it is scrutinised more deeply.
-            if (peer_logic_hash
-                    and peer_logic_hash != _NODE_LOGIC_HASH
-                    and peer_logic_hash not in Config.KNOWN_GOOD_LOGIC_HASHES):
-                _inbound_trust = PeerConnection.TRUST_LOW
+            _inbound_trust = self._classify_logic_hash_trust(
+                peer_logic_hash, PeerConnection.TRUST_HIGH, PeerConnection.TRUST_LOW)
+            if _inbound_trust == PeerConnection.TRUST_LOW:
                 log.warning(
                     f"Inbound {peer_id[:12]} logic_hash="
-                    f"{peer_logic_hash[:16]}... "
+                    f"{(peer_logic_hash[:16] + '...') if peer_logic_hash else '<empty>'} "
                     f"(ours={_NODE_LOGIC_HASH[:16]}...) — "
                     f"TRUST_LEVEL_LOW; Full Audit Mode enabled")
-            else:
-                _inbound_trust = PeerConnection.TRUST_HIGH
 
             # The temporary handshake wrapper starts its own writer thread in
             # __init__, but handshake sends are synchronous. Stop that idle
@@ -1911,6 +2070,7 @@ class P2PNetwork:
             peer.chain_height = peer_chain_height
             peer.advertised_chain_height = peer_chain_height
             peer.chain_tip_hash = peer_chain_tip_hash
+            peer.logic_hash = peer_logic_hash
             # BUG-FIX (v7.0.0.1): Transfer any bytes already buffered by
             # recv_line() during the handshake into the new peer object.
             # recv_line() accumulates raw TCP bytes in tmp._recv_buf.  TCP is a
@@ -1941,6 +2101,8 @@ class P2PNetwork:
             # proceed when registration actually succeeded.
             if not peer.connected:
                 return   # rejected by _register_peer; socket already closed
+            if tls_ctx and peer_tls_fp and not stored_fp:
+                self.storage.set_peer_tls_fp(peer_id, peer_tls_fp)
             _pa_push("IN", client_ip, peer_listen_port, "CONNECTED")
             self._peer_message_loop(peer)
         except Exception as e:
@@ -2132,7 +2294,11 @@ class P2PNetwork:
                 tmp.close(); return False
 
             challenge   = msg.get("challenge", "")
-            peer_tls_fp = msg.get("tls_fp", "")
+            raw_tls_fp  = msg.get("tls_fp", "")
+            peer_tls_fp = (
+                raw_tls_fp.strip().lower().replace(":", "")
+                if isinstance(raw_tls_fp, str) else ""
+            )
             peer_id_from_verify = str(msg.get("node_id", "") or "")
             # Reserve a local slot before sending CHALLENGE_RESP. Current Visold
             # peers include node_id in VERIFY; legacy peers use fallback below.
@@ -2153,19 +2319,22 @@ class P2PNetwork:
                     finally:
                         tmp.close()
                     return False
-            # Bind the HELLO/VERIFY-advertised certificate identity to the actual
-            # certificate presented by this TLS session.  This prevents the app
-            # handshake from pinning a fingerprint unrelated to the socket.
-            if (_candidate_peer_cert_fp and peer_tls_fp
-                    and not hmac.compare_digest(
-                        _candidate_peer_cert_fp, str(peer_tls_fp).lower())):
-                log.warning(
-                    f"TLS certificate/handshake fingerprint mismatch for "
-                    f"{_format_peer_addr(ip, port)} — rejecting")
-                tmp.close()
-                return False
+            # Bind the VERIFY-advertised certificate identity to the actual
+            # certificate presented by this TLS session. When TLS is active,
+            # an empty or mismatched tls_fp must be rejected.
+            if _candidate_peer_cert_fp:
+                if (not peer_tls_fp
+                        or not hmac.compare_digest(
+                            _candidate_peer_cert_fp, peer_tls_fp)):
+                    log.warning(
+                        f"TLS certificate/handshake fingerprint mismatch or missing for "
+                        f"{_format_peer_addr(ip, port)} — rejecting")
+                    tmp.close()
+                    return False
+            responder_challenge = os.urandom(32).hex()
             sig = self.wallet.sign(challenge.encode())
-            tmp.send({"type": "CHALLENGE_RESP", "sig": sig_to_hex(sig)})
+            tmp.send({"type": "CHALLENGE_RESP", "sig": sig_to_hex(sig),
+                      "responder_challenge": responder_challenge})
 
             msg = tmp.recv_line(timeout=8)
             if not msg:
@@ -2183,11 +2352,29 @@ class P2PNetwork:
                     _pa_push("OUT", ip, port, "REJECTED:Remote")
                 tmp.close(); return False
 
-            peer_id  = msg.get("node_id", sha256(
-                _format_peer_addr(ip, port).encode()))
+            peer_id  = msg.get("node_id", "")
             pub_hex  = msg.get("pub_hex", "")
+            if (not isinstance(peer_id, str) or not isinstance(pub_hex, str)
+                    or not peer_id or not pub_hex):
+                log.warning("[TCP] peer omitted node_id or pub_hex in ACCEPT; rejecting")
+                tmp.close(); return False
+            if not hmac.compare_digest(sha256(pub_hex.encode()), peer_id):
+                log.warning("[TCP] peer node_id does not match sha256(pub_hex); rejecting")
+                tmp.close(); return False
             if peer_id_from_verify and peer_id != peer_id_from_verify:
                 log.warning("[TCP] peer identity changed between VERIFY and ACCEPT; rejecting")
+                tmp.close(); return False
+            try:
+                _remote_pub = pub_from_hex(pub_hex)
+                _resp_sig = sig_from_hex(msg.get("sig", "[]"))
+                _resp_h = hashlib.sha256(
+                    f"VSD_TCP_ACCEPT:{responder_challenge}:{peer_id}:{self.node_id}".encode()
+                ).digest()
+                if not ecdsa_verify(_remote_pub, _resp_h, _resp_sig):
+                    log.warning("[TCP] responder ACCEPT signature invalid; rejecting")
+                    tmp.close(); return False
+            except Exception:
+                log.warning("[TCP] responder ACCEPT signature verification failed; rejecting")
                 tmp.close(); return False
             if admission_token is None:
                 admission_token = self._reserve_peer_admission(
@@ -2198,7 +2385,13 @@ class P2PNetwork:
                 tmp.close()
                 return False
             # NEW: read the remote node's software identity from ACCEPT
-            accept_logic_hash = msg.get("logic_hash", "")
+            accept_logic_hash = str(msg.get("logic_hash", "") or "").strip()
+            if self._is_logic_hash_banned(accept_logic_hash):
+                log.debug(
+                    f"[SoftBan] Outbound TCP connection to banned logic_hash "
+                    f"{accept_logic_hash[:16]}... rejected")
+                _pa_push("OUT", ip, port, "BANNED:LogicHash")
+                tmp.close(); return False
             remote_user_id = str(msg.get("user_id", "") or "")
             remote_wallet_addr = str(msg.get("wallet_addr", "") or "")
             remote_is_seed_node = (msg.get("seed_node") is True)
@@ -2210,18 +2403,17 @@ class P2PNetwork:
                 accept_chain_height = -1
             accept_chain_tip_hash = str(msg.get("chain_tip_hash", "") or "")
 
-            # TLS fingerprint pinning for outbound connection.  The advertised
-            # fingerprint must match the TLS certificate from this socket (above),
-            # and a previously pinned fingerprint for this peer_id must not change.
-            if peer_tls_fp:
+            # TLS fingerprint pinning for outbound connection: compare against the
+            # cryptographically observed socket certificate fingerprint.
+            stored_fp = None
+            if _candidate_peer_cert_fp:
                 stored_fp = self.storage.get_peer_tls_fp(peer_id)
-                if stored_fp and not hmac.compare_digest(stored_fp, peer_tls_fp):
+                if stored_fp and not hmac.compare_digest(
+                        stored_fp.strip().lower(), _candidate_peer_cert_fp):
                     log.warning(
                         f"TLS fingerprint mismatch for outbound {peer_id[:12]} — "
                         f"possible MITM or unexpected certificate rotation; rejecting.")
                     tmp.close(); return False
-                elif not stored_fp:
-                    self.storage.set_peer_tls_fp(peer_id, peer_tls_fp)
 
             # Only record the endpoint cache after the signed challenge succeeded,
             # the certificate matched VERIFY, and the durable peer-id pin passed.
@@ -2239,17 +2431,14 @@ class P2PNetwork:
             # ── Logic Hash Trust Classification (Hybrid Approach) ─────────────
             # Mirror the inbound logic: keep the connection, but flag the peer
             # TRUST_LEVEL_LOW if it advertises an unrecognised logic_hash.
-            if (accept_logic_hash
-                    and accept_logic_hash != _NODE_LOGIC_HASH
-                    and accept_logic_hash not in Config.KNOWN_GOOD_LOGIC_HASHES):
-                _outbound_trust = PeerConnection.TRUST_LOW
+            _outbound_trust = self._classify_logic_hash_trust(
+                accept_logic_hash, PeerConnection.TRUST_HIGH, PeerConnection.TRUST_LOW)
+            if _outbound_trust == PeerConnection.TRUST_LOW:
                 log.warning(
                     f"Outbound {peer_id[:12]} logic_hash="
-                    f"{accept_logic_hash[:16]}... "
+                    f"{(accept_logic_hash[:16] + '...') if accept_logic_hash else '<empty>'} "
                     f"(ours={_NODE_LOGIC_HASH[:16]}...) — "
                     f"TRUST_LEVEL_LOW; Full Audit Mode enabled")
-            else:
-                _outbound_trust = PeerConnection.TRUST_HIGH
 
             # Stop the temporary handshake wrapper's idle writer before the
             # same socket is owned by the registered peer. tmp._recv_buf is
@@ -2263,6 +2452,7 @@ class P2PNetwork:
             peer.chain_height = accept_chain_height
             peer.advertised_chain_height = accept_chain_height
             peer.chain_tip_hash = accept_chain_tip_hash
+            peer.logic_hash = accept_logic_hash
             # BUG-FIX (v7.0.0.1): Same _recv_buf transfer as the inbound path.
             # recv_line() was called multiple times during the outbound handshake
             # (POW_CHALLENGE, VERIFY, ACCEPT).  Any bytes arriving in the same
@@ -2285,9 +2475,11 @@ class P2PNetwork:
             # the connection succeeded when registration was actually rejected.
             if not peer.connected:
                 return False   # rejected by _register_peer; socket already closed
+            if _candidate_peer_cert_fp and not stored_fp:
+                self.storage.set_peer_tls_fp(peer_id, _candidate_peer_cert_fp)
 
             # v6.9.9.7: register outbound peer capabilities immediately from ACCEPT.
-            if accept_caps and hasattr(self, "_capability_router"):
+            if accept_caps and getattr(self, "_capability_router", None) is not None:
                 try:
                     self._capability_router.handle_adv(peer_id, accept_caps)
                     log.debug(f"Outbound {peer_id[:12]} capabilities from ACCEPT: "
@@ -3376,6 +3568,8 @@ class P2PNetwork:
 
         if not peer_id or peer_id == self.node_id:
             return _reject("EMPTY_OR_SELF_IDENTITY")
+        if self._is_peer_blacklisted(peer_id):
+            return _reject("PEER_BLACKLISTED")
         normalized_ip = _normalize_ip(str(ip or ""))
         if not normalized_ip:
             return _reject("INVALID_IP_ADDRESS")
@@ -4232,6 +4426,28 @@ class P2PNetwork:
             self._release_peer_admission(admission_token)
             return
 
+        if self._is_peer_blacklisted(peer_id):
+            log.debug("[PeerAdmission] refusing registration for blacklisted peer=%s",
+                      str(peer_id)[:12])
+            try:
+                peer.connected = False
+                peer.close()
+            except Exception:
+                pass
+            self._release_peer_admission(admission_token)
+            return
+
+        if self._is_logic_hash_banned(getattr(peer, "logic_hash", "")):
+            log.debug("[SoftBan] Refusing registration for banned logic_hash peer=%s",
+                      str(peer_id)[:12])
+            try:
+                peer.connected = False
+                peer.close()
+            except Exception:
+                pass
+            self._release_peer_admission(admission_token)
+            return
+
         if admission_token is None:
             direction = bool(local_outbound) if local_outbound is not None else False
             admission_token = self._reserve_peer_admission(
@@ -4676,6 +4892,60 @@ class P2PNetwork:
             return int(time.time()) < int(record.get("until", 0))
         except Exception:
             return False
+
+    def _is_logic_hash_banned(self, logic_hash: str) -> bool:
+        """Return True if `logic_hash` is currently under a soft-ban (F-11)."""
+        lh = str(logic_hash or "").strip()
+        if not lh or lh in ("unknown", _NODE_LOGIC_HASH):
+            return False
+        storage = getattr(self, "storage", None)
+        if storage is None:
+            return False
+        try:
+            raw = storage.get_meta(f"logic_hash_ban:{lh}")
+            if not raw:
+                return False
+            record = json.loads(raw)
+            return int(time.time()) < int(record.get("until", 0))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _classify_logic_hash_trust(logic_hash: str, trust_high: str, trust_low: str) -> str:
+        """Return TRUST_HIGH only for explicitly recognized logic_hash values."""
+        lh = str(logic_hash or "").strip()
+        if lh and (lh == _NODE_LOGIC_HASH or lh in Config.KNOWN_GOOD_LOGIC_HASHES):
+            return trust_high
+        return trust_low
+
+    def _is_peer_blacklisted(self, peer_id: str) -> bool:
+        if not peer_id:
+            return False
+        storage = getattr(self, "storage", None)
+        if storage is None:
+            return False
+        fn = getattr(storage, "is_peer_blacklisted", None)
+        if callable(fn):
+            return bool(fn(peer_id))
+        conn_fn = getattr(storage, "_conn", None)
+        if not callable(conn_fn):
+            return False
+        try:
+            row = conn_fn().execute(
+                "SELECT blacklisted FROM peers WHERE peer_id=?",
+                (peer_id,)).fetchone()
+            return bool(row and row["blacklisted"])
+        except Exception:
+            return True
+
+    @staticmethod
+    def _safe_wire_int(val, default: Optional[int] = None) -> Optional[int]:
+        if isinstance(val, bool) or val is None:
+            return default
+        try:
+            return int(val)
+        except (TypeError, ValueError, OverflowError):
+            return default
 
     def _soft_ban_record_failure(self, peer: 'PeerConnection', mtype: str):
         """
@@ -6636,6 +6906,7 @@ class P2PNetwork:
                 if not reporter_id or reporter_id == self.node_id:
                     return
 
+                previous = None
                 signed_report = bool(msg.get("sig"))
                 if signed_report:
                     report_max_age = min(
@@ -6686,19 +6957,34 @@ class P2PNetwork:
                     report_ts = msg.get("ts")
                     report_seq = msg.get("seq")
 
+                peer_miner_addr = None
+                if signed_report and msg.get("pub_hex"):
+                    try:
+                        peer_miner_addr = pub_to_address(pub_from_hex(str(msg["pub_hex"])))
+                    except Exception:
+                        peer_miner_addr = None
                 me_attr = getattr(self, "_mining_engine_ref", None)
                 if me_attr is not None:
                     gov = me_attr.get_hashrate_governor()
                     if gov is not None:
-                        accepted = gov.record_peer_hashrate(
-                            reporter_id, report_hps,
-                            reported_ts=report_ts, sequence=report_seq)
+                        try:
+                            accepted = gov.record_peer_hashrate(
+                                reporter_id, report_hps,
+                                reported_ts=report_ts, sequence=report_seq,
+                                miner_address=peer_miner_addr)
+                        except TypeError:
+                            accepted = gov.record_peer_hashrate(
+                                reporter_id, report_hps,
+                                reported_ts=report_ts, sequence=report_seq)
                         if not accepted:
                             if signed_report:
                                 with self._hr_reports_lock:
                                     current = self._hr_reports_seen.get(reporter_id)
                                     if current and current[0] == report_seq:
-                                        self._hr_reports_seen.pop(reporter_id, None)
+                                        if previous is not None:
+                                            self._hr_reports_seen[reporter_id] = previous
+                                        else:
+                                            self._hr_reports_seen.pop(reporter_id, None)
                             log.debug(f"[HR-Report] rejected invalid/stale/replayed report from {reporter_id[:12]}")
                             return
 
@@ -6738,12 +7024,23 @@ class P2PNetwork:
                 # documented in the auditor class).
                 cap_registry = {}
                 with gov._lock:
+                    peer_addrs = getattr(gov, "_peer_addresses", {})
                     for pid, (rate, _ts) in gov._peer_rates.items():
                         if rate > 0:
-                            cap_registry[pid] = rate
+                            addr_key = peer_addrs.get(pid, pid)
+                            cap_registry[addr_key] = cap_registry.get(addr_key, 0.0) + float(rate)
                     if gov._local_actual_hashrate > 0:
-                        my_id = getattr(self, "node_id", "self")
-                        cap_registry[my_id] = gov._local_actual_hashrate
+                        local_addr = ""
+                        wallet_ref = getattr(self, "wallet", None)
+                        if wallet_ref is not None:
+                            local_addr = str(getattr(wallet_ref, "address", "") or "")
+                        if not local_addr and getattr(self, "storage", None) is not None:
+                            try:
+                                local_addr = str(self.storage.get_meta("own_address") or "")
+                            except Exception:
+                                local_addr = ""
+                        my_id = local_addr or getattr(self, "node_id", "self")
+                        cap_registry[my_id] = cap_registry.get(my_id, 0.0) + float(gov._local_actual_hashrate)
                 if not cap_registry:
                     log.debug("[RateAudit-MSG] empty cap registry; cannot verify")
                     return
@@ -6840,7 +7137,7 @@ class P2PNetwork:
         # ── Parallel Block Sync Handlers ──────────────────────────────────────────
         elif mtype == MSG_GET_BLOCK_MANIFEST:
             bh = msg.get("block_hash")
-            if bh:
+            if isinstance(bh, str) and bh:
                 raw_block = self._get_serialized_block(bh)
                 if raw_block:
                     chunk_sz = ParallelBlockDownloader.CHUNK_SIZE
@@ -6867,8 +7164,8 @@ class P2PNetwork:
 
         elif mtype == MSG_GET_BLOCK_CHUNK:
             bh = msg.get("block_hash")
-            idx = int(msg.get("chunk_index", -1))
-            if bh and idx >= 0:
+            idx = self._safe_wire_int(msg.get("chunk_index", -1), -1)
+            if isinstance(bh, str) and bh and idx is not None and idx >= 0:
                 raw_block = self._get_serialized_block(bh)
                 if raw_block:
                     chunk_sz = ParallelBlockDownloader.CHUNK_SIZE
@@ -7204,6 +7501,14 @@ class P2PNetwork:
                     )
                     return
 
+                _expected_source = _stash.get("source_peer")
+                if _expected_source and peer.peer_id != _expected_source:
+                    log.warning(
+                        f"[CMPCT] MSG_BLOCKTXN for {_fill_bh[:16]} from unexpected "
+                        f"peer {peer.peer_id[:12]} (expected {_expected_source[:12]}) — ignoring"
+                    )
+                    return
+
                 # Check we haven't already processed this block hash
                 if self._seen_msgs.get(("BLOCK", _fill_bh)):
                     with self._compact_stash_lock:
@@ -7330,9 +7635,9 @@ class P2PNetwork:
                     self._finish_block_gossip(_fill_bh, False)
 
         elif mtype == MSG_GET_BLOCK:
-            _req_idx = msg.get("index")
-            if _req_idx is not None:
-                _req_block = self.blockchain.get_block(int(_req_idx))
+            _req_idx = self._safe_wire_int(msg.get("index"), None)
+            if _req_idx is not None and _req_idx >= 0:
+                _req_block = self.blockchain.get_block(_req_idx)
                 if _req_block is not None:
                     peer.send({"type": MSG_BLOCK, "block": _req_block.to_dict()})
 
@@ -7563,7 +7868,21 @@ class P2PNetwork:
             #     NOT yield to a non-existent pagination thread and will
             #     instead continue its own loop from the new tip.
             #
-            _server_height   = msg.get("server_height", -1)
+            _raw_server_height = msg.get("server_height", -1)
+            if isinstance(_raw_server_height, bool) or not isinstance(_raw_server_height, int):
+                log.warning(
+                    f"[ChainSync] Peer {peer.peer_id[:12]} sent invalid "
+                    f"server_height={_raw_server_height!r} — rejecting MSG_CHAIN")
+                try:
+                    self.storage.add_ban_score(
+                        peer.peer_id,
+                        getattr(Config, "PEER_SCORE_INVALID_MSG", 10))
+                except Exception:
+                    pass
+                self._sync_finish(peer, _sync_request_id)
+                peer._pagination_active.clear()
+                return
+            _server_height   = _raw_server_height
             _last_rcvd_index = -1
             try:
                 _last_rcvd_index = int(blocks_data[-1].get("index", -1))
@@ -7594,8 +7913,7 @@ class P2PNetwork:
                 if not _fork_buffer_active:
                     peer._fork_sync_buffer = []
                     peer._fork_sync_buffer_bytes = 0
-                    peer._fork_sync_target_height = (
-                        int(_server_height) if isinstance(_server_height, int) else -1)
+                    peer._fork_sync_target_height = _server_height
                     if _divergence_idx is not None and _divergence_idx > 0:
                         _common = self.blockchain.storage.get_block(_divergence_idx - 1)
                         if _common is not None:
@@ -7679,23 +7997,21 @@ class P2PNetwork:
                 _next_page_from  = _last_rcvd_index + 1
             # else Case C: partial page at server tip — no pagination needed
 
+            def _circuit_breaker_is_open() -> bool:
+                se = getattr(self, "_state_engine", None)
+                cb = getattr(se, "_circuit_breaker", None) if se is not None else None
+                return bool(cb is not None and getattr(cb, "is_open", False))
+
             def _apply_chain_direct():
-                """Apply blocks directly; used as primary path and StateEngine fallback.
-
-                v7.0.0.7: Next-page pagination request is fired from here, AFTER
-                accept_chain() succeeds, guaranteeing the next page is only
-                requested once this page is fully committed to disk.
-
-                v7.0.1.0: A sync watchdog daemon thread is started alongside
-                every next-page request.  If the peer fails to deliver the
-                requested blocks within CHAIN_SYNC_TIMEOUT_SECS, the watchdog
-                closes the zombie peer and re-requests from an alternate peer.
-                """
-                # AUDIT-FIX-2: the actual pagination-continuation logic now
-                # lives in the shared _on_chain_sync_result() method (see its
-                # docstring), so this fallback path and the StateEngine's
-                # primary path (StateEngine._handle_chain_sync) can never
-                # drift apart again.
+                """Apply blocks directly; used as primary path and StateEngine fallback."""
+                if _circuit_breaker_is_open():
+                    log.warning(
+                        f"[ChainSync] Circuit breaker OPEN (Read-Only mode) — "
+                        f"refusing direct chain apply of {_rcvd} block(s) from "
+                        f"{peer.peer_id[:12]}")
+                    self._sync_finish(peer, _sync_request_id)
+                    peer._pagination_active.clear()
+                    return
                 try:
                     blocks = [Block.from_dict(d) for d in blocks_data]
                     ok, reason = self.blockchain.accept_chain(blocks)
@@ -7703,8 +8019,7 @@ class P2PNetwork:
                     log.warning(
                         f"[ChainSync] Error applying blocks from "
                         f"{peer.peer_id[:12]}: {_ace}")
-                    # v7.0.1.1: clear on exception so the flag is never
-                    # left set permanently after an unexpected failure.
+                    self._sync_finish(peer, _sync_request_id)
                     peer._pagination_active.clear()
                     return
                 self._on_chain_sync_result(
@@ -7713,51 +8028,53 @@ class P2PNetwork:
                     _sync_request_id)
 
             if self._state_engine is not None:
+                if _circuit_breaker_is_open():
+                    log.warning(
+                        f"[ChainSync] Circuit breaker OPEN (Read-Only mode) — "
+                        f"dropping {_rcvd} block(s) from {peer.peer_id[:12]}")
+                    self._sync_finish(peer, _sync_request_id)
+                    peer._pagination_active.clear()
+                    return
                 try:
                     evt = Event(
                         EventType.CHAIN_SYNC,
                         {
                             "blocks": blocks_data,
-                            # AUDIT-FIX-2: computed once, above, from the
-                            # same Case A/B/C logic the fallback path uses —
-                            # passed through so StateEngine._handle_chain_sync
-                            # can continue pagination identically instead of
-                            # silently dropping it.
                             "needs_next_page": _needs_next_page,
                             "next_page_from":  _next_page_from,
                             "sync_request_id": _sync_request_id,
                         },
                         source_peer_id=peer.peer_id,
                     )
-                    # Increased timeout: large batch at startup may take >2s
                     posted = self._state_engine.post(evt, timeout=10.0)
                     if not posted:
+                        if _circuit_breaker_is_open():
+                            log.warning(
+                                f"[ChainSync] Circuit breaker OPEN (Read-Only mode) — "
+                                f"dropping {_rcvd} block(s) from {peer.peer_id[:12]}")
+                            self._sync_finish(peer, _sync_request_id)
+                            peer._pagination_active.clear()
+                            return
                         log.warning(
                             f"[ChainSync] StateEngine queue full for "
                             f"{_rcvd} block(s) from {peer.peer_id[:12]} "
                             f"— applying in background thread")
-                        # BUG-FIX (v7.0.0.6): Never call _apply_chain_direct()
-                        # synchronously on the receive thread.  accept_chain()
-                        # acquires blockchain._lock and runs DB writes for up
-                        # to ~10 s per 200-block batch.  Blocking the recv
-                        # thread during that time means:
-                        #   1. No sock.recv() calls → incoming TCP data backs
-                        #      up in the kernel buffer.
-                        #   2. If the kernel buffer fills, the SENDER blocks
-                        #      on its write() → the peer's send side stalls.
-                        # Fix: always dispatch to a daemon thread so the recv
-                        # loop keeps running regardless of apply duration.
                         threading.Thread(target=_apply_chain_direct,
                                          daemon=True).start()
                 except Exception as _se:
+                    if _circuit_breaker_is_open():
+                        log.warning(
+                            f"[ChainSync] Circuit breaker OPEN (Read-Only mode) — "
+                            f"dropping {_rcvd} block(s) from {peer.peer_id[:12]}")
+                        self._sync_finish(peer, _sync_request_id)
+                        peer._pagination_active.clear()
+                        return
                     log.warning(
                         f"[ChainSync] StateEngine post error ({_se}) — "
                         f"applying {_rcvd} block(s) in background thread")
                     threading.Thread(target=_apply_chain_direct,
                                      daemon=True).start()
             else:
-                # No StateEngine (unit-test path) — still dispatch to thread
-                # so this code path is consistent and never blocks.
                 threading.Thread(target=_apply_chain_direct,
                                  daemon=True).start()
 
@@ -7836,14 +8153,35 @@ class P2PNetwork:
                 )
 
         elif mtype == MSG_ALERT:
-            bad_id = msg.get("bad_node_id","")
-            if bad_id:
-                self.storage.blacklist_peer(bad_id)
-                with self._lock:
-                    if bad_id in self.peers:
-                        self.peers[bad_id].close()
-                        del self.peers[bad_id]
-                    self._eager_peers.discard(bad_id)
+            bad_id = msg.get("bad_node_id", "")
+            reported_by = msg.get("reported_by", "")
+            pub_hex = msg.get("pub_hex", "")
+            sig = msg.get("sig", "")
+            ts = msg.get("ts")
+            if (not isinstance(bad_id, str) or not bad_id
+                    or bad_id == self.node_id
+                    or not isinstance(reported_by, str) or not reported_by
+                    or not isinstance(pub_hex, str) or not pub_hex
+                    or not isinstance(sig, str) or not sig):
+                return
+            if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+                return
+            if abs(time.time() - float(ts)) > 300:
+                return
+            if sha256(pub_hex.encode()) != reported_by:
+                return
+            alert_payload = f"ALERT:{bad_id}:{reported_by}:{int(ts)}"
+            if not Wallet.verify_sig(pub_hex, alert_payload, sig):
+                return
+            if getattr(peer, "trust_level", PeerConnection.TRUST_LOW) != PeerConnection.TRUST_HIGH:
+                log.warning(f"[ALERT] Ignored alert for {bad_id[:12]} from non-high-trust peer {peer.peer_id[:12]}")
+                return
+            self.storage.blacklist_peer(bad_id)
+            with self._lock:
+                if bad_id in self.peers:
+                    self.peers[bad_id].close()
+                    del self.peers[bad_id]
+                self._eager_peers.discard(bad_id)
 
         elif mtype == MSG_IDENTITY:
             uid     = msg.get("user_id","")
@@ -7852,11 +8190,9 @@ class P2PNetwork:
             waddr   = msg.get("wallet_addr","")
             pub_hex = msg.get("pub_hex","")
             maddrs  = msg.get("multiaddrs",[])
-            if uid and pid:
-                # Gossip is a directory update only. Ownership must already
-                # exist in the canonical name_claims index populated from a
-                # confirmed block; this prevents an unauthenticated
-                # MSG_IDENTITY from creating or replacing a name claim.
+            if (uid and isinstance(pid, str) and pid
+                    and isinstance(pub_hex, str) and pub_hex
+                    and isinstance(maddrs, list)):
                 claim = self.storage.resolve_name_claim(uid)
                 if not claim:
                     log.warning(
@@ -7868,8 +8204,26 @@ class P2PNetwork:
                         f"{uid!r} from peer_id={pid[:16]} — canonical pub_hex "
                         f"does not match claimed pub_hex")
                 else:
-                    self.storage.save_identity(uid, pid, claim["wallet_addr"],
-                                               claim["pub_hex"], maddrs)
+                    expected_pid = sha256(pub_hex.encode())
+                    sig_hex = msg.get("sig_hex", "")
+                    sig_ok = False
+                    if isinstance(sig_hex, str) and sig_hex:
+                        try:
+                            pub_pt = pub_from_hex(pub_hex)
+                            sig = sig_from_hex(sig_hex)
+                            payload_hash = hashlib.sha256(
+                                json.dumps({"user_id": uid, "peer_id": pid, "multiaddrs": maddrs}, sort_keys=True).encode()
+                            ).digest()
+                            sig_ok = ecdsa_verify(pub_pt, payload_hash, sig)
+                        except Exception:
+                            sig_ok = False
+                    if not sig_ok and (pid != expected_pid or getattr(peer, "peer_id", "") != pid):
+                        log.warning(
+                            f"[IDENTITY] rejected unauthenticated MSG_IDENTITY for "
+                            f"{uid!r} from peer_id={pid[:16]}")
+                    else:
+                        self.storage.save_identity(uid, pid, claim["wallet_addr"],
+                                                   claim["pub_hex"], maddrs)
 
         elif mtype == MSG_RESOLVE:
             uid  = msg.get("user_id","")
@@ -7877,13 +8231,13 @@ class P2PNetwork:
             resp = {"type": MSG_RESOLVE_RESP, "user_id": uid}
             # Never answer from a cache entry if the canonical local index has
             # a newer authoritative result (or no confirmed claim at all).
-            identity = self.storage.resolve_identity(uid)
+            identity = self.storage.resolve_identity(uid) if uid else None
             if identity:
                 self._id_cache.put(uid, identity)
                 resp["result"] = identity
             else:
-                cached = self._id_cache.get(uid)
-                resp["result"] = cached if cached else None
+                self._id_cache.delete(uid)
+                resp["result"] = None
             peer.send(resp)
 
         elif mtype == MSG_RESOLVE_RESP:
@@ -7908,16 +8262,21 @@ class P2PNetwork:
 
         # ── NEW: DiscV5 Capability Discovery ──────────────────────────────────
         elif mtype == MSG_CAPABILITY_ADV:
-            caps = msg.get("capabilities", [])
-            if caps and hasattr(self, "_capability_router"):
+            raw_caps = msg.get("capabilities", [])
+            if isinstance(raw_caps, list) and getattr(self, "_capability_router", None) is not None:
+                caps = [
+                    c.strip() for c in raw_caps[:32]
+                    if isinstance(c, str) and 0 < len(c.strip()) <= 64
+                ]
                 self._capability_router.handle_adv(peer.peer_id, caps)
-                # Award reputation for capability advertisement
-                if hasattr(self, "_reputation_mgr"):
+                # Award reputation only for non-empty valid capability adverts
+                if caps and getattr(self, "_reputation_mgr", None) is not None:
                     self._reputation_mgr.record_uptime(peer.peer_id)
 
         elif mtype == MSG_CAPABILITY_QUERY:
             capability = msg.get("capability", "")
-            if capability and hasattr(self, "_capability_router"):
+            if (isinstance(capability, str) and 0 < len(capability) <= 64
+                    and getattr(self, "_capability_router", None) is not None):
                 matching = self._capability_router.handle_query(capability)
                 peer.send({
                     "type": MSG_CAPABILITY_RESPONSE,
@@ -7931,7 +8290,10 @@ class P2PNetwork:
             # connections (Bug #7 fix — discovery was previously a dead end).
             capability = msg.get("capability", "")
             peer_ids   = msg.get("peers", [])
-            if capability and hasattr(self, "_capability_router"):
+            if (isinstance(capability, str) and capability
+                    and isinstance(peer_ids, list)
+                    and getattr(self, "_capability_router", None) is not None):
+                peer_ids = peer_ids[:20]
                 log.debug(f"DiscV5: received {len(peer_ids)} peers for "
                           f"capability '{capability}' from {peer.peer_id[:12]}")
                 for discovered_peer_id in peer_ids:
@@ -7988,9 +8350,9 @@ class P2PNetwork:
 
         # ── v7.4.0: Snapshot blob request ─────────────────────────────────────
         elif mtype == MSG_GET_SNAPSHOT:
-            height = int(msg.get("height", -1))
-            if height < 0:
-                peer.send({"type": MSG_SNAPSHOT_DATA, "height": height,
+            height = self._safe_wire_int(msg.get("height", -1), -1)
+            if height is None or height < 0:
+                peer.send({"type": MSG_SNAPSHOT_DATA, "height": -1,
                            "error": "invalid height"})
             elif hasattr(self.blockchain, "_snapshot_engine"):
                 eng = self.blockchain._snapshot_engine
@@ -8027,7 +8389,14 @@ class P2PNetwork:
         elif mtype == MSG_GET_CHUNK_MANIFEST:
             if hasattr(self.blockchain, "_snapshot_engine"):
                 eng    = self.blockchain._snapshot_engine
-                height = int(msg.get("height", -1))
+                height = self._safe_wire_int(msg.get("height", -1), None)
+                if height is None:
+                    peer.send({
+                        "type":   MSG_CHUNK_MANIFEST,
+                        "height": -1,
+                        "error":  "invalid height",
+                    })
+                    return
                 # height == -1 means "give me your latest snapshot"
                 if height == -1:
                     height = eng.latest_servable_snapshot_height()
@@ -8055,8 +8424,8 @@ class P2PNetwork:
         elif mtype == MSG_GET_CHUNK:
             if hasattr(self.blockchain, "_snapshot_engine"):
                 eng         = self.blockchain._snapshot_engine
-                height      = int(msg.get("height", -1))
-                chunk_index = int(msg.get("chunk_index", -1))
+                height      = self._safe_wire_int(msg.get("height", -1), -1)
+                chunk_index = self._safe_wire_int(msg.get("chunk_index", -1), -1)
                 if height < 0 or chunk_index < 0:
                     peer.send({
                         "type":        MSG_CHUNK_DATA,
@@ -8149,7 +8518,7 @@ class P2PNetwork:
             self.storage.mark_peer_fail(peer.peer_id)
         self.router.remove(peer.peer_id)
         # ── NEW: Remove capability records for disconnected peer ──────────────
-        if hasattr(self, "_capability_router"):
+        if getattr(self, "_capability_router", None) is not None:
             self._capability_router.remove_peer(peer.peer_id)
         # ── NEW: Clean up Full Audit Mode rate-tracking for disconnected peer ─
         with self._untrusted_rate_lock:
@@ -8393,24 +8762,11 @@ class P2PNetwork:
             if peer_id:
                 pending_peer_ids.add(peer_id)
 
-        if peer_id:
-            try:
-                row = self.storage._conn().execute(
-                    "SELECT blacklisted FROM peers WHERE peer_id=?", (peer_id,)).fetchone()
-            except Exception as exc:
-                # Fail closed if we cannot verify blacklist state, but never
-                # strand the endpoint/identity in the pending sets.
-                with self._pending_lock:
-                    self._pending_connections.discard((ip, port))
-                    pending_peer_ids.discard(peer_id)
-                log.debug("Peer blacklist lookup failed for %s: %s; refusing dial",
-                          peer_id[:12], exc)
-                return False
-            if row and row["blacklisted"]:
-                with self._pending_lock:
-                    self._pending_connections.discard((ip, port))
-                    pending_peer_ids.discard(peer_id)
-                return False
+        if peer_id and self._is_peer_blacklisted(peer_id):
+            with self._pending_lock:
+                self._pending_connections.discard((ip, port))
+                pending_peer_ids.discard(peer_id)
+            return False
 
         try:
             worker = threading.Thread(
@@ -9051,10 +9407,15 @@ class P2PNetwork:
         self._gossip(msg)
 
     def _broadcast_invalid_alert(self, bad_node_id: str):
+        ts = int(time.time())
+        alert_payload = f"ALERT:{bad_node_id}:{self.node_id}:{ts}"
         msg = {
             "type":        MSG_ALERT,
             "bad_node_id": bad_node_id,
             "reported_by": self.node_id,
+            "pub_hex":     self.wallet.pub_hex,
+            "ts":          ts,
+            "sig":         self.wallet.sign(alert_payload),
             "ttl":         Config.GOSSIP_TTL,
         }
         self._gossip(msg)
@@ -9070,9 +9431,9 @@ class P2PNetwork:
         if local:
             self._id_cache.put(user_id, local)
             return local
-        cached = self._id_cache.get(user_id)
-        if cached:
-            return cached
+        # Canonical local index has no confirmed claim: evict any stale cache
+        # entry (e.g., remaining after a reorg/rollback) rather than serving it.
+        self._id_cache.delete(user_id)
         # BUG-FIX: The original code only queried the 5 closest DHT peers.
         # On small networks (2-3 peers) the DHT routing table may not overlap
         # with the peers that actually have the target identity stored, so the
@@ -9333,6 +9694,12 @@ class P2PNetwork:
                 # mark_peer_fail is already called by _on_peer_disconnect
                 # (which handles genuinely broken connections) — no need
                 # to call it again here.
+            rep_mgr = getattr(self, "_reputation_mgr", None)
+            if rep_mgr is not None:
+                try:
+                    rep_mgr.decay_all()
+                except Exception as e:
+                    log.debug(f"Reputation decay error: {e}")
 
     def _load_peers(self):
         stored = self.storage.get_peers(limit=50)
@@ -9529,31 +9896,54 @@ class P2PNetwork:
             # this end needs its own fix too: require state_root agreement,
             # not just height agreement, before trusting any manifest as
             # the reference.
-            root_votes: Dict[str, int] = {}
+            MAX_CHUNKS = getattr(Config, "MAX_SNAPSHOT_CHUNKS", 65536)
+
+            def _is_valid_chunk_manifest(m: dict) -> bool:
+                tc = m.get("total_chunks")
+                ch = m.get("chunk_hashes")
+                if isinstance(tc, bool) or not isinstance(tc, int) or tc <= 0 or tc > MAX_CHUNKS:
+                    return False
+                if not isinstance(ch, list) or len(ch) != tc:
+                    return False
+                for h in ch:
+                    if not isinstance(h, str) or len(h) != 64:
+                        return False
+                    try:
+                        int(h, 16)
+                    except ValueError:
+                        return False
+                return True
+
+            manifest_votes: Dict[tuple, int] = {}
             for m in valid_manifests.values():
                 r = m.get("state_root", "")
-                if r:
-                    root_votes[r] = root_votes.get(r, 0) + 1
-            agreeing_roots = {r: n for r, n in root_votes.items() if n >= 2}
-            if not agreeing_roots:
+                if not r or not _is_valid_chunk_manifest(m):
+                    continue
+                key = (r, int(m["total_chunks"]), tuple(m["chunk_hashes"]))
+                manifest_votes[key] = manifest_votes.get(key, 0) + 1
+            agreeing_manifests = {k: n for k, n in manifest_votes.items() if n >= 2}
+            if not agreeing_manifests:
                 log.warning(
-                    "[ParallelSync] No state_root agreement among %d "
-                    "peers at height %d (each peer disagrees, or omitted "
-                    "state_root) — refusing to trust an arbitrary single "
-                    "manifest; falling back to legacy fast-sync.",
+                    "[ParallelSync] No manifest consensus (state_root, total_chunks, "
+                    "chunk_hashes) among %d peers at height %d — falling back to legacy fast-sync.",
                     len(valid_manifests), best_height)
                 return self._fast_sync_legacy(peer)
-            best_root = max(agreeing_roots, key=lambda r: agreeing_roots[r])
+            best_root, best_total_chunks, best_chunk_hashes = max(
+                agreeing_manifests, key=lambda k: agreeing_manifests[k]
+            )
             valid_manifests = {
                 pid: m for pid, m in valid_manifests.items()
-                if m.get("state_root", "") == best_root
+                if (m.get("state_root", "") == best_root
+                    and _is_valid_chunk_manifest(m)
+                    and int(m["total_chunks"]) == best_total_chunks
+                    and tuple(m["chunk_hashes"]) == best_chunk_hashes)
             }
 
             ref_manifest  = next(iter(valid_manifests.values()))
             snap_height   = ref_manifest["height"]
-            total_chunks  = ref_manifest["total_chunks"]
-            chunk_hashes  = ref_manifest["chunk_hashes"]
-            state_root    = ref_manifest.get("state_root", "")
+            total_chunks  = best_total_chunks
+            chunk_hashes  = list(best_chunk_hashes)
+            state_root    = best_root
             anchor_block_hash = ref_manifest.get("anchor_block_hash", "")
 
             log.info(
@@ -9633,10 +10023,21 @@ class P2PNetwork:
                             work_queue.task_done()
                             break   # peer is too slow; let other workers take over
 
-                        if resp.get("type") != MSG_CHUNK_DATA:
+                        if (not isinstance(resp, dict)
+                                or resp.get("type") != MSG_CHUNK_DATA
+                                or resp.get("height") != snap_height
+                                or resp.get("chunk_index") != chunk_idx):
+                            with chunk_map_lock:
+                                chunk_retries[chunk_idx] += 1
+                                if chunk_retries[chunk_idx] >= MAX_RETRIES:
+                                    failed.set()
+                                    error_reason[0] = (
+                                        f"Chunk {chunk_idx} invalid/mismatched response "
+                                        f"after {MAX_RETRIES} retries"
+                                    )
                             work_queue.put(chunk_idx)
                             work_queue.task_done()
-                            continue
+                            break
 
                         if "error" in resp:
                             log.debug(
@@ -9674,8 +10075,8 @@ class P2PNetwork:
                         # ── Integrity verification ────────────────────────────
                         actual_hash   = hashlib.sha256(raw_chunk).hexdigest()
                         expected_hash = (chunk_hashes[chunk_idx]
-                                         if chunk_idx < len(chunk_hashes) else "")
-                        if expected_hash and actual_hash != expected_hash:
+                                         if 0 <= chunk_idx < len(chunk_hashes) else "")
+                        if not expected_hash or actual_hash != expected_hash:
                             log.warning(
                                 "[ParallelSync] Chunk %d hash MISMATCH from %s "
                                 "(got=%s expected=%s) — re-assigning",
@@ -9695,27 +10096,31 @@ class P2PNetwork:
                             continue
 
                         # ── Store verified chunk ──────────────────────────────
+                        stored_new = False
                         with chunk_map_lock:
-                            chunk_store[chunk_idx] = raw_chunk
+                            if chunk_store[chunk_idx] is None:
+                                chunk_store[chunk_idx] = raw_chunk
+                                stored_new = True
 
                         work_queue.task_done()
 
-                        with done_lock:
-                            done_count[0] += 1
-                            current_done   = done_count[0]
+                        if stored_new:
+                            with done_lock:
+                                done_count[0] += 1
+                                current_done   = done_count[0]
 
-                        # Progress log every 5 chunks and on final chunk
-                        if current_done % 5 == 0 or current_done == total_chunks:
-                            log.info(
-                                "[ParallelSync] Progress: Downloaded %d/%d "
-                                "chunks from %d peers",
-                                current_done, total_chunks,
-                                len(valid_manifests),
-                            )
+                            # Progress log every 5 chunks and on final chunk
+                            if current_done % 5 == 0 or current_done == total_chunks:
+                                log.info(
+                                    "[ParallelSync] Progress: Downloaded %d/%d "
+                                    "chunks from %d peers",
+                                    current_done, total_chunks,
+                                    len(valid_manifests),
+                                )
 
-                        if current_done >= total_chunks:
-                            completed.set()
-                            break
+                            if current_done >= total_chunks:
+                                completed.set()
+                                break
 
                 except Exception as _we:
                     log.debug("[ParallelSync] Worker %s unexpected error: %s",

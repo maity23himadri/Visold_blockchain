@@ -25,6 +25,7 @@ Origin: visold_vsd_.py L9823-10320
 """
 
 import hashlib
+import json
 import math
 import threading
 from collections import OrderedDict
@@ -147,21 +148,35 @@ class RateDefectionAuditor:
         # schedule.  Persisted via storage if available.
         self._banned: set = set()
 
+        # Observe-only offense counter (does not carry over into enforced slashes/bans).
+        self._observed_counts: Dict[str, int] = {}
+
         # Last block height the audit ran on (so we don't re-run on the
         # same window when called repeatedly).
         self._last_audit_height: int = -1
 
         # Hook into storage if it has the persistence helpers; tolerate
         # absence (e.g. during early bootstrap or in unit tests).
+        persisted = None
         try:
-            persisted = self._storage.get_rate_defection_state()
-            if isinstance(persisted, dict):
-                self._offense_counts.update(persisted.get("offenses", {}))
-                self._last_offense_block.update(
-                    persisted.get("last_offense_block", {}))
-                self._banned.update(persisted.get("banned", []))
+            if hasattr(self._storage, "get_rate_defection_state"):
+                persisted = self._storage.get_rate_defection_state()
         except Exception:
-            pass
+            persisted = None
+        if not isinstance(persisted, dict) and hasattr(self._storage, "get_meta"):
+            try:
+                raw = self._storage.get_meta("rate_defection_state")
+                if raw:
+                    persisted = json.loads(raw)
+            except Exception:
+                persisted = None
+        if isinstance(persisted, dict):
+            self._offense_counts.update(persisted.get("offenses", {}))
+            self._last_offense_block.update(
+                persisted.get("last_offense_block", {}))
+            self._banned.update(persisted.get("banned", []))
+            for eid in persisted.get("seen_evidence", [])[-4096:]:
+                self._seen_evidence[str(eid)] = None
 
     # ─────────────────────────────────────────────────────────────────────
     # Public: run one audit cycle.  Called from the consensus engine
@@ -363,7 +378,10 @@ class RateDefectionAuditor:
         total_cap = sum(v for v in cap_registry.values() if v > 0)
         if total_cap <= 0:
             return None
-        expected = (cap_registry[miner] / total_cap) * (w_end - w_start + 1)
+        share = cap_registry[miner] / total_cap
+        if share < float(Config.RATE_AUDIT_MIN_SHARE):
+            return None
+        expected = share * (w_end - w_start + 1)
         if expected <= 0:
             return None
         return actual / expected
@@ -398,8 +416,19 @@ class RateDefectionAuditor:
             return False, "Claimed ratio must be finite"
         if window_end <= window_start:
             return False, "Invalid window range"
-        if window_end - window_start + 1 != int(Config.RATE_AUDIT_WINDOW):
+        window_size = int(Config.RATE_AUDIT_WINDOW)
+        if window_end - window_start + 1 != window_size:
             return False, "Window size mismatch"
+        _cadence_chk = int(Config.RATE_AUDIT_CADENCE)
+        if _cadence_chk <= 0:
+            return False, "Invalid audit cadence"
+        if window_end < window_size or window_start < 1:
+            return False, "Window precedes minimum audit height"
+        if window_end % _cadence_chk != 0:
+            return False, (
+                f"Unaligned window_end {window_end}: "
+                f"must be divisible by RATE_AUDIT_CADENCE ({_cadence_chk})"
+            )
 
         # AUDIT-FIX-19 (Batch F, Finding 2): 'consecutive' is a plain
         # integer supplied by whoever built this packet.  It used to be
@@ -438,9 +467,22 @@ class RateDefectionAuditor:
         # the canonical (miner, window_start, window_end) identity and suppress a
         # later genuine evidence packet for the same window.
         ev_id = self._evidence_id(ev)
+        min_spacing = max(_cadence, max(1, required) * _cadence)
         with self._lock:
             if ev_id in self._seen_evidence:
                 return True, "Duplicate (already processed)"
+            last_offense = self._last_offense_block.get(miner)
+            if last_offense is not None:
+                if window_end <= last_offense:
+                    return False, (
+                        f"Stale evidence: window_end {window_end} <= "
+                        f"last_offense_block {last_offense}"
+                    )
+                if window_end < last_offense + min_spacing:
+                    return False, (
+                        f"Overlapping offense window: window_end {window_end} < "
+                        f"next eligible offense height {last_offense + min_spacing}"
+                    )
 
         # Independent recomputation
         local_actual = 0
@@ -459,6 +501,12 @@ class RateDefectionAuditor:
         if total_cap <= 0:
             return False, "Empty cap registry"
         local_share    = cap_registry[miner] / total_cap
+        min_share      = float(Config.RATE_AUDIT_MIN_SHARE)
+        if local_share < min_share:
+            return False, (
+                f"Miner share {local_share:.4f} below minimum auditable share "
+                f"{min_share:.4f}"
+            )
         local_expected = local_share * (window_end - window_start + 1)
         if local_expected <= 0:
             return False, "Local expected wins is zero"
@@ -478,16 +526,35 @@ class RateDefectionAuditor:
         # window, and record exactly one offense.  The re-check closes the race
         # between two peer threads verifying the same evidence concurrently.
         offense_block = window_end
+        enforce = bool(Config.AUTO_SLASH_RATE_DEFECTION)
         with self._lock:
             if ev_id in self._seen_evidence:
                 return True, "Duplicate (already processed)"
+            last_offense = self._last_offense_block.get(miner)
+            if last_offense is not None:
+                if window_end <= last_offense:
+                    return False, (
+                        f"Stale evidence: window_end {window_end} <= "
+                        f"last_offense_block {last_offense}"
+                    )
+                if window_end < last_offense + min_spacing:
+                    return False, (
+                        f"Overlapping offense window: window_end {window_end} < "
+                        f"next eligible offense height {last_offense + min_spacing}"
+                    )
             self._seen_evidence[ev_id] = None
             while len(self._seen_evidence) > 4096:
                 self._seen_evidence.popitem(last=False)
-            prev_count = self._offense_counts.get(miner, 0)
-            self._offense_counts[miner] = prev_count + 1
-            self._last_offense_block[miner] = offense_block
-            new_count = self._offense_counts[miner]
+            if enforce:
+                prev_count = self._offense_counts.get(miner, 0)
+                self._offense_counts[miner] = prev_count + 1
+                self._last_offense_block[miner] = offense_block
+                new_count = self._offense_counts[miner]
+            else:
+                # Observe-only mode: do not accrue punitive offense counts
+                # toward the enforcement slash schedule.
+                self._observed_counts[miner] = self._observed_counts.get(miner, 0) + 1
+                new_count = self._offense_counts.get(miner, 0) + 1
 
         # Decide slash percentage
         schedule = Config.RATE_SLASH_SCHEDULE
@@ -502,12 +569,12 @@ class RateDefectionAuditor:
             f"[RateAudit] Verified evidence for {miner[:12]}…  "
             f"offense #{new_count}  slash={slash_pct:.0%}  "
             f"ratio={local_ratio:.2f}  ban={ban}  "
-            f"AUTO_SLASH={'ON' if Config.AUTO_SLASH_RATE_DEFECTION else 'OFF (observe)'}"
+            f"AUTO_SLASH={'ON' if enforce else 'OFF (observe)'}"
         )
 
         # Apply enforcement only if config flag is on
-        if Config.AUTO_SLASH_RATE_DEFECTION:
-            self._apply_slash(miner, slash_pct, ban)
+        if enforce:
+            self._apply_slash(miner, slash_pct, ban, ev_id=ev_id, window_end=window_end)
         else:
             log.info(
                 f"[RateAudit] OBSERVE-ONLY: would slash {miner[:12]}… "
@@ -521,24 +588,30 @@ class RateDefectionAuditor:
         except Exception as exc:
             log.debug(f"[RateAudit] Persist failed: {exc}")
 
-        return True, ("slashed" if Config.AUTO_SLASH_RATE_DEFECTION
-                      else "observed")
+        return True, ("slashed" if enforce else "observed")
 
-    def _apply_slash(self, miner: str, slash_pct: float, ban: bool) -> None:
-        """Apply the slash via storage; idempotent on failure."""
+    def _apply_slash(self, miner: str, slash_pct: float, ban: bool,
+                     ev_id: str = "", window_end: int = 0) -> None:
+        """Apply graduated slash_with_rate if supported, else record evidence without mutating off-chain state."""
         try:
-            # Use the existing storage.slash() but with a configurable rate.
-            # If storage.slash_with_rate is unavailable, fall back to slash()
-            # which uses Config.SLASH_RATE — in that case the schedule is
-            # approximate.
             if hasattr(self._storage, "slash_with_rate"):
                 self._storage.slash_with_rate(miner, slash_pct)
-            else:
-                # Use the standard slash() — this applies SLASH_RATE (10%
-                # by default), which differs from the schedule but is at
-                # least a real slash.  Operators wanting exact schedule
-                # semantics should add storage.slash_with_rate.
-                self._storage.slash(miner)
+            elif hasattr(self._storage, "set_meta"):
+                key = (
+                    f"rate_defection_evidence:{ev_id[:32]}"
+                    if ev_id else f"rate_defection_evidence:{miner}:{window_end}"
+                )
+                self._storage.set_meta(
+                    key,
+                    json.dumps({
+                        "miner": miner,
+                        "slash_pct": float(slash_pct),
+                        "ban": bool(ban),
+                        "window_end": int(window_end),
+                        "timestamp": int(time.time()),
+                        "penalty_applied": False,
+                    }),
+                )
             if ban:
                 with self._lock:
                     self._banned.add(miner)
@@ -566,18 +639,34 @@ class RateDefectionAuditor:
 
     def _persist_state(self) -> None:
         """Persist offense + ban state if storage supports it."""
-        if not hasattr(self._storage, "set_rate_defection_state"):
-            return
         with self._lock:
             payload = {
                 "offenses":           dict(self._offense_counts),
                 "last_offense_block": dict(self._last_offense_block),
                 "banned":             list(self._banned),
+                "seen_evidence":      list(self._seen_evidence.keys())[-4096:],
             }
         try:
-            self._storage.set_rate_defection_state(payload)
+            if hasattr(self._storage, "set_rate_defection_state"):
+                self._storage.set_rate_defection_state(payload)
+            elif hasattr(self._storage, "set_meta"):
+                self._storage.set_meta("rate_defection_state", json.dumps(payload))
         except Exception as exc:
             log.debug(f"[RateAudit] Persist failed: {exc}")
+
+    def on_rollback(self, new_tip_height: int) -> None:
+        """Rewind audit state after a chain rollback/reorg to new_tip_height."""
+        target = int(new_tip_height)
+        with self._lock:
+            if self._last_audit_height > target:
+                self._last_audit_height = target
+            self._consecutive_flags.clear()
+            stale_emitted = [
+                k for k in self._emitted_evidence
+                if k[1] > target
+            ]
+            for k in stale_emitted:
+                self._emitted_evidence.pop(k, None)
 
     @staticmethod
     def _evidence_id(ev: dict) -> str:
@@ -597,4 +686,6 @@ class RateDefectionAuditor:
 
     def offense_count(self, miner: str) -> int:
         with self._lock:
-            return self._offense_counts.get(miner, 0)
+            if Config.AUTO_SLASH_RATE_DEFECTION:
+                return self._offense_counts.get(miner, 0)
+            return self._offense_counts.get(miner, 0) + self._observed_counts.get(miner, 0)

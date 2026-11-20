@@ -37,14 +37,17 @@ from collections import defaultdict
 
 def _serialize(obj) -> str:
     """JSON-serialize obj, safely converting defaultdicts and sets."""
-    return json.dumps(obj, cls=_SafeJSONEncoder, default=str)
+    return json.dumps(obj, cls=_SafeJSONEncoder)
 
 
 class _SafeJSONEncoder(json.JSONEncoder):
-    """Convert defaultdict → dict and set → list so json.dumps never fails."""
+    """Convert defaultdict → dict and set → sorted list so json.dumps never fails."""
     def default(self, obj):
         if isinstance(obj, defaultdict):
             return dict(obj)
         if isinstance(obj, set):
-            return sorted(obj)
-        return super().default(obj)
+            try:
+                return sorted(obj)
+            except TypeError:
+                return sorted(obj, key=lambda x: (type(x).__name__, str(x)))
+        return str(obj)

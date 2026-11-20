@@ -25,6 +25,33 @@ Origin: visold_vsd_.py L23312-23348, L23351-23371, L23374-23402, L23405-23437
 """
 
 import json
+import re
+
+_SECP256K1_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+_SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+_MAX_SIG_JSON_LEN = 512
+
+
+def _is_strict_hex(s: str, expected_len: int) -> bool:
+    return len(s) == expected_len and bool(_HEX_RE.fullmatch(s))
+
+
+def _parse_sig_json(raw: str):
+    if len(raw) > _MAX_SIG_JSON_LEN:
+        return None
+    try:
+        arr = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(arr, list) or len(arr) != 2:
+        return None
+    r_val, s_val = arr[0], arr[1]
+    if type(r_val) is not int or type(s_val) is not int:
+        return None
+    if not (1 <= r_val < _SECP256K1_N and 1 <= s_val < _SECP256K1_N):
+        return None
+    return r_val, s_val
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -83,39 +110,25 @@ def l2_sig_compact(sig_hex: str) -> str:
     """Convert an ECDSA signature in sig_to_hex() format to a fixed-length
     128-char hex string for L2 wire transmission.
 
-    CRITICAL NOTE (fixed in v7.5.0-OPT post-audit): sig_to_hex() in this
-    codebase emits a JSON array like ``"[r_int, s_int]"`` — NOT hex — and
-    sig_from_hex() parses it back with json.loads.  The original L2 code
-    assumed hex and padded/truncated the JSON blindly, which mangled the
-    closing bracket and broke every L2 signature.  This version:
-      • Parses the JSON to get r, s as ints (same as sig_from_hex would)
-      • Formats them as two concatenated 64-char hex fields = 128 chars
-    This ALSO produces real bandwidth savings (~35% on typical sigs where
-    the JSON form averages ~155 chars).
-
     Returns "" on parse failure so downstream verify fails explicitly.
     """
-    if not sig_hex:
+    if not isinstance(sig_hex, str) or not sig_hex:
         return ""
-    try:
-        arr = json.loads(sig_hex)
-        r_int = int(arr[0])
-        s_int = int(arr[1])
-    except Exception:
-        # Already compact-hex?  If it's exactly 128 hex chars, trust it.
-        if len(sig_hex) == 128:
-            try:
-                int(sig_hex, 16)
-                return sig_hex.lower()
-            except ValueError:
-                pass
+    sig_str = sig_hex.strip()
+    if not sig_str:
         return ""
-    # Each component fits in 256 bits = 32 bytes = 64 hex chars.
-    # Reject pathologically-large values that would overflow this — an
-    # honest ECDSA sig on secp256k1 always has r, s in [1, n-1].
-    if r_int < 0 or s_int < 0 or r_int >> 256 or s_int >> 256:
-        return ""
-    return f"{r_int:064x}{s_int:064x}"
+    if sig_str.startswith("["):
+        parsed = _parse_sig_json(sig_str)
+        if parsed is None:
+            return ""
+        r_int, s_int = parsed
+        return f"{r_int:064x}{s_int:064x}"
+    if _is_strict_hex(sig_str, 128):
+        r_int = int(sig_str[:64], 16)
+        s_int = int(sig_str[64:], 16)
+        if 1 <= r_int < _SECP256K1_N and 1 <= s_int < _SECP256K1_N:
+            return sig_str.lower()
+    return ""
 
 
 def l2_sig_expand(compact_sig_hex: str) -> str:
@@ -126,17 +139,21 @@ def l2_sig_expand(compact_sig_hex: str) -> str:
     (defensively) the raw JSON form if a peer on a different code version
     wired it through unchanged.  Returns "" on parse failure.
     """
-    if not compact_sig_hex:
+    if not isinstance(compact_sig_hex, str) or not compact_sig_hex:
         return ""
-    # Defensive: caller already gave us JSON?
-    if compact_sig_hex.startswith("["):
-        return compact_sig_hex
-    if len(compact_sig_hex) != 128:
+    sig_str = compact_sig_hex.strip()
+    if not sig_str:
         return ""
-    try:
-        r_int = int(compact_sig_hex[:64], 16)
-        s_int = int(compact_sig_hex[64:], 16)
-    except ValueError:
+    if sig_str.startswith("["):
+        parsed = _parse_sig_json(sig_str)
+        if parsed is None:
+            return ""
+        return json.dumps([parsed[0], parsed[1]])
+    if not _is_strict_hex(sig_str, 128):
+        return ""
+    r_int = int(sig_str[:64], 16)
+    s_int = int(sig_str[64:], 16)
+    if not (1 <= r_int < _SECP256K1_N and 1 <= s_int < _SECP256K1_N):
         return ""
     return json.dumps([r_int, s_int])
 
@@ -152,19 +169,25 @@ def l2_pub_compact(pub_hex: str) -> str:
     it is returned unchanged.  Invalid inputs fall through to empty so the
     downstream verify fails explicitly rather than silently accepting.
     """
-    if not pub_hex:
+    if not isinstance(pub_hex, str) or not pub_hex:
         return ""
     pub_hex = pub_hex.lower().strip()
-    # Already compressed?
+    # Already compressed? Validate via l2_pub_expand curve & field checks.
     if len(pub_hex) == 66 and pub_hex[:2] in ("02", "03"):
-        return pub_hex
+        if not _is_strict_hex(pub_hex[2:], 64):
+            return ""
+        return pub_hex if l2_pub_expand(pub_hex) else ""
     # Uncompressed (standard sig_to_hex / pub_from_hex form)?
     if len(pub_hex) == 130 and pub_hex.startswith("04"):
         x_hex = pub_hex[2:66]
         y_hex = pub_hex[66:130]
-        try:
-            y_int = int(y_hex, 16)
-        except ValueError:
+        if not _is_strict_hex(x_hex, 64) or not _is_strict_hex(y_hex, 64):
+            return ""
+        x_int = int(x_hex, 16)
+        y_int = int(y_hex, 16)
+        if not (0 < x_int < _SECP256K1_P and 0 < y_int < _SECP256K1_P):
+            return ""
+        if (y_int * y_int) % _SECP256K1_P != (pow(x_int, 3, _SECP256K1_P) + 7) % _SECP256K1_P:
             return ""
         prefix = "02" if (y_int % 2 == 0) else "03"
         return prefix + x_hex
@@ -179,19 +202,21 @@ def l2_pub_expand(compact_pub_hex: str) -> str:
     existing curve parameters already defined for ECDSA in SECTION 2.
     Returns "" on any parse failure so the caller's verify step fails cleanly.
     """
-    if not compact_pub_hex or len(compact_pub_hex) != 66:
+    if not isinstance(compact_pub_hex, str) or not compact_pub_hex:
+        return ""
+    compact_pub_hex = compact_pub_hex.lower().strip()
+    if len(compact_pub_hex) != 66:
         return ""
     prefix = compact_pub_hex[:2]
     if prefix not in ("02", "03"):
         return ""
-    try:
-        x = int(compact_pub_hex[2:], 16)
-    except ValueError:
+    x_hex_in = compact_pub_hex[2:]
+    if not _is_strict_hex(x_hex_in, 64):
         return ""
-    # secp256k1 parameters — the CURVE_P constant exists in SECTION 2 via
-    # the tinyec backend; recompute here from the canonical constant to
-    # avoid coupling to a specific library's name.
-    P   = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+    x = int(x_hex_in, 16)
+    if not (0 < x < _SECP256K1_P):
+        return ""
+    P = _SECP256K1_P
     rhs = (pow(x, 3, P) + 7) % P
     # Tonelli-Shanks shortcut: for p ≡ 3 (mod 4), sqrt = rhs^((p+1)/4) mod p.
     # secp256k1's p satisfies this, so we can compute y directly.

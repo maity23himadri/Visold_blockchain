@@ -190,7 +190,7 @@ class DecisionEngine:
 
         k = r.kind
         c = r.confidence
-        z = abs(r.z_score)
+        z = r.z_score
 
         # ── CRITICAL ─────────────────────────────────────────────────────────
         if k == AnomalyKind.DOUBLE_SIGN and c >= 1.0:
@@ -254,6 +254,11 @@ class DecisionEngine:
                     ["log", "rate_limit"],
                     f"Statistical anomaly z={z:.1f} in {k.value}")
 
+        if k == AnomalyKind.TPS_SPIKE and (r.source == "rule" or c >= self.HIGH_CONFIDENCE):
+            return (Severity.MEDIUM,
+                    ["log", "rate_limit"],
+                    f"Rule-based TPS spike (confidence={c:.2f})")
+
         if k == AnomalyKind.MEMPOOL_FLOOD:
             return (Severity.MEDIUM,
                     ["log", "rate_limit"],
@@ -302,7 +307,7 @@ class DecisionEngine:
         # Low z-score stat anomalies are noise
         if (report.source == "stat"
                 and severity == Severity.LOW
-                and abs(report.z_score) < 3.0):
+                and report.z_score < 3.0):
             return True
 
         return False

@@ -28,7 +28,11 @@ from visold.kernel.config import Config
 import struct
 import zlib
 
-from visold.network.compression import bounded_zlib_decompress
+from visold.kernel.compression_utils import (
+    DecompressedSizeLimitError,
+    bounded_zlib_decompress,
+)
+from visold.kernel.netutil import _normalize_ip
 
 
 # STANDARD LIBRARY IMPORTS
@@ -193,6 +197,9 @@ _F_HB    = 0x10
 
 _F_FEC   = 0x20
 
+_UDP_VALID_FLAGS = _F_FRAG | _F_LAST | _F_ACK | _F_NACK | _F_HB | _F_FEC
+_UDP_TYPE_FLAGS  = _F_FRAG | _F_ACK | _F_NACK | _F_HB | _F_FEC
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -222,6 +229,11 @@ def _udp_unpack(data: bytes):
     # or FEC bookkeeping.
     if len(data) > _UDP_MTU:
         return None
+    if flags == 0 or (flags & ~_UDP_VALID_FLAGS):
+        return None
+    type_bits = flags & _UDP_TYPE_FLAGS
+    if type_bits == 0 or (type_bits & (type_bits - 1)) != 0:
+        return None
     return flags, seq, frag_id, frag_off, data[_UDP_HDR_LEN:]
 
 
@@ -250,6 +262,8 @@ def _udp_decompress(data: bytes) -> bytes:
     try:
         out = bounded_zlib_decompress(data, _MAX)
         return out
+    except DecompressedSizeLimitError:
+        raise
     except (zlib.error, ValueError):
         return data   # not compressed — return as-is
 
@@ -257,10 +271,8 @@ def _udp_decompress(data: bytes) -> bytes:
 def _udp_normalize_addr(addr: tuple) -> tuple:
     """
     Normalize a (host, port[, ...]) addr tuple to a plain (str, int) pair.
-    Strips IPv4-mapped IPv6 prefixes (::ffff:x.x.x.x → x.x.x.x).
+    Strips IPv4-mapped IPv6 prefixes (::ffff:x.x.x.x / ::FFFF:x.x.x.x → x.x.x.x).
     """
-    host = addr[0]
+    host = _normalize_ip(addr[0])
     port = addr[1]
-    if host.startswith('::ffff:'):
-        host = host[7:]
     return (host, port)

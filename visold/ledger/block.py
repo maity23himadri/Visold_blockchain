@@ -25,6 +25,7 @@ Origin: visold_vsd_.py L11912-12425
 """
 
 import json
+import math
 import threading
 import time
 import concurrent.futures as _futures
@@ -32,12 +33,14 @@ from typing import List, Optional, TYPE_CHECKING, Tuple, Set
 
 from visold.consensus.difficulty import DifficultyEngine
 from visold.crypto.hashing import hash_obj, sha256
+import visold.crypto.parallel_verify as _pv
 from visold.crypto.parallel_verify import (
     _PAR_SIG_THRESHOLD, _get_sig_pool, _par_verify_sig, _par_verify_sig_batch,
 )
 from visold.kernel.config import Config
 from visold.kernel.logging_setup import log
 from visold.kernel.metrics import metrics
+from visold.kernel.units import from_satoshi, gas_fee_to_sat
 from visold.ledger.transaction import Transaction
 
 if TYPE_CHECKING:  # annotation-only references (no runtime import, no cycle)
@@ -76,13 +79,16 @@ class Block:
     })
 
     def __init__(self, index: int, prev_hash: str, transactions: List[Transaction],
-                 miner_address: str, difficulty: float, timestamp: int = 0,
+                 miner_address: str, difficulty: float, timestamp: Optional[int] = None,
                  nonce: int = 0, block_hash: str = "", validator_sigs: Optional[List[dict]] = None,
                  vrf_proof: str = "", vrf_output: str = "", finalized: bool = False,
-                 state_root: str = "", protocol_version: int = 0,
+                 state_root: str = "", protocol_version: Optional[int] = None,
                  merkle_root: Optional[str] = None,
                  pruned: bool = False,
-                 bootstrap_commitment: Optional[dict] = None):
+                 bootstrap_commitment: Optional[dict] = None,
+                 version: Optional[int] = None,
+                 *,
+                 _deserializing: bool = False):
         if type(pruned) is not bool:
             raise ValueError("block pruned marker must be a boolean")
         if pruned and transactions:
@@ -96,15 +102,23 @@ class Block:
         self._pruned = pruned
         self._bootstrap_commitment = (
             dict(bootstrap_commitment) if bootstrap_commitment is not None else None)
-        self.version          = self.VERSION
-        self.protocol_version = protocol_version or Config.PROTOCOL_VERSION
+        self.version          = self.VERSION if version is None else version
+        self.protocol_version = (
+            protocol_version if _deserializing
+            else (Config.PROTOCOL_VERSION if protocol_version is None else protocol_version)
+        )
         self.index            = index
         self.prev_hash        = prev_hash
-        self.timestamp        = timestamp or int(time.time())
+        self.timestamp        = (
+            timestamp if _deserializing
+            else (int(time.time()) if timestamp is None else timestamp)
+        )
         # Store transactions as a tuple so mutation is structurally impossible
         self.transactions     = tuple(transactions)
         self.miner_address    = miner_address
-        self.difficulty       = difficulty
+        self.difficulty       = float(difficulty) if (
+            isinstance(difficulty, (int, float)) and not isinstance(difficulty, bool)
+        ) else difficulty
         self.nonce            = nonce
         self.vrf_proof        = vrf_proof
         self.vrf_output       = vrf_output
@@ -113,8 +127,8 @@ class Block:
         # BEFORE the PoW loop, so the mined block_hash already commits to
         # it.  apply_block now VERIFIES (not mutates) state_root.
         self.state_root       = state_root
-        self.block_hash       = block_hash or self.compute_hash()
-        self.validator_sigs   = validator_sigs or []
+        self.block_hash       = block_hash if _deserializing else (block_hash or self.compute_hash())
+        self.validator_sigs   = [] if validator_sigs is None else validator_sigs
         self.finalized        = finalized
 
     def __setattr__(self, name: str, value):
@@ -167,6 +181,40 @@ class Block:
         object.__setattr__(self, "_sealed", True)
         return self
 
+    @staticmethod
+    def _is_strict_int(val: object) -> bool:
+        return isinstance(val, int) and not isinstance(val, bool)
+
+    @staticmethod
+    def _is_strict_num(val: object) -> bool:
+        return isinstance(val, (int, float)) and not isinstance(val, bool)
+
+    def validate_header_types(self) -> Tuple[bool, str]:
+        """Enforce canonical Python types for all consensus header fields."""
+        for fname in ("version", "protocol_version", "index", "timestamp", "nonce"):
+            val = getattr(self, fname, None)
+            if not self._is_strict_int(val):
+                return False, f"Invalid header field '{fname}': expected int, got {type(val).__name__}"
+        if self.version < 1:
+            return False, f"Invalid header field 'version': must be >= 1, got {self.version}"
+        if self.protocol_version < 0:
+            return False, f"Invalid header field 'protocol_version': must be >= 0, got {self.protocol_version}"
+        if self.index < 0:
+            return False, f"Invalid header field 'index': must be >= 0, got {self.index}"
+        if self.timestamp < 0:
+            return False, f"Invalid header field 'timestamp': must be >= 0, got {self.timestamp}"
+        if self.nonce < 0:
+            return False, f"Invalid header field 'nonce': must be >= 0, got {self.nonce}"
+
+        if not self._is_strict_num(self.difficulty) or not math.isfinite(float(self.difficulty)) or float(self.difficulty) < 0:
+            return False, f"Invalid header field 'difficulty': {self.difficulty!r}"
+
+        for fname in ("prev_hash", "miner_address", "merkle_root", "state_root", "vrf_proof", "vrf_output", "block_hash"):
+            val = getattr(self, fname, None)
+            if not isinstance(val, str):
+                return False, f"Invalid header field '{fname}': expected str, got {type(val).__name__}"
+        return True, "OK"
+
     def integrity_check(self, mempool: Optional['Mempool'] = None,
                         verified_txids: Optional[Set[str]] = None,
                         integrity_txids: Optional[Set[str]] = None) -> Tuple[bool, str]:
@@ -211,6 +259,10 @@ class Block:
                 f"Pruned block #{self.index} has no transaction body; "
                 "header-only records cannot pass full-block integrity validation"
             )
+
+        ok_types, types_msg = self.validate_header_types()
+        if not ok_types:
+            return False, f"Block integrity failure: {types_msg}"
 
         # 1. Recompute merkle root from current transaction set
         computed_merkle = self._merkle()
@@ -288,8 +340,13 @@ class Block:
         # signatures/public keys are intentionally not included in tx_id.
         # Legacy blocks that require a different signing payload naturally miss
         # this cache and take the full verification path.
+        def _is_unsigned_system_tx(tx: Transaction) -> bool:
+            if tx.sender == "COINBASE":
+                return True
+            return self.index == 0 and tx.sender == Config.GENESIS_TX_SENDER
+
         non_cb = [(i, tx) for i, tx in enumerate(self.transactions)
-                  if tx.sender != "COINBASE"]
+                  if not _is_unsigned_system_tx(tx)]
         if mempool is not None:
             _to_verify = []
             _verified_cache_hits = []
@@ -337,22 +394,49 @@ class Block:
                 )
                 batches[pos % batch_count].append((pos, tx, payload))
 
-            futs = {}
-            for batch in batches:
-                payloads = [entry[2] for entry in batch]
-                futs[pool.submit(_par_verify_sig_batch, payloads)] = batch
+            try:
+                futs = {}
+                for batch in batches:
+                    payloads = [entry[2] for entry in batch]
+                    futs[pool.submit(_par_verify_sig_batch, payloads)] = batch
 
-            for fut in _futures.as_completed(futs):
-                invalid_offset = fut.result()
-                batch = futs[fut]
-                if invalid_offset >= 0:
-                    tx = batch[invalid_offset][1]
-                    return False, (
-                        f"Block integrity failure: invalid signature on tx "
-                        f"{tx.tx_id[:16]} from {tx.sender[:16]}."
-                    )
+                for fut in _futures.as_completed(futs):
+                    invalid_offset = fut.result()
+                    batch = futs[fut]
+                    if invalid_offset >= 0:
+                        tx = batch[invalid_offset][1]
+                        return False, (
+                            f"Block integrity failure: invalid signature on tx "
+                            f"{str(tx.tx_id or '')[:16]} from {str(tx.sender or '')[:16]}."
+                        )
                 if verified_txids is not None:
-                    verified_txids.update(entry[1].tx_id for entry in batch)
+                    for batch in batches:
+                        verified_txids.update(entry[1].tx_id for entry in batch)
+            except (_futures.BrokenProcessPool, RuntimeError) as exc:
+                log.warning(
+                    "SigPool failed during parallel verification (%s); "
+                    "resetting pool and falling back to sequential", exc
+                )
+                _reset_fn = getattr(_pv, "reset_signature_pool", None)
+                if _reset_fn is not None:
+                    _reset_fn(pool)
+                else:
+                    _pv.shutdown_signature_pool(wait=False)
+                for _, tx in non_cb:
+                    payload = (
+                        tx.pub_hex,
+                        tx.sig_hex,
+                        signing_payloads[id(tx)],
+                        tx.sender,
+                        legacy_payloads.get(id(tx)) if allow_legacy else None,
+                    )
+                    if not _par_verify_sig(*payload):
+                        return False, (
+                            f"Block integrity failure: invalid signature on tx "
+                            f"{str(tx.tx_id or '')[:16]} from {str(tx.sender or '')[:16]}."
+                        )
+                    if verified_txids is not None:
+                        verified_txids.add(tx.tx_id)
         else:
             # Small block — sequential is faster (no IPC overhead). Reuse the
             # canonical signing preimage already constructed for tx-id integrity
@@ -371,7 +455,7 @@ class Block:
                 if not _par_verify_sig(*payload):
                     return False, (
                         f"Block integrity failure: invalid signature on tx "
-                        f"{tx.tx_id[:16]} from {tx.sender[:16]}."
+                        f"{str(tx.tx_id or '')[:16]} from {str(tx.sender or '')[:16]}."
                     )
                 if verified_txids is not None:
                     verified_txids.add(tx.tx_id)
@@ -405,6 +489,28 @@ class Block:
             return sha256(b"empty")
 
         # Pick the rule based on this block's height
+        try:
+            v3_height = getattr(Config, "MERKLE_V3_ACTIVATION_HEIGHT", None)
+            v3_active = (v3_height is not None) and (self.index >= int(v3_height)) and (self.index >= int(Config.MERKLE_V2_ACTIVATION_HEIGHT)) and (self.index >= int(Config.MERKLE_V2_ACTIVATION_HEIGHT))
+        except Exception:
+            v3_active = False
+
+        if v3_active:
+            LEAF_TAG = "|leaf|"
+            NODE_TAG = "|node|"
+            ODD_TAG  = "|odd|"
+            hashes = [sha256((LEAF_TAG + h).encode()) for h in hashes]
+            while len(hashes) > 1:
+                pairs = len(hashes) // 2
+                next_level = [
+                    sha256((NODE_TAG + hashes[2*i] + hashes[2*i+1]).encode())
+                    for i in range(pairs)
+                ]
+                if len(hashes) % 2 == 1:
+                    next_level.append(sha256((ODD_TAG + hashes[-1]).encode()))
+                hashes = next_level
+            return hashes[0]
+
         try:
             v2_active = self.index >= int(Config.MERKLE_V2_ACTIVATION_HEIGHT)
         except Exception:
@@ -454,7 +560,7 @@ class Block:
             "prev_hash":        self.prev_hash,
             "timestamp":        self.timestamp,
             "miner":            self.miner_address,
-            "difficulty":       self.difficulty,
+            "difficulty":       float(self.difficulty) if self._is_strict_num(self.difficulty) else self.difficulty,
             "nonce":            self.nonce,
             "merkle_root":      self.merkle_root,
             "state_root":       self.state_root,
@@ -560,12 +666,44 @@ class Block:
             return False
         return DifficultyEngine.validate_pow_target(self.block_hash, self.difficulty)
 
-    def total_tx_fees(self) -> float:
-        return round(sum(t.compute_fee() for t in self.transactions if t.sender != "COINBASE"), 8)
+    def total_tx_fees(self, storage=None) -> float:
+        return from_satoshi(self.total_tx_fees_sat(storage=storage))
 
-    def total_tx_fees_sat(self) -> int:
-        """Total fees in satoshi — pure integer sum (F-01 COMPLETION)."""
-        return sum(t.compute_fee_sat() for t in self.transactions if t.sender != "COINBASE")
+    def total_tx_fees_sat(self, storage=None) -> int:
+        """Total fees in satoshi — pure integer sum (F-01 COMPLETION).
+
+        When ``storage`` is provided, VVM transactions (TYPE_DEPLOY / TYPE_CALL)
+        resolve their actual fee-pool contribution from persisted receipts
+        (matching Blockchain._vvm_fee_pool_credit_sat), falling back to the
+        transaction's committed max gas fee (gas_limit * gas_price) when no
+        storage or receipt is available.
+        """
+        total = 0
+        for t in self.transactions:
+            if t.sender == "COINBASE":
+                continue
+            if (storage is not None
+                    and t.tx_type in (Transaction.TYPE_DEPLOY, Transaction.TYPE_CALL)):
+                receipt = storage.get_vvm_receipt(t.tx_id)
+                if receipt is not None:
+                    sd = receipt.get("storage_delta") or {}
+                    marker = sd.get("__fee_pool_sat__")
+                    if marker is not None:
+                        try:
+                            total += max(0, int(marker))
+                            continue
+                        except (TypeError, ValueError):
+                            pass
+                    reason = str(receipt.get("revert_reason") or "")
+                    if (reason == "Balance debit failed"
+                            or reason == "Contract name already exists"
+                            or reason.startswith("Invalid contract name:")):
+                        continue
+                    gas_used = min(int(receipt.get("gas_used", t.gas_limit)), int(t.gas_limit))
+                    total += gas_fee_to_sat(gas_used, t.gas_price)
+                    continue
+            total += t.compute_fee_sat()
+        return total
 
     def to_dict(self) -> dict:
         return {
@@ -602,7 +740,12 @@ class Block:
         Config.MAX_BLOCK_SIZE and the fill-ratio computation in
         accept_chain().
         """
-        return len(json.dumps(self.to_dict()).encode("utf-8"))
+        d = self.to_dict()
+        d.pop("validator_sigs", None)
+        d.pop("finalized", None)
+        d.pop("pruned", None)
+        d.pop("bootstrap_commitment", None)
+        return len(json.dumps(d).encode("utf-8"))
 
     def size_human(self) -> str:
         """
@@ -627,18 +770,32 @@ class Block:
         raw_txs = d.get("transactions", [])
         if not isinstance(raw_txs, list):
             raise ValueError("block transactions must be a list")
+        required_fields = (
+            "index", "prev_hash", "miner_address", "difficulty",
+            "timestamp", "nonce", "block_hash",
+        )
+        for req in required_fields:
+            if req not in d:
+                raise ValueError(f"block payload missing required field: {req}")
+        if not isinstance(d.get("block_hash"), str) or not d.get("block_hash"):
+            raise ValueError("block payload must include a non-empty block_hash")
         if pruned_flag:
             if raw_txs:
                 raise ValueError("pruned block must not include transaction bodies")
             if not isinstance(d.get("merkle_root"), str) or not d.get("merkle_root"):
                 raise ValueError("pruned block must preserve its original merkle_root")
-            if not isinstance(d.get("block_hash"), str) or not d.get("block_hash"):
-                raise ValueError("pruned block must preserve its original block_hash")
+        validator_sigs = d.get("validator_sigs", [])
+        if not isinstance(validator_sigs, list):
+            raise ValueError("block validator_sigs must be a list")
+        finalized = d.get("finalized", False)
+        if type(finalized) is not bool:
+            raise ValueError("block finalized marker must be a boolean")
         retained = d.get("bootstrap_commitment")
         if retained is not None and not isinstance(retained, dict):
             raise ValueError("bootstrap_commitment metadata must be an object")
         txs = [Transaction.from_dict(t) for t in raw_txs]
         blk = cls(
+            version          = d.get("version", cls.VERSION),
             index            = d["index"],
             prev_hash        = d["prev_hash"],
             transactions     = txs,
@@ -647,15 +804,16 @@ class Block:
             timestamp        = d["timestamp"],
             nonce            = d["nonce"],
             block_hash       = d["block_hash"],
-            validator_sigs   = d.get("validator_sigs", []),
-            vrf_proof        = d.get("vrf_proof", ""),
-            vrf_output       = d.get("vrf_output", ""),
-            finalized        = d.get("finalized", False),
+            validator_sigs   = validator_sigs,
+            vrf_proof        = d.get("vrf_proof") or "",
+            vrf_output       = d.get("vrf_output") or "",
+            finalized        = finalized,
             state_root       = d.get("state_root", ""),
             protocol_version = d.get("protocol_version", Config.PROTOCOL_VERSION),
             merkle_root      = d.get("merkle_root") if "merkle_root" in d else None,
             pruned           = pruned_flag,
             bootstrap_commitment = retained,
+            _deserializing   = True,
         )
         # Remember the historical Merkle commitment for a compact pruned
         # record. It must be restored *after* seal(), because seal() recomputes

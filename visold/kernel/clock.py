@@ -23,9 +23,11 @@ Defines: NetworkClock
 Origin: visold_vsd_.py L5671-5883, L5887
 """
 
+import math
 import threading
 import time
 from collections import deque
+from typing import Optional
 
 from visold.kernel.config import Config
 from visold.kernel.logging_setup import log
@@ -68,10 +70,24 @@ class NetworkClock:
         self._samples: deque = deque(maxlen=Config.CLOCK_PEER_SAMPLE_SIZE)
         self._last_update: float = 0.0
 
+    @staticmethod
+    def _sanitize_timestamp(ts) -> Optional[int]:
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+            return None
+        if not math.isfinite(ts):
+            return None
+        ts_int = int(ts)
+        if ts_int <= 0:
+            return None
+        return ts_int
+
     def record_block_timestamp(self, ts: int):
         """Record a block timestamp observed from the network or locally mined."""
+        clean_ts = self._sanitize_timestamp(ts)
+        if clean_ts is None:
+            return
         with self._lock:
-            self._samples.append(ts)
+            self._samples.append(clean_ts)
         self._maybe_log_drift()
 
     def record_peer_timestamp(self, ts: int, trusted: bool = True):
@@ -80,9 +96,18 @@ class NetworkClock:
         TRUST_LEVEL_LOW peers are excluded to prevent time-warp attacks."""
         if not trusted:
             return  # drop untrusted peer timestamps silently
+        clean_ts = self._sanitize_timestamp(ts)
+        if clean_ts is None:
+            return
         with self._lock:
-            self._samples.append(ts)
+            self._samples.append(clean_ts)
         self._maybe_log_drift()
+
+    def reset(self):
+        """Clear recorded timestamp samples (e.g. on chain reset or tests)."""
+        with self._lock:
+            self._samples.clear()
+            self._last_update = 0.0
 
     def network_time(self) -> int:
         """
@@ -154,7 +179,12 @@ class NetworkClock:
         # samples to agree, so a single outlier still can't unilaterally
         # control the result.
         import statistics
-        newest_ts = max(samples)
+        max_allowed_ts = local_ts + Config.DIFF_MAX_FUTURE_DRIFT
+        plausible = [s for s in samples if s <= max_allowed_ts]
+        if len(plausible) < 3:
+            return local_ts
+
+        newest_ts = max(plausible)
         # If the newest block timestamp is itself very old (chain was idle
         # or we just replayed historical blocks), the sample window is
         # stale and tells us nothing about current network time.
@@ -166,11 +196,16 @@ class NetworkClock:
         # Fresh sample window: check if local clock is BEHIND the network,
         # using the median of the most recent few samples so a single
         # outlier can't unilaterally trigger a correction.
-        recent = sorted(samples)[-3:]
+        recent = sorted(plausible)[-3:]
         median_ts = int(statistics.median(recent))
         drift = local_ts - median_ts
         if drift < -Config.CLOCK_MAX_DRIFT_SECS:
-            corrected = median_ts + 1
+            max_adj = int(getattr(
+                Config, "CLOCK_MAX_FUTURE_ADJUSTMENT",
+                Config.DIFF_MAX_FUTURE_DRIFT // 2,
+            ))
+            cap_ts = min(max_allowed_ts, local_ts + max_adj)
+            corrected = min(median_ts + 1, cap_ts)
             log.warning(
                 f"[NetworkClock] Local clock is {-drift}s behind network "
                 f"(local={local_ts}, median_sample={median_ts}) "
@@ -201,44 +236,23 @@ class NetworkClock:
         and we skip the skew check entirely (different problem, not a clock bug).
         """
         now = time.time()
-        if now - self._last_update < Config.CLOCK_UPDATE_INTERVAL:
-            return
-        self._last_update = now
         with self._lock:
+            if now - self._last_update < Config.CLOCK_UPDATE_INTERVAL:
+                return
+            self._last_update = now
             samples = list(self._samples)
         if len(samples) < 3:
             return
-        # AUDIT-FIX-J2: use max(samples) — a real value comparison —
-        # instead of samples[-1], which trusted deque append order to
-        # match timestamp order. That's not guaranteed (e.g. across a
-        # reorg, a just-applied block can have an earlier timestamp than
-        # one already sitting earlier in the deque). Deliberately NOT
-        # switched to a full-window median: with TARGET_BLOCK_TIME=60s
-        # and CLOCK_PEER_SAMPLE_SIZE=16, the window spans up to ~16
-        # minutes, so a median-of-16 would sit minutes away from
-        # CLOCK_MAX_DRIFT_SECS=30 and fire a false skew warning on every
-        # call under normal operation — exactly the failure mode this
-        # method's own docstring above already identifies and avoids by
-        # using the single freshest sample instead of a median.
-        newest_ts  = max(samples)
-        local_ts   = int(now)
-        sample_age = local_ts - newest_ts
-        # BUG-FIX (sync-fix-7): old code used CLOCK_UPDATE_INTERVAL*4 = 240s
-        # as the stale-sample guard.  During sync or after an idle period the
-        # newest block can be hours old — 240s is far too short, so the guard
-        # never fired and CLOCK SKEW DETECTED spammed the log continuously.
-        # Fix: use DIFF_MAX_FUTURE_DRIFT (7200s) — same threshold as
-        # network_time().  If the sample is older than that, it is stale
-        # (chain idle / historical sync) and carries no skew signal.
-        if sample_age > Config.DIFF_MAX_FUTURE_DRIFT:
-            metrics.set_gauge("clock_drift_secs", 0.0)  # stale — no meaningful drift
+        local_ts = int(now)
+        plausible = [s for s in samples if s <= local_ts + Config.DIFF_MAX_FUTURE_DRIFT]
+        if len(plausible) < 3:
             return
-        # Fresh sample: real drift check.
-        # Only warn when local clock is AHEAD of the latest block by more
-        # than CLOCK_MAX_DRIFT_SECS — that means our clock is genuinely fast.
-        # Do NOT warn when local is behind (sample_age < 0 means future block
-        # — that is a different problem caught elsewhere).
-        drift = abs(sample_age)
+        newest_ts = max(plausible)
+        sample_age = local_ts - newest_ts
+        if sample_age > Config.DIFF_MAX_FUTURE_DRIFT or sample_age < 0:
+            metrics.set_gauge("clock_drift_secs", 0.0)  # stale or future — no meaningful drift
+            return
+        drift = sample_age
         metrics.set_gauge("clock_drift_secs", float(drift))
         if drift > Config.CLOCK_MAX_DRIFT_SECS:
             log.warning(

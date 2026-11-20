@@ -300,14 +300,16 @@ class CLI:
     _UP_NOTIF: List[int] = [8, 7, 6, 5, 4]
     _UP_PA:    List[int] = [8, 7, 6, 5, 4, 3, 2, 1]
 
-    def __init__(self):
+    def __init__(self, port: Optional[int] = None):
         self.node: Optional[VisoldNode]             = None
         self.user_id: Optional[str]                 = None
+        self._port: Optional[int]                   = int(port) if port is not None else None
         self._running                               = True
         self._node_shutdown_done                    = False
         # Live-UI concurrency state
         self._ui_lock       = threading.Lock()          # serialises stdout writes
         self._input_pending_bytes = bytearray()          # preserves bytes after pasted multi-line input
+        self._swallow_next_lf: bool = False              # swallows trailing LF of a split CRLF
         self._refresh_stop  = threading.Event()         # signals refresh thread to exit
         self._refresh_thread: Optional[threading.Thread] = None
         # Dynamic layout state — populated every _full_render().
@@ -347,7 +349,7 @@ class CLI:
             self.user_id = UserAccount.get_user_id()
             print(clr(f"  Auto-login as {self.user_id}", GREEN))
 
-        port = Config.DEFAULT_PORT
+        port = self._port if self._port is not None else Config.DEFAULT_PORT
         self.node = VisoldNode(port=port)
         self.node.start()
 
@@ -450,7 +452,14 @@ class CLI:
                 # v7.5.x: show the deterministically-derived wallet address
                 # so the user can verify cross-device recovery later.
                 try:
-                    _wdata = json.load(open(UserAccount.ACCOUNTS_FILE))
+                    if hasattr(UserAccount, "_get_accounts_file"):
+                        _acct_path = UserAccount._get_accounts_file()
+                    elif hasattr(UserAccount, "_accounts_file"):
+                        _acct_path = UserAccount._accounts_file()
+                    else:
+                        _acct_path = os.path.join(Config.DATA_DIR, "account.json")
+                    with open(_acct_path) as _af:
+                        _wdata = json.load(_af)
                     _waddr = _wdata.get("wallet_addr", "")
                     if _waddr:
                         print(f"  Wallet    : {bold(_waddr)}")
@@ -1738,7 +1747,10 @@ class CLI:
             if self._input_pending_bytes:
                 chunk = bytes(self._input_pending_bytes)
                 self._input_pending_bytes.clear()
-                INPUT_DIAG.event("pending_input_bytes_used", read_id=diag_read_id, count=len(chunk))
+                if diagnostic_kind == "secret":
+                    INPUT_DIAG.event("pending_input_bytes_used", read_id=diag_read_id)
+                else:
+                    INPUT_DIAG.event("pending_input_bytes_used", read_id=diag_read_id, count=len(chunk))
             else:
                 INPUT_DIAG.update(diag_read_id, state="waiting_in_select")
                 try:
@@ -1780,11 +1792,24 @@ class CLI:
             i = 0
             while i < len(chunk):
                 value = chunk[i]
+                if getattr(self, "_swallow_next_lf", False):
+                    self._swallow_next_lf = False
+                    if value == 10:
+                        i += 1
+                        continue
                 if value in (10, 13):  # LF or CR; Android Enter commonly sends CR.
                     finish_partial_codepoint()
                     next_i = i + 1
-                    if value == 13 and next_i < len(chunk) and chunk[next_i] == 10:
-                        next_i += 1
+                    if value == 13:
+                        if next_i < len(chunk) and chunk[next_i] == 10:
+                            next_i += 1
+                            self._swallow_next_lf = False
+                        elif next_i == len(chunk):
+                            self._swallow_next_lf = True
+                        else:
+                            self._swallow_next_lf = False
+                    else:
+                        self._swallow_next_lf = False
                     self._input_pending_bytes.extend(chunk[next_i:])
                     delimiter = "CRLF" if value == 13 and next_i == i + 2 else ("CR" if value == 13 else "LF")
                     INPUT_DIAG.event(
@@ -4033,9 +4058,24 @@ class CLI:
 
         # Build deploy tx
         sender      = self.node.wallet.address
-        chain_nonce = self.node.storage.get_nonce(sender)
-        pending_cnt = len(self.node.blockchain.mempool._pending_nonces.get(sender, set()))
-        nonce       = chain_nonce + pending_cnt
+        _mempool    = self.node.blockchain.mempool
+        if hasattr(_mempool, "next_nonce"):
+            nonce = _mempool.next_nonce(sender)
+        else:
+            _lock = getattr(_mempool, "_lock", None)
+            if _lock is not None:
+                with _lock:
+                    nonce = self.node.storage.get_nonce(sender)
+                    _pending = _mempool._pending_nonces.get(sender)
+                    if _pending:
+                        while nonce in _pending:
+                            nonce += 1
+            else:
+                nonce = self.node.storage.get_nonce(sender)
+                _pending = _mempool._pending_nonces.get(sender)
+                if _pending:
+                    while nonce in _pending:
+                        nonce += 1
         tx = Transaction(
             sender        = sender,
             receiver      = "",
@@ -4149,9 +4189,24 @@ class CLI:
                 print(clr("  Invalid parameter.", RED)); return
 
             sender      = self.node.wallet.address
-            chain_nonce = self.node.storage.get_nonce(sender)
-            pending_cnt = len(self.node.blockchain.mempool._pending_nonces.get(sender, set()))
-            nonce       = chain_nonce + pending_cnt
+            _mempool    = self.node.blockchain.mempool
+            if hasattr(_mempool, "next_nonce"):
+                nonce = _mempool.next_nonce(sender)
+            else:
+                _lock = getattr(_mempool, "_lock", None)
+                if _lock is not None:
+                    with _lock:
+                        nonce = self.node.storage.get_nonce(sender)
+                        _pending = _mempool._pending_nonces.get(sender)
+                        if _pending:
+                            while nonce in _pending:
+                                nonce += 1
+                else:
+                    nonce = self.node.storage.get_nonce(sender)
+                    _pending = _mempool._pending_nonces.get(sender)
+                    if _pending:
+                        while nonce in _pending:
+                            nonce += 1
             tx = Transaction(
                 sender    = sender,
                 receiver  = addr,

@@ -25,11 +25,12 @@ Origin: visold_vsd_.py L23441-23576, L23580-23602, L23606-23707, L23725, L23735,
 
 import hashlib
 import json
+import re
 import threading
 import time
 from typing import Dict, List, Optional, TYPE_CHECKING, Tuple
 
-from visold.crypto.ecc import ecdsa_verify, pub_from_hex, pub_to_address, sig_from_hex
+from visold.crypto.ecc import ECPoint, ecdsa_verify, pub_from_hex, pub_to_address, sig_from_hex
 from visold.crypto.hashing import sha256
 from visold.kernel.config import Config
 from visold.kernel.logging_setup import log
@@ -72,19 +73,24 @@ class L2Transaction:
     # from containing absurdly-huge individual entries.  Real entries are
     # ~400 B; 2 KB gives plenty of headroom.
     MAX_WIRE_BYTES = 2048
+    _CANONICAL_SIG_RE = re.compile(r"^[0-9a-f]{128}$")
+    _CANONICAL_PUB_RE = re.compile(r"^0[23][0-9a-f]{64}$")
 
     def __init__(self, sender: str, receiver: str, amount_sat: int,
-                 nonce: int, timestamp: int = 0,
+                 nonce: int, timestamp: Optional[int] = None,
                  sig: str = "", pub: str = "", l2_tx_id: str = ""):
-        if not isinstance(amount_sat, int) or amount_sat < 0:
+        if isinstance(amount_sat, bool) or not isinstance(amount_sat, int) or amount_sat < 0:
             raise ValueError("L2Transaction amount_sat must be non-negative int")
-        if not isinstance(nonce, int) or nonce < 0:
+        if isinstance(nonce, bool) or not isinstance(nonce, int) or nonce < 0:
             raise ValueError("L2Transaction nonce must be non-negative int")
+        if timestamp is not None:
+            if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
+                raise ValueError("L2Transaction timestamp must be non-negative int")
         self.sender     = sender
         self.receiver   = receiver
-        self.amount_sat = int(amount_sat)
-        self.nonce      = int(nonce)
-        self.timestamp  = int(timestamp) if timestamp else int(time.time())
+        self.amount_sat = amount_sat
+        self.nonce      = nonce
+        self.timestamp  = int(time.time()) if timestamp is None else timestamp
         self.sig        = sig
         self.pub        = pub
         canonical_id = self._compute_id()
@@ -107,23 +113,35 @@ class L2Transaction:
     def is_valid(self) -> Tuple[bool, str]:
         """Structural + signature check.  Does NOT check balance — that's the
         job of Layer2State.apply()."""
-        if not self.sender or not self.receiver:
+        if not isinstance(self.sender, str) or not isinstance(self.receiver, str) or not self.sender or not self.receiver:
             return False, "missing sender/receiver"
-        # L2 uses the same canonical receiver namespace as L1.  Sentinels are
-        # explicit protocol addresses; arbitrary strings must never become
-        # spendable L2 accounts.
+        if self.receiver in (L2_BRIDGE_ADDRESS, L2_WITHDRAW_ADDRESS):
+            return False, "cannot send to L1 bridge sentinel on L2"
+        # L2 transfers use the canonical wallet/contract namespace only.
+        # L1-only protocol sentinels (L2_BRIDGE_ADDRESS, L2_WITHDRAW_ADDRESS,
+        # Config.BURN_ADDRESS, VSD_GLOBAL_MARKET) have no private keys and do
+        # not trigger L1 bridge/burn hooks on L2, so crediting them on L2
+        # would permanently strand both L2 funds and L1 bridge escrow.
         if not is_valid_protocol_address(
                 self.receiver,
-                specials=(L2_BRIDGE_ADDRESS, L2_WITHDRAW_ADDRESS,
-                          Config.BURN_ADDRESS, VSD_GLOBAL_MARKET),
+                specials=(),
                 allow_contract=True):
             return False, "invalid receiver address"
         if self.sender == self.receiver:
             return False, "self-send forbidden on L2"
         if self.amount_sat <= 0:
             return False, "amount must be positive"
-        if not self.sig or not self.pub:
+        if not isinstance(self.sig, str) or not isinstance(self.pub, str) or not self.sig or not self.pub:
             return False, "missing sig/pub"
+        if not self._CANONICAL_SIG_RE.fullmatch(self.sig):
+            return False, "non-canonical sig encoding"
+        if not self._CANONICAL_PUB_RE.fullmatch(self.pub):
+            return False, "non-canonical pub encoding"
+        if self.l2_tx_id != self._compute_id():
+            return False, "l2_tx_id mismatch"
+        wire_bytes = len(json.dumps(self.to_dict(), separators=(",", ":"), sort_keys=True).encode("utf-8"))
+        if wire_bytes > self.MAX_WIRE_BYTES:
+            return False, f"transaction exceeds MAX_WIRE_BYTES ({wire_bytes} > {self.MAX_WIRE_BYTES})"
         # POST-AUDIT FIX (v7.5.0-OPT): pub_from_hex() in this codebase
         # accepts the 33-byte COMPRESSED form directly (line 7790's
         # pub_from_bytes recomputes Y from X using the compressed prefix
@@ -136,6 +154,8 @@ class L2Transaction:
         try:
             pub_pt = pub_from_hex(self.pub)
             sig_pair = sig_from_hex(l2_sig_expand(self.sig))
+            if sig_pair[1] > ECPoint.N // 2:
+                return False, "non-canonical high-S signature"
             h = hashlib.sha256(self.signing_bytes()).digest()
             if not ecdsa_verify(pub_pt, h, sig_pair):
                 return False, "bad signature"
@@ -181,15 +201,36 @@ class L2Transaction:
 
     @classmethod
     def from_dict(cls, d: dict) -> 'L2Transaction':
+        if not isinstance(d, dict):
+            raise ValueError("L2Transaction payload must be a JSON object")
+        for req in ("sender", "receiver", "amount_sat", "nonce"):
+            if req not in d:
+                raise ValueError(f"L2Transaction payload missing required field: {req}")
+        sender = d["sender"]
+        receiver = d["receiver"]
+        sig = d.get("sig") if d.get("sig") is not None else ""
+        pub = d.get("pub") if d.get("pub") is not None else ""
+        l2_tx_id = d.get("l2_tx_id") if d.get("l2_tx_id") is not None else ""
+        if not all(isinstance(v, str) for v in (sender, receiver, sig, pub, l2_tx_id)):
+            raise ValueError("L2Transaction string fields must be str")
+        raw_amount = d["amount_sat"]
+        raw_nonce = d["nonce"]
+        raw_ts = d.get("timestamp") if d.get("timestamp") is not None else 0
+        if isinstance(raw_amount, bool) or not isinstance(raw_amount, int):
+            raise ValueError("L2Transaction amount_sat must be an integer")
+        if isinstance(raw_nonce, bool) or not isinstance(raw_nonce, int):
+            raise ValueError("L2Transaction nonce must be an integer")
+        if isinstance(raw_ts, bool) or not isinstance(raw_ts, int):
+            raise ValueError("L2Transaction timestamp must be an integer")
         return cls(
-            sender     = d["sender"],
-            receiver   = d["receiver"],
-            amount_sat = int(d["amount_sat"]),
-            nonce      = int(d["nonce"]),
-            timestamp  = int(d.get("timestamp", 0)),
-            sig        = d.get("sig", ""),
-            pub        = d.get("pub", ""),
-            l2_tx_id   = d.get("l2_tx_id", ""),
+            sender     = sender,
+            receiver   = receiver,
+            amount_sat = raw_amount,
+            nonce      = raw_nonce,
+            timestamp  = raw_ts,
+            sig        = sig,
+            pub        = pub,
+            l2_tx_id   = l2_tx_id,
         )
 
 

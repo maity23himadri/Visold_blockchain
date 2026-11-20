@@ -50,14 +50,23 @@ def _storage_get_vvm_receipts_for_block(self, height: int) -> List[dict]:
     Add to Storage class or patch in via SHBS._patch_storage().
     """
     try:
-        c = self._conn()
-        rows = c.execute(
-            """SELECT tx_id, contract_addr, gas_used, gas_limit,
-                      success, return_data, revert_reason, logs,
-                      storage_delta
-               FROM vvm_receipts WHERE block_idx=?""",
-            (height,)
-        ).fetchall()
+        if getattr(self, "_pgx_enabled", False):
+            rows = self._pg_fetch(
+                """SELECT tx_id, contract_addr, gas_used, gas_limit,
+                          success, return_data, revert_reason, logs,
+                          storage_delta
+                   FROM vvm_receipts WHERE block_idx=$1""",
+                int(height),
+            )
+        else:
+            c = self._conn()
+            rows = c.execute(
+                """SELECT tx_id, contract_addr, gas_used, gas_limit,
+                          success, return_data, revert_reason, logs,
+                          storage_delta
+                   FROM vvm_receipts WHERE block_idx=?""",
+                (int(height),)
+            ).fetchall()
         result = []
         for row in rows:
             d = dict(row)
@@ -104,13 +113,15 @@ def _storage_get_total_supply_sat(self) -> int:
 def _storage_slash_validator(self, address: str) -> bool:
     """Mark a validator as slashed. Wraps existing storage layer."""
     try:
+        if hasattr(self, "slash"):
+            return bool(self.slash(address))
         c = self._conn()
-        c.execute(
-            "UPDATE validators SET slashed=1 WHERE address=?",
+        cur = c.execute(
+            "UPDATE roles SET slashed=1 WHERE address=? AND slashed=0",
             (address,)
         )
         c.commit()
-        return True
+        return int(getattr(cur, "rowcount", 0) or 0) == 1
     except Exception as exc:
         log.error(f"slash_validator({address}): {exc}")
         return False

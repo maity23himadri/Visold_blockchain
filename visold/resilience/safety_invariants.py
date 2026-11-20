@@ -205,25 +205,43 @@ class SafetyInvariantChecker:
 
         for idx in range(start, tip + 1):
             blk = self._storage.get_block(idx)
-            if blk is None:
-                continue
+            if hasattr(self._storage, "get_blocks_at_height"):
+                candidates = list(self._storage.get_blocks_at_height(idx) or [])
+            else:
+                candidates = [blk] if blk is not None else []
+                if hasattr(self._storage, "get_validator_votes_at_height") and hasattr(
+                    self._storage, "get_block_by_hash"
+                ):
+                    seen_hashes = {b.block_hash for b in candidates}
+                    for vote in self._storage.get_validator_votes_at_height(idx) or []:
+                        bhash = str(vote.get("block_hash", ""))
+                        if bhash and bhash not in seen_hashes:
+                            alt = self._storage.get_block_by_hash(bhash)
+                            if alt is not None and int(getattr(alt, "index", idx)) == idx:
+                                candidates.append(alt)
+                                seen_hashes.add(bhash)
 
             # ── Finality conflict check ───────────────────────────────────────
-            if blk.finalized:
+            for candidate in candidates:
+                if not getattr(candidate, "finalized", False):
+                    continue
                 if idx in finalized_heights:
                     existing_hash = finalized_heights[idx]
-                    if existing_hash != blk.block_hash:
+                    if existing_hash != candidate.block_hash:
                         msg = (
                             f"SAFETY VIOLATION: Two different finalized blocks "
                             f"at height {idx}: "
-                            f"{existing_hash[:16]}... vs {blk.block_hash[:16]}... "
+                            f"{existing_hash[:16]}... vs {candidate.block_hash[:16]}... "
                             f"— conflicting finality detected!")
                         violations.append(msg)
                         log.critical(msg)
                         metrics.inc("invariant_safety_violations")
                         ok = False
                 else:
-                    finalized_heights[idx] = blk.block_hash
+                    finalized_heights[idx] = candidate.block_hash
+
+            if blk is None:
+                continue
 
             # ── Chain linkage check (non-genesis) ─────────────────────────────
             if idx > max(0, start):
@@ -333,19 +351,19 @@ class SafetyInvariantChecker:
             # otherwise-healthy node. All four sums now come from the backend
             # this Storage instance actually considers authoritative.
             pgx3 = self._storage._pgx_enabled
-            excl3 = (Config.BURN_ADDRESS, L2_BRIDGE_ADDRESS, L2_WITHDRAW_ADDRESS)
+            excl2 = (Config.BURN_ADDRESS, L2_WITHDRAW_ADDRESS)
 
             # ── 1. Sum of all balances in satoshi (excluding burn address) ─────
             if pgx3:
                 _row1 = self._storage._pg_fetch(
                     "SELECT COALESCE(SUM(balance_sat),0) AS total FROM accounts "
-                    "WHERE address NOT IN ($1,$2,$3)", list(excl3))
+                    "WHERE address NOT IN ($1,$2)", list(excl2))
                 total_balances_sat = int(_row1[0]["total"]) if _row1 else 0
             else:
                 c = self._storage._conn()
                 row = c.execute(
                     "SELECT COALESCE(SUM(CAST(balance AS INTEGER)),0) AS total "
-                    "FROM balances WHERE address NOT IN (?,?,?)", excl3
+                    "FROM balances WHERE address NOT IN (?,?)", excl2
                 ).fetchone()
                 total_balances_sat = int(row["total"])
 
@@ -356,7 +374,7 @@ class SafetyInvariantChecker:
             # Authoritative: use compute_reward_sat() for each block height.
             # This matches exactly what _distribute_rewards() distributes.
             height = self._storage.chain_height()
-            total_issued_sat = 0
+            total_issued_sat = max(0, int(getattr(Config, "GENESIS_TX_AMOUNT", 0)))
             for h in range(1, height + 1):
                 total_issued_sat += self._blockchain.compute_reward_sat(h) \
                     if self._blockchain else 0

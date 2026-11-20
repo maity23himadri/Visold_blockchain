@@ -91,6 +91,8 @@ class ConsensusEngine:
         best    = None
         best_vr = None
         for c in candidates:
+            if not isinstance(c, dict):
+                continue
             priv_hex = c.get("priv_hex")
             if not priv_hex:
                 # Not eligible — no key, no deterministic VRF.  SKIP.
@@ -143,213 +145,213 @@ class ConsensusEngine:
                     recent_ts.append(_blk.timestamp)
             mtp = DifficultyEngine.compute_mtp(recent_ts) if recent_ts else 0
 
-        # ── Consensus Fix #1: MTP-safe timestamp ─────────────────────────────
-        # At low difficulty, blocks mine in microseconds — many blocks can share
-        # the exact same integer second.  validate_block() enforces a strict
-        # greater-than check against the MTP (Median Time Past).  If the new
-        # block's timestamp equals the MTP, the block is rejected, causing an
-        # infinite retry loop at the same height.
-        #
-        # Solution: always set the candidate timestamp to:
-        #   safe_ts = max(current_time, MTP + 1)
-        # This guarantees the timestamp is strictly greater than the MTP before
-        # the block ever enters the mining loop, so validation cannot fail on
-        # the timestamp rule regardless of mining speed.
-        safe_ts = max(int(time.time()), mtp + 1)
+            # ── Consensus Fix #1: MTP-safe timestamp ─────────────────────────────
+            # At low difficulty, blocks mine in microseconds — many blocks can share
+            # the exact same integer second.  validate_block() enforces a strict
+            # greater-than check against the MTP (Median Time Past).  If the new
+            # block's timestamp equals the MTP, the block is rejected, causing an
+            # infinite retry loop at the same height.
+            #
+            # Solution: always set the candidate timestamp to:
+            #   safe_ts = max(current_time, MTP + 1)
+            # This guarantees the timestamp is strictly greater than the MTP before
+            # the block ever enters the mining loop, so validation cannot fail on
+            # the timestamp rule regardless of mining speed.
+            safe_ts = max(int(time.time()), mtp + 1)
 
-        max_bytes = self.blockchain.get_dynamic_block_size()
-        txs       = []
-        used       = 0
-        # AUDIT-FIX-8: exclude frozen senders' transactions from blocks
-        # THIS node proposes. mempool.get_top()'s ordering stays fully
-        # canonical/deterministic (Fix #7 above) — this filter only
-        # decides which of those already-eligible transactions THIS
-        # miner chooses to keep, exactly like the max_bytes cutoff below
-        # already does. Read-only (is_frozen), never mutates rate-limit
-        # state — that stays scoped to gossip admission (StateEngineHook)
-        # so merely building a candidate block can't itself count as a
-        # rate-limited "attempt".
-        _freeze_reg = getattr(self, "_freeze_registry", None)
-        for tx in self.blockchain.mempool.get_top(500):
-            if _freeze_reg is not None:
+            max_bytes = self.blockchain.get_dynamic_block_size()
+            txs       = []
+            used       = 0
+            # AUDIT-FIX-8: exclude frozen senders' transactions from blocks
+            # THIS node proposes. mempool.get_top()'s ordering stays fully
+            # canonical/deterministic (Fix #7 above) — this filter only
+            # decides which of those already-eligible transactions THIS
+            # miner chooses to keep, exactly like the max_bytes cutoff below
+            # already does. Read-only (is_frozen), never mutates rate-limit
+            # state — that stays scoped to gossip admission (StateEngineHook)
+            # so merely building a candidate block can't itself count as a
+            # rate-limited "attempt".
+            _freeze_reg = getattr(self, "_freeze_registry", None)
+            for tx in self.blockchain.mempool.get_top(500):
+                if _freeze_reg is not None:
+                    try:
+                        if tx.sender != "COINBASE" and _freeze_reg.is_frozen(tx.sender):
+                            continue
+                    except Exception:
+                        pass
+                tx_size = len(json.dumps(tx.to_dict()).encode())
+                if used + tx_size > max_bytes:
+                    break
+                txs.append(tx)
+                used += tx_size
+
+            reward = self.blockchain.compute_reward(height)
+
+            # v7.6.1 — pruning-safe bootstrap commitment.  At the block
+            # immediately following each fixed consensus snapshot boundary, commit
+            # to the complete deterministic state of the parent height.  The
+            # commitment lives in the coinbase transaction, so it is authenticated
+            # by the existing Merkle root and PoW block hash without changing the
+            # header format.
+            _bootstrap_commitment = None
+            _parent_height = height - 1
+            if (height >= int(Config.BOOTSTRAP_COMMITMENT_ACTIVATION_HEIGHT)
+                    and _parent_height > 0
+                    and _parent_height % int(Config.BOOTSTRAP_SNAPSHOT_INTERVAL) == 0):
+                _snap_engine = getattr(self.blockchain, "_snapshot_engine", None)
+                if _snap_engine is None:
+                    raise RuntimeError(
+                        "bootstrap commitment required but snapshot engine is unavailable")
+                _parent = latest
+                if _parent is None or int(_parent.index) != _parent_height or not _parent.state_root:
+                    raise RuntimeError(
+                        "bootstrap commitment required but canonical parent state is unavailable")
+                _digest, _err = _snap_engine.ensure_bootstrap_snapshot(
+                    _parent_height, _parent.state_root)
+                if not _digest:
+                    raise RuntimeError(
+                        f"unable to create required bootstrap snapshot at "
+                        f"height {_parent_height}: {_err}")
+                _bootstrap_commitment = (_parent_height, _digest)
+
+            cb = Transaction.coinbase(
+                miner_address, reward, height,
+                bootstrap_snapshot=_bootstrap_commitment)
+            txs.insert(0, cb)
+
+            # ─────────────────────────────────────────────────────────────────────
+            # v7.1.9 OPTION-A FIX: compute state_root BEFORE the PoW loop.
+            #
+            # Before this fix, state_root was left "" in the candidate, the PoW
+            # solved a header containing state_root="", then apply_block mutated
+            # the field to a non-empty value AFTER the block was sealed.
+            # header_dict() included state_root in the hash preimage, so every
+            # receiving peer recomputed a different block_hash, integrity_check
+            # rejected the block, and sync was completely broken across the
+            # entire network.  See changelog v7.1.9.
+            #
+            # We must run this dry-run while holding the blockchain lock so a
+            # concurrent apply_block doesn't shift state under us.  The dry-run
+            # itself is non-mutating (snapshot/restore).
+            #
+            # v7.2.0-FIX-4: If dry_run_state_root() fails due to a specific tx
+            # (e.g. sender can't afford it), remove that tx and retry rather than
+            # falling back to state_root="" for the entire block.  A block mined
+            # with state_root="" is guaranteed to be rejected by all peers — the
+            # retry produces a valid candidate instead.  VSA-03: there is no empty-root
+            # fallback; a root that cannot be computed raises and yields no candidate.
+            # ─────────────────────────────────────────────────────────────────────
+            _candidate_txs = txs
+
+            def _compute_candidate_root(candidate_txs):
+                """Compute the exact candidate root, with a narrow legacy-signature fallback.
+
+                Real Blockchain.dry_run_state_root() receives the candidate
+                timestamp/difficulty so block-context opcodes execute identically
+                to apply_block().  Some standalone test doubles and older embedders
+                still expose the historical 3-argument API; only that specific
+                signature mismatch is allowed to fall back.  Any TypeError raised
+                *inside* the real dry-run is propagated instead of being masked.
+                """
+                kwargs = {
+                    "transactions": candidate_txs,
+                    "miner_address": miner_address,
+                    "height": height,
+                    "timestamp": safe_ts,
+                    "difficulty": diff,
+                }
                 try:
-                    if tx.sender != "COINBASE" and _freeze_reg.is_frozen(tx.sender):
-                        continue
-                except Exception:
-                    pass
-            tx_size = len(json.dumps(tx.to_dict()).encode())
-            if used + tx_size > max_bytes:
-                break
-            txs.append(tx)
-            used += tx_size
+                    return self.blockchain.dry_run_state_root(**kwargs)
+                except TypeError as exc:
+                    msg = str(exc)
+                    if ("unexpected keyword argument 'timestamp'" not in msg
+                            and "unexpected keyword argument \"timestamp\"" not in msg):
+                        raise
+                    legacy_kwargs = {k: kwargs[k] for k in
+                                     ("transactions", "miner_address", "height")}
+                    return self.blockchain.dry_run_state_root(**legacy_kwargs)
 
-        reward = self.blockchain.compute_reward(height)
+            def _resolve_candidate_root(candidate_txs):
+                """Return ``(executable_txs, state_root)`` for ``candidate_txs``.
 
-        # v7.6.1 — pruning-safe bootstrap commitment.  At the block
-        # immediately following each fixed consensus snapshot boundary, commit
-        # to the complete deterministic state of the parent height.  The
-        # commitment lives in the coinbase transaction, so it is authenticated
-        # by the existing Merkle root and PoW block hash without changing the
-        # header format.
-        _bootstrap_commitment = None
-        _parent_height = height - 1
-        if (height >= int(Config.BOOTSTRAP_COMMITMENT_ACTIVATION_HEIGHT)
-                and _parent_height > 0
-                and _parent_height % int(Config.BOOTSTRAP_SNAPSHOT_INTERVAL) == 0):
-            _snap_engine = getattr(self.blockchain, "_snapshot_engine", None)
-            if _snap_engine is None:
-                raise RuntimeError(
-                    "bootstrap commitment required but snapshot engine is unavailable")
-            _parent = latest
-            if _parent is None or int(_parent.index) != _parent_height or not _parent.state_root:
-                raise RuntimeError(
-                    "bootstrap commitment required but canonical parent state is unavailable")
-            _digest, _err = _snap_engine.ensure_bootstrap_snapshot(
-                _parent_height, _parent.state_root)
-            if not _digest:
-                raise RuntimeError(
-                    f"unable to create required bootstrap snapshot at "
-                    f"height {_parent_height}: {_err}")
-            _bootstrap_commitment = (_parent_height, _digest)
+                VSA-03: never returns an empty root; if the root cannot be computed the
+                exception propagates and no candidate is produced.
+                VSA-19 / VSA-20 / VSA-27 / VSA-07 / VSA-01: each pass runs the read-only
+                precheck (validate_block()'s rules) and then the dry run.  A rejected
+                transaction is identified by position (CandidateTxRejected), removed with
+                every later transaction from the same sender so no nonce gap is created,
+                and the reduced list is checked again.  The coinbase at index 0 is never
+                removed: a rejection pointing at it is a hard failure.
+                """
+                current = list(candidate_txs)
+                while True:
+                    try:
+                        with self.blockchain._lock:
+                            self.blockchain._candidate_precheck(current, height, safe_ts)
+                            return current, _compute_candidate_root(current)
+                    except CandidateTxRejected as rejected:
+                        pos = rejected.index
+                        if pos <= 0 or pos >= len(current):
+                            raise RuntimeError(
+                                "build_candidate_block: cannot isolate a rejected candidate "
+                                f"transaction ({rejected}); no candidate produced") from rejected
+                        victim_sender = current[pos].sender
+                        dropped = sum(1 for t in current[pos:] if t.sender == victim_sender)
+                        log.warning(
+                            f"build_candidate_block: excluding {dropped} transaction(s) from "
+                            f"sender {victim_sender[:12]}: {rejected.reason}")
+                        # BUG-19: a REGISTER that is no longer affordable cannot
+                        # become mineable without the sender's balance changing.
+                        # Leaving it resident makes every future candidate reject
+                        # the same nonce and blocks later transactions. Evict only
+                        # that rejected REGISTER; BUG-13 keeps the freed nonce open
+                        # for resubmission while preserving later pending entries.
+                        _victim = current[pos]
+                        if (_victim.tx_type == Transaction.TYPE_REGISTER
+                                and "insufficient spendable balance for REGISTER fee"
+                                in rejected.reason):
+                            try:
+                                self.blockchain.mempool.remove(_victim.tx_id)
+                            except Exception as _evict_exc:
+                                log.warning(
+                                    "build_candidate_block: failed to evict unaffordable "
+                                    "REGISTER %s: %s", _victim.tx_id[:12], _evict_exc)
+                        current = (current[:pos]
+                                   + [t for t in current[pos:] if t.sender != victim_sender])
 
-        cb = Transaction.coinbase(
-            miner_address, reward, height,
-            bootstrap_snapshot=_bootstrap_commitment)
-        txs.insert(0, cb)
+            _candidate_txs, pre_state_root = _resolve_candidate_root(_candidate_txs)
 
-        # ─────────────────────────────────────────────────────────────────────
-        # v7.1.9 OPTION-A FIX: compute state_root BEFORE the PoW loop.
-        #
-        # Before this fix, state_root was left "" in the candidate, the PoW
-        # solved a header containing state_root="", then apply_block mutated
-        # the field to a non-empty value AFTER the block was sealed.
-        # header_dict() included state_root in the hash preimage, so every
-        # receiving peer recomputed a different block_hash, integrity_check
-        # rejected the block, and sync was completely broken across the
-        # entire network.  See changelog v7.1.9.
-        #
-        # We must run this dry-run while holding the blockchain lock so a
-        # concurrent apply_block doesn't shift state under us.  The dry-run
-        # itself is non-mutating (snapshot/restore).
-        #
-        # v7.2.0-FIX-4: If dry_run_state_root() fails due to a specific tx
-        # (e.g. sender can't afford it), remove that tx and retry rather than
-        # falling back to state_root="" for the entire block.  A block mined
-        # with state_root="" is guaranteed to be rejected by all peers — the
-        # retry produces a valid candidate instead.  VSA-03: there is no empty-root
-        # fallback; a root that cannot be computed raises and yields no candidate.
-        # ─────────────────────────────────────────────────────────────────────
-        _candidate_txs = txs
-
-        def _compute_candidate_root(candidate_txs):
-            """Compute the exact candidate root, with a narrow legacy-signature fallback.
-
-            Real Blockchain.dry_run_state_root() receives the candidate
-            timestamp/difficulty so block-context opcodes execute identically
-            to apply_block().  Some standalone test doubles and older embedders
-            still expose the historical 3-argument API; only that specific
-            signature mismatch is allowed to fall back.  Any TypeError raised
-            *inside* the real dry-run is propagated instead of being masked.
-            """
-            kwargs = {
-                "transactions": candidate_txs,
-                "miner_address": miner_address,
-                "height": height,
-                "timestamp": safe_ts,
-                "difficulty": diff,
-            }
-            try:
-                return self.blockchain.dry_run_state_root(**kwargs)
-            except TypeError as exc:
-                msg = str(exc)
-                if ("unexpected keyword argument 'timestamp'" not in msg
-                        and "unexpected keyword argument \"timestamp\"" not in msg):
-                    raise
-                legacy_kwargs = {k: kwargs[k] for k in
-                                 ("transactions", "miner_address", "height")}
-                return self.blockchain.dry_run_state_root(**legacy_kwargs)
-
-        def _resolve_candidate_root(candidate_txs):
-            """Return ``(executable_txs, state_root)`` for ``candidate_txs``.
-
-            VSA-03: never returns an empty root; if the root cannot be computed the
-            exception propagates and no candidate is produced.
-            VSA-19 / VSA-20 / VSA-27 / VSA-07 / VSA-01: each pass runs the read-only
-            precheck (validate_block()'s rules) and then the dry run.  A rejected
-            transaction is identified by position (CandidateTxRejected), removed with
-            every later transaction from the same sender so no nonce gap is created,
-            and the reduced list is checked again.  The coinbase at index 0 is never
-            removed: a rejection pointing at it is a hard failure.
-            """
-            current = list(candidate_txs)
+            # The tx-byte budget above intentionally governs local packing policy,
+            # but the consensus limit applies to the COMPLETE serialized block.
+            # CoinBase + header fields add bytes that are not included in ``used``.
+            # Trim from the tail and recompute the deterministic state root until
+            # the exact candidate representation is inside the hard consensus cap.
+            # Removing only tail transactions preserves the canonical mempool order.
+            hard_cap = int(Config.MAX_BLOCK_SIZE)
             while True:
-                try:
-                    with self.blockchain._lock:
-                        self.blockchain._candidate_precheck(current, height, safe_ts)
-                        return current, _compute_candidate_root(current)
-                except CandidateTxRejected as rejected:
-                    pos = rejected.index
-                    if pos <= 0 or pos >= len(current):
-                        raise RuntimeError(
-                            "build_candidate_block: cannot isolate a rejected candidate "
-                            f"transaction ({rejected}); no candidate produced") from rejected
-                    victim_sender = current[pos].sender
-                    dropped = sum(1 for t in current[pos:] if t.sender == victim_sender)
-                    log.warning(
-                        f"build_candidate_block: excluding {dropped} transaction(s) from "
-                        f"sender {victim_sender[:12]}: {rejected.reason}")
-                    # BUG-19: a REGISTER that is no longer affordable cannot
-                    # become mineable without the sender's balance changing.
-                    # Leaving it resident makes every future candidate reject
-                    # the same nonce and blocks later transactions. Evict only
-                    # that rejected REGISTER; BUG-13 keeps the freed nonce open
-                    # for resubmission while preserving later pending entries.
-                    _victim = current[pos]
-                    if (_victim.tx_type == Transaction.TYPE_REGISTER
-                            and "insufficient spendable balance for REGISTER fee"
-                            in rejected.reason):
-                        try:
-                            self.blockchain.mempool.remove(_victim.tx_id)
-                        except Exception as _evict_exc:
-                            log.warning(
-                                "build_candidate_block: failed to evict unaffordable "
-                                "REGISTER %s: %s", _victim.tx_id[:12], _evict_exc)
-                    current = (current[:pos]
-                               + [t for t in current[pos:] if t.sender != victim_sender])
-
-        _candidate_txs, pre_state_root = _resolve_candidate_root(_candidate_txs)
-
-        # The tx-byte budget above intentionally governs local packing policy,
-        # but the consensus limit applies to the COMPLETE serialized block.
-        # CoinBase + header fields add bytes that are not included in ``used``.
-        # Trim from the tail and recompute the deterministic state root until
-        # the exact candidate representation is inside the hard consensus cap.
-        # Removing only tail transactions preserves the canonical mempool order.
-        hard_cap = int(Config.MAX_BLOCK_SIZE)
-        while True:
-            candidate = Block(
-                index        = height,
-                prev_hash    = prev_hash,
-                transactions = _candidate_txs,
-                miner_address= miner_address,
-                difficulty   = diff,
-                vrf_proof    = vrf_proof,
-                vrf_output   = vrf_output,
-                timestamp    = safe_ts,
-                state_root   = pre_state_root,
-            )
-            if candidate.size() <= hard_cap:
-                return candidate
-            if len(_candidate_txs) <= 1:
-                # Coinbase alone must fit under the configured consensus cap.
-                # If configuration violates that invariant, fail loudly rather
-                # than return a candidate that every validator must reject.
-                raise RuntimeError(
-                    f"Consensus MAX_BLOCK_SIZE={hard_cap} is too small for "
-                    f"the mandatory coinbase/header block ({candidate.size()} bytes)"
+                candidate = Block(
+                    index        = height,
+                    prev_hash    = prev_hash,
+                    transactions = _candidate_txs,
+                    miner_address= miner_address,
+                    difficulty   = diff,
+                    vrf_proof    = vrf_proof,
+                    vrf_output   = vrf_output,
+                    timestamp    = safe_ts,
+                    state_root   = pre_state_root,
                 )
+                if candidate.size() <= hard_cap:
+                    return candidate
+                if len(_candidate_txs) <= 1:
+                    # Coinbase alone must fit under the configured consensus cap.
+                    # If configuration violates that invariant, fail loudly rather
+                    # than return a candidate that every validator must reject.
+                    raise RuntimeError(
+                        f"Consensus MAX_BLOCK_SIZE={hard_cap} is too small for "
+                        f"the mandatory coinbase/header block ({candidate.size()} bytes)"
+                    )
 
-            _candidate_txs, pre_state_root = _resolve_candidate_root(_candidate_txs[:-1])
+                _candidate_txs, pre_state_root = _resolve_candidate_root(_candidate_txs[:-1])
 
     def _is_canonical(self, block: Block) -> bool:
         """True when this block is the canonical block stored at its height (VSA-22)."""
@@ -424,9 +426,13 @@ class ConsensusEngine:
                 % block.index,
             )
             return False, "eligible validator snapshot unavailable; refusing BFT vote"
-        total_stake_sat = sum(int(v["stake_sat"]) for v in validators)
-        validator_count = len(validators)
-        eligible_addresses = {str(v["address"]) for v in validators}
+        active_validators = [
+            v for v in validators
+            if isinstance(v, dict) and v.get("address") and int(v.get("stake_sat", 0)) > 0
+        ]
+        total_stake_sat = sum(int(v["stake_sat"]) for v in active_validators)
+        validator_count = len(active_validators)
+        eligible_addresses = {str(v["address"]) for v in active_validators}
 
         # F-09 FIX: Require MIN_VALIDATORS_FOR_BFT validators before BFT mode
         # is considered active.  Below this threshold the network uses PoW-only

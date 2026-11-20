@@ -151,11 +151,14 @@ class TransactionMonitor:
         now = time.time()
         txs = getattr(block, "transactions", [])
         height = getattr(block, "index", 0)
-        elapsed = max(getattr(block, "timestamp", now) - self._get_prev_ts(height), 1)
+        block_ts = getattr(block, "timestamp", now)
+        elapsed = max(block_ts - self._get_prev_ts(height, block_ts), 1)
 
         # TPS measurement
         tps = len(txs) / elapsed
         self._tps_buf.push(tps)
+        tps_baseline = self._bus.get_baseline("tps")
+        tps_z = tps_baseline.current_zscore(tps) if tps_baseline is not None else 0.0
 
         # Mempool size
         try:
@@ -182,8 +185,18 @@ class TransactionMonitor:
                 source="rule",
                 confidence=0.95,
                 block_height=height,
-                z_score=self._bus.get_baseline("tps").current_zscore(tps),
+                z_score=tps_z,
             ))
+
+        # Update MonitorBus baselines (after reading current_zscore for Rule 1)
+        for metric_name, metric_val in (
+            ("tps", float(tps)),
+            ("mempool_size", float(mpool_size)),
+            ("block_gas", float(total_gas)),
+        ):
+            tracker = self._bus.get_baseline(metric_name)
+            if tracker is not None:
+                tracker.update(metric_val)
 
         # ── Rule 2: Single-sender flood ──────────────────────────────────────
         sender_counts: Dict[str, int] = defaultdict(int)
@@ -207,30 +220,43 @@ class TransactionMonitor:
                 ))
 
         # ── Rule 3: Fund drain detection ─────────────────────────────────────
-        # For each non-coinbase tx, check if sender balance dropped > DRAIN_THRESHOLD
+        # on_block_applied() runs AFTER apply_block(), so get_balance(sender)
+        # returns the post-block balance. Reconstruct pre-block balance from
+        # balance_after + total outgoing amount sent by that sender in block.
+        sender_out_amounts: Dict[str, float] = defaultdict(float)
+        sender_tx_ids: Dict[str, List[str]] = defaultdict(list)
         for tx in txs:
             sender = getattr(tx, "sender", "")
-            amount = getattr(tx, "amount", 0.0)
-            if not sender or sender == "COINBASE":
+            amount = float(getattr(tx, "amount", 0.0) or 0.0)
+            if not sender or sender == "COINBASE" or amount <= 0.0:
                 continue
+            sender_out_amounts[sender] += amount
+            tx_id = getattr(tx, "tx_id", "")
+            if tx_id:
+                sender_tx_ids[sender].append(tx_id)
+
+        for sender, total_amount in sender_out_amounts.items():
             try:
-                balance = self._storage.get_balance(sender)
-                if balance > 0 and amount / max(balance, 1e-12) > self.DRAIN_THRESHOLD:
+                balance_after = float(self._storage.get_balance(sender) or 0.0)
+                balance_before = balance_after + total_amount
+                if balance_before > 0.0 and total_amount / balance_before > self.DRAIN_THRESHOLD:
+                    drain_ratio = total_amount / balance_before
                     anomalies.append(AnomalyReport(
                         kind=AnomalyKind.FUND_DRAIN,
                         detected_at=now,
                         description=(
                             f"Fund drain: {sender[:20]} sent "
-                            f"{amount:.4f} VSD ({100*amount/balance:.1f}% of balance)"
+                            f"{total_amount:.4f} VSD ({100*drain_ratio:.1f}% of balance)"
                         ),
-                        evidence={"sender": sender, "amount": amount,
-                                  "balance_before": balance,
-                                  "drain_ratio": amount / balance},
+                        evidence={"sender": sender, "amount": total_amount,
+                                  "balance_before": balance_before,
+                                  "balance_after": balance_after,
+                                  "drain_ratio": drain_ratio},
                         source="rule",
                         confidence=0.75,
                         affected_addr=sender,
                         block_height=height,
-                        tx_ids=[getattr(tx, "tx_id", "")],
+                        tx_ids=sender_tx_ids[sender],
                     ))
             except Exception:
                 pass
@@ -240,15 +266,23 @@ class TransactionMonitor:
 
         return anomalies
 
-    def _get_prev_ts(self, height: int) -> float:
+    def _get_prev_ts(self, height: int, block_ts: Optional[float] = None) -> float:
         """Fetch timestamp of previous block for TPS calculation."""
         try:
-            prev = self._storage.get_block(height - 1)
-            if prev:
-                return prev.get("timestamp", time.time() - 10)
+            if height > 0:
+                prev = self._storage.get_block(height - 1)
+                if prev is not None:
+                    ts = (
+                        prev.get("timestamp")
+                        if isinstance(prev, dict)
+                        else getattr(prev, "timestamp", None)
+                    )
+                    if ts is not None:
+                        return float(ts)
         except Exception:
             pass
-        return time.time() - 10
+        base = float(block_ts) if block_ts is not None else time.time()
+        return base - 10.0
 
 
 class GasMonitor:
@@ -305,6 +339,9 @@ class GasMonitor:
             # Update global baseline
             z = self._gas_tracker.update(gas_used)
             self._gas_baseline.push(gas_used)
+            bus_gas_baseline = self._bus.get_baseline("vvm_gas_per_tx")
+            if bus_gas_baseline is not None:
+                bus_gas_baseline.update(float(gas_used))
 
             # Gas spike anomaly
             if z > self.GAS_SPIKE_Z and self._gas_tracker.is_warmed:
@@ -537,8 +574,11 @@ class ReentrancyPatternDetector:
         except Exception:
             return []
 
+        seen_in_block: Set[str] = set()
         for receipt in (receipts or []):
             contract = receipt.get("contract_addr", "")
+            if contract in seen_in_block:
+                continue
             logs     = receipt.get("logs", [])
             delta    = receipt.get("storage_delta", {})
             tx_id    = receipt.get("tx_id", "")
@@ -568,44 +608,41 @@ class ReentrancyPatternDetector:
             sstore_positions = [i for i, t in enumerate(log_types)
                                 if "SSTORE" in t.upper() or "STORE" in t.upper()]
 
-            # If any CALL appears BEFORE a subsequent SSTORE, classic
-            # reentrancy (state written after an external interaction --
-            # the checks-effects-interactions violation a reentrant call
-            # can exploit by re-entering before that SSTORE takes effect).
+            matched_pair = None
             for call_pos in call_positions:
                 for sstore_pos in sstore_positions:
-                    # AUDIT-FIX-M6: this comparison was backwards
-                    # (sstore_pos < call_pos), which flagged SSTORE-then-
-                    # CALL -- the SAFE checks-effects-interactions ordering
-                    # -- and never fired on the actual dangerous pattern
-                    # this class's own docstring describes: "a CALL log
-                    # before a subsequent SSTORE".
                     if call_pos < sstore_pos:
-                        # CALL then SSTORE — reentrancy signature
-                        with self._lock:
-                            if contract not in self._suspicious_contracts:
-                                self._suspicious_contracts.add(contract)
-                                anomalies.append(AnomalyReport(
-                                    kind=AnomalyKind.REENTRANCY_PATTERN,
-                                    detected_at=now,
-                                    description=(
-                                        f"Reentrancy pattern in contract {contract[:24]}: "
-                                        f"CALL at log[{call_pos}] before "
-                                        f"SSTORE at log[{sstore_pos}]"
-                                    ),
-                                    evidence={
-                                        "contract": contract,
-                                        "tx_id": tx_id,
-                                        "sstore_pos": sstore_pos,
-                                        "call_pos": call_pos,
-                                        "log_count": len(logs),
-                                        "storage_keys_written": list(delta.keys())[:5],
-                                    },
-                                    source="pattern",
-                                    confidence=0.70,
-                                    affected_addr=contract,
-                                    block_height=height,
-                                    tx_ids=[tx_id],
-                                ))
+                        matched_pair = (call_pos, sstore_pos)
+                        break
+                if matched_pair is not None:
+                    break
+
+            if matched_pair is not None:
+                call_pos, sstore_pos = matched_pair
+                seen_in_block.add(contract)
+                with self._lock:
+                    self._suspicious_contracts.add(contract)
+                anomalies.append(AnomalyReport(
+                    kind=AnomalyKind.REENTRANCY_PATTERN,
+                    detected_at=now,
+                    description=(
+                        f"Reentrancy pattern in contract {contract[:24]}: "
+                        f"CALL at log[{call_pos}] before "
+                        f"SSTORE at log[{sstore_pos}]"
+                    ),
+                    evidence={
+                        "contract": contract,
+                        "tx_id": tx_id,
+                        "sstore_pos": sstore_pos,
+                        "call_pos": call_pos,
+                        "log_count": len(logs),
+                        "storage_keys_written": list(delta.keys())[:5],
+                    },
+                    source="pattern",
+                    confidence=0.70,
+                    affected_addr=contract,
+                    block_height=height,
+                    tx_ids=[tx_id],
+                ))
 
         return anomalies

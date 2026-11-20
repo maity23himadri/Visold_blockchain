@@ -87,6 +87,32 @@ class RollingWindowPruner:
             return None
         idx = int(target_index)
         proof = []
+        try:
+            v3_height = getattr(Config, "MERKLE_V3_ACTIVATION_HEIGHT", None)
+            v3 = (v3_height is not None) and (int(block_height) >= int(v3_height))
+        except Exception:
+            v3 = False
+        if v3:
+            leaf_tag = "|leaf|"
+            node_tag = "|node|"
+            odd_tag = "|odd|"
+            hashes = [sha256((leaf_tag + h).encode()) for h in hashes]
+            while len(hashes) > 1:
+                pairs = len(hashes) // 2
+                paired = pairs * 2
+                if idx < paired:
+                    sib = idx ^ 1
+                    proof.append({"hash": hashes[sib],
+                                  "side": "R" if idx % 2 == 0 else "L"})
+                else:
+                    proof.append({"hash": "", "side": "ODD"})
+                nxt = [sha256((node_tag + hashes[2*i] + hashes[2*i+1]).encode())
+                       for i in range(pairs)]
+                if len(hashes) % 2:
+                    nxt.append(sha256((odd_tag + hashes[-1]).encode()))
+                idx = idx // 2 if idx < paired else len(nxt) - 1
+                hashes = nxt
+            return proof
         v2 = int(block_height) >= int(Config.MERKLE_V2_ACTIVATION_HEIGHT)
         if v2:
             odd_tag = "|odd|"
@@ -306,16 +332,18 @@ class RollingWindowPruner:
         # resume exactly where it stopped instead of repeatedly rescanning the
         # entire old chain.
         try:
-            watermark = max(0, int(self._storage.get_meta("rolling_pruned_until") or 0))
+            prior_watermark = max(
+                0, int(self._storage.get_meta("rolling_pruned_until") or 0))
         except Exception:
-            watermark = 0
+            prior_watermark = 0
 
         # Repair the specific stale-watermark shape emitted by older snapshot
         # bootstrap code: it could set the watermark beyond the rolling cutoff
         # while block 0 (or another prefix block) still had a full body.  This
         # cheap sentinel check avoids rescanning the entire chain on every block.
         # The full contiguous-prefix reconciliation runs once after bootstrap.
-        if watermark > 0:
+        start = prior_watermark
+        if prior_watermark > 0:
             try:
                 first_block = self._storage.get_block(0)
                 if first_block is not None:
@@ -324,17 +352,17 @@ class RollingWindowPruner:
                         # Authenticated bootstrap deliberately retains genesis as
                         # a full trust anchor while installing 1..H header-only.
                         # That valid shape must keep its positive watermark. Only
-                        # reset the legacy stale marker when block 1 is full too.
+                        # scan from 0 when block 1 is full too, without wiping
+                        # rolling_pruned_until in storage.
                         second = self._storage.get_block(1)
                         second_pruned = bool(
                             second is not None and second.to_dict().get("pruned", False))
                         if not second_pruned:
-                            watermark = 0
-                            self._storage.set_meta("rolling_pruned_until", "0")
+                            start = 0
             except Exception:
-                # On an uncertain read, do not move the watermark forward.
-                watermark = min(watermark, cutoff)
-        start = watermark
+                # On an uncertain read, bound scan start to cutoff without
+                # lowering the persisted watermark.
+                start = min(prior_watermark, cutoff)
 
         # A watermark beyond the rolling cutoff is valid after authenticated
         # bootstrap when the imported history is already header-only.  Never
@@ -666,6 +694,18 @@ class RollingWindowPruner:
             # prefix; doing so would falsely claim old blocks are unavailable.
             if pruned:
                 new_watermark = contiguous
+                if prior_watermark > contiguous:
+                    # Preserve protection for any already-pruned suffix blocks
+                    # (e.g., from non-fresh authenticated bootstrap) above cutoff.
+                    for check_idx in range(prior_watermark - 1, contiguous - 1, -1):
+                        try:
+                            blk = self._storage.get_block(check_idx)
+                            if blk is not None and bool(blk.to_dict().get("pruned", False)):
+                                new_watermark = max(new_watermark, check_idx + 1)
+                                break
+                        except Exception:
+                            new_watermark = max(new_watermark, check_idx + 1)
+                            break
                 self._storage.set_meta("rolling_pruned_until", str(new_watermark))
                 metrics.set_gauge("rolling_pruned_until_height", float(new_watermark))
             return pruned
@@ -719,6 +759,10 @@ class RollingWindowPruner:
             # exception so the watermark still records historical unavailability.
             genesis_exception_boundary = 0
             genesis_exception_open = True
+            # Non-fresh bootstrap keeps 0..local_h full while installing
+            # local_h+1..snap_h header-only. Track the highest pruned block so
+            # rollback/reorg guards never treat header-only suffixes as full.
+            highest_pruned_boundary = 0
             first_full_at_or_after_cutoff = None
             scan_complete = True
             batch = []
@@ -737,6 +781,7 @@ class RollingWindowPruner:
                 is_pruned = bool(full.get("pruned", False))
 
                 if is_pruned:
+                    highest_pruned_boundary = idx + 1
                     batch.append((
                         idx, str(full.get("block_hash", "")),
                         str(full.get("prev_hash", "")),
@@ -785,20 +830,26 @@ class RollingWindowPruner:
                 c.commit()
 
             if not scan_complete:
-                # Keep only the verified contiguous prefix; a partial scan must
-                # never advertise a larger watermark or mark reconciliation done.
-                self._storage.set_meta("rolling_pruned_until", str(contiguous))
-                metrics.set_gauge("rolling_pruned_until_height", float(contiguous))
+                # Keep at least the highest observed pruned boundary so
+                # rollback/reorg cannot cross already-pruned header-only blocks.
+                partial_boundary = max(contiguous, highest_pruned_boundary)
+                self._storage.set_meta("rolling_pruned_until", str(partial_boundary))
+                metrics.set_gauge("rolling_pruned_until_height", float(partial_boundary))
                 self._last_height = -1
                 return 0
 
             if (not Config.ROLLING_PRUNE_ENABLED or
                     height < int(Config.ROLLING_PRUNE_WINDOW) +
                     int(Config.ROLLING_PRUNE_INTERVAL)):
+                early_boundary = max(
+                    int(all_prefix_boundary),
+                    int(genesis_exception_boundary),
+                    int(highest_pruned_boundary),
+                )
                 self._storage.set_meta(
-                    "rolling_pruned_until", str(all_prefix_boundary))
+                    "rolling_pruned_until", str(early_boundary))
                 metrics.set_gauge(
-                    "rolling_pruned_until_height", float(all_prefix_boundary))
+                    "rolling_pruned_until_height", float(early_boundary))
                 self._storage.set_meta("rolling_prune_reconcile_version", "1")
                 self._last_height = height
                 return 0
@@ -856,19 +907,25 @@ class RollingWindowPruner:
                     scan += 1
                 final_boundary = max(
                     final_boundary, int(all_prefix_boundary),
-                    int(genesis_exception_boundary))
+                    int(genesis_exception_boundary),
+                    int(highest_pruned_boundary))
                 self._storage.set_meta("rolling_pruned_until", str(final_boundary))
                 metrics.set_gauge(
                     "rolling_pruned_until_height", float(final_boundary))
+            elif highest_pruned_boundary > self.get_pruned_watermark():
+                self._storage.set_meta(
+                    "rolling_pruned_until", str(highest_pruned_boundary))
+                metrics.set_gauge(
+                    "rolling_pruned_until_height", float(highest_pruned_boundary))
             self._storage.set_meta("rolling_prune_reconcile_version", "1")
             self._last_height = height
             return processed
         except Exception as exc:
             log.warning("RollingWindowPruner: bootstrap reconciliation failed: %s", exc)
             try:
-                # Reset only to a conservative value; never claim the snapshot
-                # height itself was pruned merely because its state was restored.
-                self._storage.set_meta("rolling_pruned_until", "0")
+                fallback_boundary = max(0, int(locals().get("highest_pruned_boundary", 0)))
+                self._storage.set_meta("rolling_pruned_until", str(fallback_boundary))
+                metrics.set_gauge("rolling_pruned_until_height", float(fallback_boundary))
             except Exception:
                 pass
             return processed

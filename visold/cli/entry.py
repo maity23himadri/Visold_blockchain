@@ -136,14 +136,21 @@ Safety:
             rc = 130
         sys.exit(int(rc) if rc is not None else 0)
 
-    port = Config.DEFAULT_PORT
+    port = None
     if len(sys.argv) > 1:
         try:
-            port = int(sys.argv[1])
+            parsed_port = int(sys.argv[1])
+            if 1024 <= parsed_port <= 65533:
+                port = parsed_port
+            else:
+                print(
+                    clr(f"Ignoring out-of-range port {parsed_port} (must be 1024..65533).", YELLOW),
+                    file=sys.stderr,
+                )
         except ValueError:
             pass
 
-    cli = CLI()
+    cli = CLI(port=port)
     cli_ref["cli"] = cli
     try:
         cli.run()

@@ -29,7 +29,7 @@ import time
 import concurrent.futures as _futures
 from typing import Any, Dict, List, Optional, TYPE_CHECKING, Tuple
 
-from visold.kernel.config import Config
+from visold.kernel.config import BLOCK_ALREADY_APPLIED_MSG, Config
 from visold.kernel.events import Event, EventType
 from visold.kernel.logging_setup import log
 from visold.kernel.messages import MSG_EMERGENCY_VOTE, MSG_VALIDATOR_SIG
@@ -112,7 +112,10 @@ class StateEngine:
             maxsize=Config.STATE_ENGINE_QUEUE_SIZE)
         self._thread: Optional[threading.Thread] = None
         self._running = False
+        self._stopping = False
         self._stop_evt = threading.Event()
+        self._lifecycle_lock = threading.Lock()
+        self._writer_lock = threading.RLock()
         # Fix #12: invariant checker injected by VisoldNode after construction
         self._invariant_checker: Optional['SafetyInvariantChecker'] = None
         # NEW: Circuit breaker — injected by VisoldNode; gates write events
@@ -172,25 +175,38 @@ class StateEngine:
         self._network = network
 
     def start(self):
-        """Start the single-writer background thread."""
-        self._running = True
-        self._stop_evt.clear()
-        self._thread = threading.Thread(
-            target=self._run, daemon=True, name="state-engine")
-        self._thread.start()
-        log.info("StateEngine started — single-writer mode active")
+        """Start the single-writer background thread (idempotent if already alive)."""
+        with self._lifecycle_lock:
+            if self._thread is not None and self._thread.is_alive():
+                log.warning("StateEngine.start() called while writer thread is already alive; ignoring")
+                return
+            self._stopping = False
+            self._running = True
+            self._stop_evt.clear()
+            self._thread = threading.Thread(
+                target=self._run, daemon=True, name="state-engine")
+            self._thread.start()
+            log.info("StateEngine started — single-writer mode active")
 
     def stop(self):
         """Graceful shutdown: drain the queue then stop."""
-        self._running = False
-        # Post a STOP event to unblock the queue.get() if it is waiting
-        try:
-            self._queue.put_nowait(Event(EventType.STOP, {}))
-        except queue.Full:
-            pass
-        self._stop_evt.set()
-        if self._thread:
-            self._thread.join(timeout=10)
+        with self._lifecycle_lock:
+            thread = self._thread
+            if not self._running and (thread is None or not thread.is_alive()):
+                self._stopping = True
+                self._stop_evt.set()
+                return
+            self._stopping = True
+            self._stop_evt.set()
+            # Post a STOP sentinel to unblock queue.get() if it is waiting.
+            # If the queue is full, _run() still exits after draining because
+            # _stop_evt is set.
+            try:
+                self._queue.put_nowait(Event(EventType.STOP, {}))
+            except queue.Full:
+                pass
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=10)
 
     # ── Post API ──────────────────────────────────────────────────────────────
 
@@ -207,6 +223,10 @@ class StateEngine:
         peers to mark the node as disconnected — a cross-layer DoS.
         Local events (CLI/RPC, timeout=provided) may still block with a timeout.
         """
+        _stop_evt = getattr(self, "_stop_evt", None)
+        if (getattr(self, "_stopping", False) or (_stop_evt is not None and _stop_evt.is_set())) and event.etype != EventType.STOP:
+            return False
+
         if self._circuit_breaker and self._circuit_breaker.is_open:
             if event.etype not in (EventType.TIMER, EventType.STOP):
                 return False  # breaker open — drop state-mutating events
@@ -278,7 +298,16 @@ class StateEngine:
                            ``future`` lets the caller correlate the eventual result.
         * ``"not_queued"`` the event never entered the queue and cannot apply.
         """
+        _stop_evt = getattr(self, "_stop_evt", None)
+        if getattr(self, "_stopping", False) or (_stop_evt is not None and _stop_evt.is_set()):
+            return "not_queued", False, "StateEngine is stopping", None
+
+        thread = getattr(self, "_thread", None)
         if not self._running:
+            if thread is not None and thread.is_alive():
+                return "not_queued", False, "StateEngine writer thread is still active", None
+            if thread is not None:
+                return "not_queued", False, "StateEngine is stopped", None
             # Fallback: direct execution for tests / pre-start scenarios
             ok, msg = self._dispatch_direct(event)
             return "done", bool(ok), msg, None
@@ -314,6 +343,13 @@ class StateEngine:
 
     def _dispatch_direct(self, event: Event) -> Tuple[bool, str]:
         """Synchronous fallback for tests / pre-start scenarios."""
+        lock = getattr(self, "_writer_lock", None)
+        if lock is not None:
+            with lock:
+                try:
+                    return self._handle(event)
+                except Exception as e:
+                    return False, str(e)
         try:
             return self._handle(event)
         except Exception as e:
@@ -326,34 +362,74 @@ class StateEngine:
         Fixed StateEngine Event Loop
         """
         _last_seq: int = 0
-        while self._running:
-            try:
-                # Poll the queue for new events (blocks, txs, etc.)
-                event = self._queue.get(timeout=1.0)
-            except queue.Empty:
-                # This keeps the engine alive even when no events are happening
-                self._handle_timer()
-                continue
+        _timer_interval: float = 1.0
+        _last_timer: float = time.monotonic()
+        try:
+            while self._running:
+                if self._stop_evt.is_set():
+                    try:
+                        event = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                else:
+                    _remaining = max(
+                        0.05, _timer_interval - (time.monotonic() - _last_timer))
+                    try:
+                        event = self._queue.get(timeout=_remaining)
+                    except queue.Empty:
+                        if self._stop_evt.is_set():
+                            continue
+                        with self._writer_lock:
+                            self._handle_timer()
+                        _last_timer = time.monotonic()
+                        continue
 
-            if event.etype == EventType.STOP:
-                break
+                if event.etype == EventType.STOP:
+                    if event.future is not None and not event.future.done():
+                        event.future.set_result((True, "stop"))
+                    self._queue.task_done()
+                    break
 
-            # Global ordering audit
-            if event.global_seq <= _last_seq:
-                log.warning(f"StateEngine: out-of-order event {event.global_seq}")
-            _last_seq = event.global_seq
+                # Global ordering audit
+                if event.global_seq <= _last_seq:
+                    log.warning(f"StateEngine: out-of-order event {event.global_seq}")
+                _last_seq = event.global_seq
 
-            try:
-                result = self._handle(event)
-            except Exception as exc:
-                log.error(f"StateEngine error: {exc}", exc_info=True)
-                result = (False, str(exc))
-            finally:
-                if event.future is not None and not event.future.done():
-                    event.future.set_result(result)
-                self._queue.task_done()
-            if event.etype == EventType.NEW_BLOCK:
-                self._release_protected_transfer()
+                try:
+                    with self._writer_lock:
+                        result = self._handle(event)
+                except Exception as exc:
+                    log.error(f"StateEngine error: {exc}", exc_info=True)
+                    result = (False, str(exc))
+                finally:
+                    if event.future is not None and not event.future.done():
+                        event.future.set_result(result)
+                    self._queue.task_done()
+                if event.etype == EventType.NEW_BLOCK:
+                    with self._writer_lock:
+                        self._release_protected_transfer()
+
+                if (not self._stop_evt.is_set()
+                        and time.monotonic() - _last_timer >= _timer_interval):
+                    with self._writer_lock:
+                        self._handle_timer()
+                    _last_timer = time.monotonic()
+        finally:
+            self._running = False
+            # Resolve any events that raced into the queue after STOP
+            while True:
+                try:
+                    leftover = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    if leftover.future is not None and not leftover.future.done():
+                        if leftover.etype == EventType.STOP:
+                            leftover.future.set_result((True, "stop"))
+                        else:
+                            leftover.future.set_result((False, "StateEngine stopped"))
+                finally:
+                    self._queue.task_done()
 
     def _handle(self, event: Event) -> Tuple[bool, str]:
         """Dispatch a single event. Called only from the engine thread."""
@@ -459,9 +535,17 @@ class StateEngine:
             if not flight:
                 return
             tip = int(self._blockchain.height())
+            delay = int(Config.COMMIT_REVEAL_DELAY_BLOCKS)
+            max_age = int(Config.MEV_COMMIT_MAX_AGE_BLOCKS)
+            commit_txid = flight["commit_txid"]
+            search_low = max(
+                0,
+                min(int(flight.get("started_height", 0)), tip - max_age),
+            )
+            in_mempool = commit_txid in self._blockchain.mempool._pending_tx_ids
+
             if flight.get("phase") == "commit":
-                commit_txid = flight["commit_txid"]
-                if commit_txid in self._blockchain.mempool._pending_tx_ids:
+                if in_mempool:
                     if tip - int(flight["started_height"]) > mev.MAX_WAIT_BLOCKS:
                         mev.save_flight(self._storage, None)
                         log.warning(f"MEV: the commitment was not mined within "
@@ -469,7 +553,7 @@ class StateEngine:
                                     f"transfer was cancelled")
                     return
                 found = mev.find_tx_height(self._storage, commit_txid,
-                                           int(flight["started_height"]), tip)
+                                           search_low, tip)
                 if found is None:
                     mev.save_flight(self._storage, None)
                     log.warning("MEV: the commitment left the mempool without being "
@@ -477,10 +561,55 @@ class StateEngine:
                     return
                 flight["phase"] = "reveal"
                 flight["commit_height"] = int(found)
+                flight["reveal_tx"] = None
+                flight["reveal_txid"] = ""
                 mev.save_flight(self._storage, flight)
+            else:
+                commit_height = int(flight.get("commit_height", -1))
+                cur_block = (self._storage.get_block(commit_height)
+                             if 0 <= commit_height <= tip else None)
+                still_at_height = (
+                    cur_block is not None
+                    and any(tx.tx_id == commit_txid for tx in cur_block.transactions)
+                )
+                if not still_at_height:
+                    found = mev.find_tx_height(self._storage, commit_txid,
+                                               search_low, tip)
+                    if found is not None:
+                        flight["phase"] = "reveal"
+                        flight["commit_height"] = int(found)
+                        flight["reveal_tx"] = None
+                        flight["reveal_txid"] = ""
+                        mev.save_flight(self._storage, flight)
+                    elif in_mempool:
+                        flight["phase"] = "commit"
+                        flight["commit_height"] = -1
+                        flight["reveal_tx"] = None
+                        flight["reveal_txid"] = ""
+                        mev.save_flight(self._storage, flight)
+                        return
+                    else:
+                        mev.save_flight(self._storage, None)
+                        log.warning("MEV: the commitment is no longer on-chain or in "
+                                    "the mempool; the protected transfer was cancelled")
+                        return
+                elif flight.get("reveal_tx") is not None:
+                    try:
+                        cached_reveal = Transaction.from_dict(flight["reveal_tx"])
+                        ok_r, msg_r = mev.check_reveal(self._storage, cached_reveal, tip + 1)
+                        if not ok_r and (
+                            "not part of its block" in msg_r
+                            or "not on-chain" in msg_r
+                        ):
+                            flight["reveal_tx"] = None
+                            flight["reveal_txid"] = ""
+                            mev.save_flight(self._storage, flight)
+                    except Exception:
+                        flight["reveal_tx"] = None
+                        flight["reveal_txid"] = ""
+                        mev.save_flight(self._storage, flight)
+
             commit_height = int(flight["commit_height"])
-            delay = int(Config.COMMIT_REVEAL_DELAY_BLOCKS)
-            max_age = int(Config.MEV_COMMIT_MAX_AGE_BLOCKS)
             if tip - commit_height < delay:
                 return
             if tip + 1 - commit_height > max_age:
@@ -556,6 +685,9 @@ class StateEngine:
                 tx = Transaction.from_dict(tx_data)
             else:
                 tx = tx_data  # already a Transaction
+
+            if getattr(tx, "sender", "") == "COINBASE":
+                return False, "COINBASE transactions cannot be submitted or relayed"
 
             flight_req = payload.get("mev_flight")
             if flight_req is not None and not source_peer:
@@ -659,21 +791,25 @@ class StateEngine:
         Rewritten as an explicit work-list processed in a single stack
         frame, so drain depth no longer depends on chain length.
         """
+        if not hasattr(self, "_orphans_lock"):
+            return
         pending: List[str] = [parent_hash]
         while pending:
             key = pending.pop()
-            children: List[dict] = []
+            children: List[Tuple[dict, str]] = []
             with self._orphans_lock:
                 child_hashes = [h for h, m in self._orphan_meta.items()
                                 if m.get("parent") == key]
                 for h in child_hashes:
-                    children.append(self._orphans.pop(h))
-                    self._orphan_meta.pop(h, None)
+                    child_data = self._orphans.pop(h)
+                    meta = self._orphan_meta.pop(h, {})
+                    orphan_peer = meta.get("peer", "")
+                    children.append((child_data, orphan_peer))
                     try:
                         self._orphan_order.remove(h)
                     except ValueError:
                         pass
-            for child_data in children:
+            for child_data, orphan_peer in children:
                 log.info(
                     f"[ORPHAN] Parent {key[:12]}… now applied — "
                     f"replaying buffered child block")
@@ -682,7 +818,7 @@ class StateEngine:
                 # whole chain iteratively; queue the child's own hash below
                 # instead so any orphans waiting on IT get picked up next.
                 ok, _msg = self._handle_new_block(
-                    {"block": child_data}, source_peer, _drain=False)
+                    {"block": child_data}, orphan_peer, _drain=False)
                 if ok:
                     try:
                         child_block = Block.from_dict(child_data)
@@ -694,6 +830,56 @@ class StateEngine:
                         # nothing further to drain from this branch, not a
                         # reason to raise out of the drain loop.
                         pass
+
+    def _on_canonical_block_applied(self, block: 'Block',
+                                    source_peer: str,
+                                    _drain: bool = True) -> None:
+        """Run post-apply hooks after a received block becomes canonical."""
+        # VARR: create/route compact authenticated wallet receipts while
+        # the full canonical transaction bodies are still available.
+        if self._network:
+            try:
+                self._network.publish_receipts_for_block(block)
+            except Exception as _varr_err:
+                # Receipts are non-consensus metadata; never turn a valid
+                # block into an apply failure because relay service failed.
+                log.warning(f"[VARR] receipt publication failed for #{block.index}: {_varr_err}")
+        # Drive governance state machine
+        self._governance.on_block_applied(block)
+        # BFT-FIX: received blocks must trigger this node's local
+        # consensus step as well as relay.
+        try:
+            _consensus_ref = getattr(
+                getattr(self, "_node_ref", None), "consensus", None)
+            if _consensus_ref is not None:
+                _consensus_ref.validate_and_finalize(block)
+        except Exception as _bft_vote_err:
+            log.warning(
+                f"Received-block BFT vote failed for #{block.index}: "
+                f"{_bft_vote_err}")
+        # RELAY-FIX: loud logging + never drop relay silently
+        if self._network:
+            try:
+                peer_count = len([p for pid, p in self._network.peers.items()
+                                  if p.connected and pid != source_peer])
+                _src = source_peer[:12] if source_peer else "unknown"
+                log.info(f"[RELAY] Block #{block.index} from {_src} -> relaying to {peer_count} other peer(s)")
+                self._network.broadcast_block(block, exclude=source_peer)
+            except Exception as _re:
+                log.error(f"[RELAY] relay FAILED for #{block.index}: {_re}", exc_info=True)
+        else:
+            log.error(f"[RELAY] _network is None - block #{block.index} NOT relayed!")
+        if _drain:
+            self._drain_orphans_for(block.block_hash, source_peer)
+        self._drain_pending_validator_sigs()
+        self._rebroadcast_block_validator_sigs(block, source_peer)
+        # ── SHBS: anomaly detection on received block ─────────────────────────
+        try:
+            _shbs = getattr(getattr(self, '_node_ref', None), 'shbs', None)
+            if _shbs is not None and _shbs._running:
+                _shbs.on_block_applied(block)
+        except Exception as _shbs_hook_err:
+            log.debug(f"[SHBS] on_block_applied hook error: {_shbs_hook_err}")
 
     def _handle_new_block(self, payload: dict,
                           source_peer: str,
@@ -776,11 +962,22 @@ class StateEngine:
                 _parent = self._storage.get_block(block.index - 1)
                 if _parent is not None and _parent.block_hash == block.prev_hash:
                     _fork_ok, _fork_msg = self._blockchain.accept_chain([_parent, block])
-                    # A same-height candidate can legitimately lose the
-                    # cumulative-work/tip-hash fork choice. That is not a
-                    # failed application and must not poison block_apply:*.
-                    if (not _fork_ok
-                            and not _fork_msg.startswith("Reorg apply block")):
+                    _canon_here = self._storage.get_block(block.index)
+                    _won_fork = bool(
+                        _fork_ok
+                        and _canon_here is not None
+                        and _canon_here.block_hash == block.block_hash)
+                    _fork_msg_str = str(_fork_msg or "")
+                    _is_fork_choice_loss = (
+                        not _fork_ok
+                        and (
+                            "less cumulative work" in _fork_msg_str
+                            or "loses deterministic tip-hash tiebreak" in _fork_msg_str
+                            or "peer cumulative work" in _fork_msg_str
+                            or "our tip hash wins tiebreak" in _fork_msg_str
+                        )
+                    )
+                    if _is_fork_choice_loss:
                         _fork_ok = True
                         _fork_msg = (
                             "Fork candidate rejected by deterministic fork choice; "
@@ -790,13 +987,9 @@ class StateEngine:
                     # candidate records nothing; a winning one is already marked
                     # by its own apply inside accept_chain().
                     self._record_apply_outcome(block, _fork_ok)
-                    if _fork_ok:
-                        # The winning candidate is now canonical; drive protocol
-                        # governance for it as for any other applied block.
-                        _canon_here = self._storage.get_block(block.index)
-                        if (_canon_here is not None
-                                and _canon_here.block_hash == block.block_hash):
-                            self._governance.on_block_applied(block)
+                    if _won_fork:
+                        self._on_canonical_block_applied(
+                            block, source_peer, _drain=_drain)
                     return _fork_ok, _fork_msg
                 return False, (
                     f"Conflicting block {block.index} has no matching local "
@@ -808,13 +1001,13 @@ class StateEngine:
                 log.warning(w)
 
             ok, msg = self._blockchain.apply_block(block)
-            self._record_apply_outcome(block, ok)
 
             # ── v7.1.8 Bug 2 fix: treat "Previous block not found" as a gap
             # rather than a hard reject.  Stash in orphan pool and request
             # the immediate parent so the chain heals automatically.
             if (not ok) and msg and "Previous block not found" in msg:
                 if not self._orphan_admissible(block):
+                    self._record_apply_outcome(block, False)
                     return False, f"Rejected unproven orphan block: {msg}"
                 self._stash_orphan(block, _block_dict_for_orphan, source_peer)
                 if source_peer and self._network:
@@ -829,66 +1022,12 @@ class StateEngine:
                         pass
                 return False, f"Stashed as orphan: {msg}"
 
-            if ok:
-                # VARR: create/route compact authenticated wallet receipts while
-                # the full canonical transaction bodies are still available.
-                if self._network:
-                    try:
-                        self._network.publish_receipts_for_block(block)
-                    except Exception as _varr_err:
-                        # Receipts are non-consensus metadata; never turn a valid
-                        # block into an apply failure because relay service failed.
-                        log.warning(f"[VARR] receipt publication failed for #{block.index}: {_varr_err}")
-                # Drive governance state machine
-                self._governance.on_block_applied(block)
-                # BFT-FIX: received blocks must trigger this node's local
-                # consensus step as well as relay. The mining path already
-                # invokes validate_and_finalize(), but received blocks used to
-                # stop after apply_block(), so investor nodes never voted.
-                try:
-                    _consensus_ref = getattr(
-                        getattr(self, "_node_ref", None), "consensus", None)
-                    if _consensus_ref is not None:
-                        _consensus_ref.validate_and_finalize(block)
-                except Exception as _bft_vote_err:
-                    # Voting is additive; never turn a valid received block
-                    # into a transport failure because a local vote failed.
-                    log.warning(
-                        f"Received-block BFT vote failed for #{block.index}: "
-                        f"{_bft_vote_err}")
-                # RELAY-FIX: loud logging + never drop relay silently
-                if self._network:
-                    try:
-                        peer_count = len([p for pid, p in self._network.peers.items()
-                                          if p.connected and pid != source_peer])
-                        _src = source_peer[:12] if source_peer else "unknown"
-                        log.info(f"[RELAY] Block #{block.index} from {_src} -> relaying to {peer_count} other peer(s)")
-                        # v7.5.0: broadcast_block now emits MSG_CMPCTBLOCK so
-                        # peers with full mempools reconstruct without re-download.
-                        # exclude= is honoured inside broadcast_block → _gossip.
-                        self._network.broadcast_block(block, exclude=source_peer)
-                    except Exception as _re:
-                        log.error(f"[RELAY] relay FAILED for #{block.index}: {_re}", exc_info=True)
-                else:
-                    log.error(f"[RELAY] _network is None - block #{block.index} NOT relayed!")
-                # v7.1.8 Bug 3: drain any orphans that were waiting for THIS
-                # block as their parent. AUDIT-FIX-J1: only do this for a
-                # top-level call (_drain=True) — when _handle_new_block is
-                # itself being invoked BY the drain loop to replay a
-                # stashed orphan, _drain is False and the loop in
-                # _drain_orphans_for handles chaining to further orphans
-                # itself, iteratively.
-                if _drain:
-                    self._drain_orphans_for(block.block_hash, source_peer)
-                self._drain_pending_validator_sigs()
-                self._rebroadcast_block_validator_sigs(block, source_peer)
-                # ── SHBS: anomaly detection on received block ─────────────────
-                try:
-                    _shbs = getattr(getattr(self, '_node_ref', None), 'shbs', None)
-                    if _shbs is not None and _shbs._running:
-                        _shbs.on_block_applied(block)
-                except Exception as _shbs_hook_err:
-                    log.debug(f"[SHBS] on_block_applied hook error: {_shbs_hook_err}")
+            if msg != BLOCK_ALREADY_APPLIED_MSG:
+                self._record_apply_outcome(block, ok)
+
+            if ok and msg != BLOCK_ALREADY_APPLIED_MSG:
+                self._on_canonical_block_applied(
+                    block, source_peer, _drain=_drain)
             return ok, msg
         except Exception as e:
             return False, f"new_block error: {e}"
@@ -945,10 +1084,10 @@ class StateEngine:
                     msg = "Mined block not applied: candidate is not canonical"
                     _record_apply_result = False
 
-            if _record_apply_result:
+            if _record_apply_result and msg != BLOCK_ALREADY_APPLIED_MSG:
                 self._storage.record_block_apply_result(block.index, ok)
 
-            if ok:
+            if ok and msg != BLOCK_ALREADY_APPLIED_MSG:
                 if self._network:
                     try:
                         self._network.publish_receipts_for_block(block)
@@ -983,7 +1122,7 @@ class StateEngine:
                         _shbs.on_block_applied(block)
                 except Exception as _shbs_mine_err:
                     log.debug(f"[SHBS] on_block_applied (mine) hook error: {_shbs_mine_err}")
-            else:
+            elif not ok:
                 log.warning(f"Mine result rejected: {msg}")
             return ok, msg
         except Exception as e:
@@ -1031,10 +1170,14 @@ class StateEngine:
                 self._network._gossip(payload, exclude=exclude or None)
 
     def _queue_pending_validator_sig(self, payload: dict,
-                                      source_peer: str) -> None:
+                                      source_peer: str,
+                                      created_at: Optional[float] = None) -> None:
         """Buffer a vote whose canonical block has not arrived yet."""
         now = time.time()
-        item = (now, dict(payload), source_peer or "")
+        stamp = now if created_at is None else float(created_at)
+        if now - stamp > self.PENDING_VALIDATOR_SIG_TTL:
+            return
+        item = (stamp, dict(payload), source_peer or "")
         with self._pending_validator_sigs_lock:
             cutoff = now - self.PENDING_VALIDATOR_SIG_TTL
             self._pending_validator_sigs = [
@@ -1055,6 +1198,8 @@ class StateEngine:
 
     def _drain_pending_validator_sigs(self) -> None:
         """Replay buffered votes whose blocks are now canonical."""
+        if not hasattr(self, "_pending_validator_sigs_lock"):
+            return
         now = time.time()
         with self._pending_validator_sigs_lock:
             pending = self._pending_validator_sigs
@@ -1064,7 +1209,8 @@ class StateEngine:
                 continue
             block_hash = payload.get("block_hash", "")
             if self._storage.get_block_by_hash(block_hash) is None:
-                self._queue_pending_validator_sig(payload, source_peer)
+                self._queue_pending_validator_sig(
+                    payload, source_peer, created_at=created_at)
                 continue
             self._handle_validator_sig(payload, source_peer)
 

@@ -24,6 +24,7 @@ Defines: Config
 Origin: visold_vsd_.py L3819-4897
 """
 
+import ipaddress
 import json
 import os
 import re
@@ -43,7 +44,7 @@ class Config:
     # Coin
     COIN_NAME           = "Visold"
     COIN_SYMBOL         = "VSD"
-    VERSION             = "11.0.0.0"
+    VERSION             = "11.1.3.78"
 
     # Chain identity — included in canonical L1/L2 transaction signing data,
     # transaction identifiers, receipt authentication, and the VVM CHAINID.
@@ -777,6 +778,8 @@ class Config:
     # Set to 0 on FRESH chains (recommended) so all blocks use the secure
     # rule from genesis.  Set to a future height on LIVE chains.
     MERKLE_V2_ACTIVATION_HEIGHT = 0
+    MERKLE_V3_ACTIVATION_HEIGHT = 0
+    MERKLE_V3_ACTIVATION_HEIGHT = 0
 
     # SEC-FIX H-02 (Truncated tx_id Hardening)
     # ────────────────────────────────────────
@@ -932,6 +935,7 @@ class Config:
     CLOCK_MAX_DRIFT_SECS   = 30    # warn if node clock drifts > 30s from median
     CLOCK_PEER_SAMPLE_SIZE = 16    # peer timestamps kept for median estimate
     CLOCK_UPDATE_INTERVAL  = 60    # seconds between network clock updates
+    CLOCK_MAX_FUTURE_ADJUSTMENT = 3600  # hard cap (s) on forward network_time() adjustment over local_ts
 
     # ── ICE / NAT traversal (STUN + UDP hole punching + TURN relay) ───────────
     ICE_ENABLED          = True
@@ -1204,9 +1208,10 @@ class Config:
                         cls.DEFAULT_PORT = p_env
                 except (ValueError, TypeError):
                     pass
-            mode_env = os.environ.get("VISOLD_PORT_MODE", "auto").strip().lower()
-            if mode_env in ("auto", "manual"):
-                cls.PORT_MODE = mode_env
+            if "VISOLD_PORT_MODE" in os.environ:
+                mode_env = os.environ.get("VISOLD_PORT_MODE", "").strip().lower()
+                if mode_env in ("auto", "manual"):
+                    cls.PORT_MODE = mode_env
 
         os.makedirs(cls.DATA_DIR, exist_ok=True)
         cls.DB_PATH           = os.path.join(cls.DATA_DIR, "visold.db")
@@ -1230,27 +1235,48 @@ class Config:
                     cfg = json.load(f)
                 import logging as _cfglog
                 _cl = _cfglog.getLogger("VISOLD.config")
+                if not isinstance(cfg, dict):
+                    _cl.warning("config.json: top-level value must be a JSON object — all values ignored")
+                    cfg = {}
 
                 if not cls._PORT_SETTINGS_INITIALIZED:
                     if "port" in cfg:
-                        p = int(cfg["port"])
-                        if 1024 <= p <= 65533:
-                            cls.DEFAULT_PORT = p
+                        raw_port = cfg["port"]
+                        if isinstance(raw_port, bool):
+                            _cl.warning("config.json: port must be an integer — ignored")
                         else:
-                            _cl.warning(f"config.json: port {p} out of range [1024,65533] — ignored")
+                            try:
+                                p = int(raw_port)
+                                if 1024 <= p <= 65533:
+                                    cls.DEFAULT_PORT = p
+                                else:
+                                    _cl.warning(f"config.json: port {p} out of range [1024,65533] — ignored")
+                            except (TypeError, ValueError, OverflowError):
+                                _cl.warning("config.json: port must be an integer — ignored")
                     if "port_mode" in cfg:
-                        mode = str(cfg["port_mode"]).strip().lower()
-                        if mode in ("auto", "manual"):
-                            cls.PORT_MODE = mode
+                        raw_mode = cfg["port_mode"]
+                        if isinstance(raw_mode, str):
+                            mode = raw_mode.strip().lower()
+                            if mode in ("auto", "manual"):
+                                cls.PORT_MODE = mode
+                            else:
+                                _cl.warning("config.json: port_mode must be 'auto' or 'manual' — ignored")
                         else:
                             _cl.warning("config.json: port_mode must be 'auto' or 'manual' — ignored")
 
                 if "max_peers" in cfg:
-                    mp = int(cfg["max_peers"])
-                    if 5 <= mp <= 500:
-                        cls.MAX_PEERS = mp
+                    raw_mp = cfg["max_peers"]
+                    if isinstance(raw_mp, bool):
+                        _cl.warning("config.json: max_peers must be an integer — ignored")
                     else:
-                        _cl.warning(f"config.json: max_peers {mp} out of range [5,500] — ignored")
+                        try:
+                            mp = int(raw_mp)
+                            if 5 <= mp <= 500:
+                                cls.MAX_PEERS = mp
+                            else:
+                                _cl.warning(f"config.json: max_peers {mp} out of range [5,500] — ignored")
+                        except (TypeError, ValueError, OverflowError):
+                            _cl.warning("config.json: max_peers must be an integer — ignored")
 
                 if "topology_policy_enabled" in cfg:
                     value = cfg.get("topology_policy_enabled")
@@ -1323,19 +1349,42 @@ class Config:
                         _cl.warning(f"config.json: unknown log_format '{lf}' — ignored")
 
                 if "dns_seeds" in cfg:
-                    _hostname_re = re.compile(
-                        r'^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$')
-                    valid_seeds = [s for s in list(cfg["dns_seeds"])
-                                   if isinstance(s, str) and _hostname_re.match(s)]
-                    if valid_seeds:
-                        cls.DNS_SEEDS = valid_seeds
+                    raw_seeds = cfg["dns_seeds"]
+                    if isinstance(raw_seeds, (list, tuple)):
+                        _hostname_re = re.compile(
+                            r'^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$')
+                        valid_seeds = [s for s in raw_seeds
+                                       if isinstance(s, str) and _hostname_re.match(s)]
+                        if valid_seeds:
+                            cls.DNS_SEEDS = valid_seeds
+                        else:
+                            _cl.warning("config.json: dns_seeds contains no valid hostnames — ignored")
                     else:
-                        _cl.warning("config.json: dns_seeds contains no valid hostnames — ignored")
+                        _cl.warning("config.json: dns_seeds must be a list of hostnames — ignored")
 
                 if "bind_address" in cfg:
-                    cls.BIND_ADDRESS = str(cfg["bind_address"])
+                    raw_bind = cfg["bind_address"]
+                    if isinstance(raw_bind, str) and raw_bind.strip():
+                        bind_val = raw_bind.strip()
+                        try:
+                            ipaddress.ip_address(bind_val)
+                            cls.BIND_ADDRESS = bind_val
+                        except ValueError:
+                            _cl.warning(f"config.json: invalid bind_address '{bind_val}' — ignored")
+                    else:
+                        _cl.warning("config.json: bind_address must be a valid IP address string — ignored")
+
                 if "loopback" in cfg:
-                    cls.LOOPBACK_ADDRESS = str(cfg["loopback"])
+                    raw_loop = cfg["loopback"]
+                    if isinstance(raw_loop, str) and raw_loop.strip():
+                        loop_val = raw_loop.strip()
+                        try:
+                            ipaddress.ip_address(loop_val)
+                            cls.LOOPBACK_ADDRESS = loop_val
+                        except ValueError:
+                            _cl.warning(f"config.json: invalid loopback '{loop_val}' — ignored")
+                    else:
+                        _cl.warning("config.json: loopback must be a valid IP address string — ignored")
             except Exception as e:
                 import logging as _cfglog2
                 _cfglog2.getLogger("VISOLD.config").warning(

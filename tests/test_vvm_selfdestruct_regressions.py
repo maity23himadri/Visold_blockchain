@@ -64,7 +64,7 @@ def test_selfdestruct_top_level_value_moves_value_once_and_rolls_back_exactly():
         sender_w = Wallet.generate()
         miner_w = Wallet.generate()
         sender, miner = sender_w.address, miner_w.address
-        contract = "VSDcselfdestructreg000000000000000"
+        contract = "VSDc444444444444444444444444444444444444"
         beneficiary = _addr(2)
 
         _install_contract(st, contract, bytes.fromhex("6002ff"), sender)
@@ -128,7 +128,7 @@ def test_selfdestruct_with_existing_contract_balance_transfers_full_balance_once
         sender_w = Wallet.generate()
         miner_w = Wallet.generate()
         sender, miner = sender_w.address, miner_w.address
-        contract = "VSDcselfdestructfunded000000000000"
+        contract = "VSDc555555555555555555555555555555555555"
         beneficiary = _addr(2)
 
         _install_contract(st, contract, bytes.fromhex("6002ff"), sender)
@@ -241,7 +241,7 @@ def test_selfdestruct_spent_beneficiary_refuses_rollback_atomically():
         sender_w = Wallet.generate()
         miner_w = Wallet.generate()
         sender, miner = sender_w.address, miner_w.address
-        contract = "VSDcselfdestructspent00000000000000"
+        contract = "VSDc666666666666666666666666666666666666"
         beneficiary = _addr(2)
 
         _install_contract(st, contract, bytes.fromhex("6002ff"), sender)

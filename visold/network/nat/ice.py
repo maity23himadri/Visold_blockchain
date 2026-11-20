@@ -24,7 +24,9 @@ Origin: visold_vsd_.py L32837-32852, L32855-32878, L32882-33338
 """
 
 import hashlib
+import hmac
 import os
+import secrets
 import socket
 import threading
 import time
@@ -566,11 +568,13 @@ class ICEManager:
         return ips
 
     @staticmethod
-    def _make_session_token(ip: str, port: int) -> str:
+    def _make_session_token(ip: str, port: int, shared_secret: Optional[bytes] = None) -> str:
         """
-        Deterministic relay session token shared by both peers.
-        Both sides call this with the *server* peer's (ip, port) so they
-        derive the same token without extra signaling.
+        Derive a relay session token bound to a high-entropy secret.
+        If shared_secret is provided (e.g., from authenticated peer handshake),
+        use HMAC-SHA256; otherwise generate a CSPRNG token.
         """
-        raw = f"vsd-relay:{ip}:{port}:{int(time.time()) // 30}"
-        return hashlib.sha256(raw.encode()).hexdigest()[:32]
+        if shared_secret:
+            msg = f"vsd-relay:{ip}:{port}:{int(time.time()) // 30}".encode()
+            return hmac.new(shared_secret, msg, hashlib.sha256).hexdigest()[:32]
+        return secrets.token_hex(16)

@@ -120,7 +120,10 @@ def _cached_pub_coords(pub_hex: str):
     if not (0 <= x < ECPoint.P):
         raise ValueError("public-key x coordinate out of range")
     p = ECPoint.P
-    y = pow((pow(x, 3, p) + 7) % p, (p + 1) // 4, p)
+    y_sq = (pow(x, 3, p) + 7) % p
+    y = pow(y_sq, (p + 1) // 4, p)
+    if pow(y, 2, p) != y_sq:
+        raise ValueError("public-key point is not on secp256k1")
     if (y & 1) != (prefix & 1):
         y = p - y
     return x, y
@@ -176,10 +179,22 @@ def _self_test_coincurve() -> bool:
 
 
 def _recover_y_from_compressed(pub_bytes: bytes) -> int:
-    prefix = pub_bytes[0]
-    x = int.from_bytes(pub_bytes[1:33], "big")
+    if not isinstance(pub_bytes, (bytes, bytearray, memoryview)):
+        raise TypeError("compressed public key must be bytes-like")
+    raw = bytes(pub_bytes)
+    if len(raw) != 33:
+        raise ValueError("compressed public key must be 33 bytes")
+    prefix = raw[0]
+    if prefix not in (2, 3):
+        raise ValueError("invalid compressed public-key prefix")
+    x = int.from_bytes(raw[1:33], "big")
     p = ECPoint.P
-    y = pow((pow(x, 3, p) + 7) % p, (p + 1) // 4, p)
+    if not (0 <= x < p):
+        raise ValueError("public-key x coordinate out of range")
+    y_sq = (pow(x, 3, p) + 7) % p
+    y = pow(y_sq, (p + 1) // 4, p)
+    if pow(y, 2, p) != y_sq:
+        raise ValueError("public-key point is not on secp256k1")
     if (y & 1) != (prefix & 1):
         y = p - y
     return y
@@ -212,7 +227,10 @@ class ECPoint:
     @classmethod
     def inf(cls): o = cls.__new__(cls); o.x = o.y = None; return o
 
-    def __eq__(self, o): return self.x == o.x and self.y == o.y
+    def __eq__(self, o):
+        if not isinstance(o, ECPoint):
+            return NotImplemented
+        return self.x == o.x and self.y == o.y
 
     def __add__(self, o):
         P = self.P
@@ -323,11 +341,16 @@ def ecdsa_sign_digest(priv: int, digest: bytes, _native_private_key=None, _crypt
 
 
 def ecdsa_verify(pub: ECPoint, msg_hash: bytes, sig: Tuple[int, int]) -> bool:
-    r, s = sig
-    N = ECPoint.N
-    if not (1 <= r < N and 1 <= s < N):
-        return False
     try:
+        if not isinstance(sig, (tuple, list)) or len(sig) != 2:
+            return False
+        r, s = sig
+        if (isinstance(r, bool) or isinstance(s, bool)
+                or not isinstance(r, int) or not isinstance(s, int)):
+            return False
+        N = ECPoint.N
+        if not (1 <= r < N and 1 <= s < N):
+            return False
         digest = _effective_ecdsa_digest(msg_hash)
         if _COINCURVE_SELFTEST_OK:
             pub_bytes = pub_to_bytes(pub)
@@ -349,6 +372,8 @@ def ecdsa_verify(pub: ECPoint, msg_hash: bytes, sig: Tuple[int, int]) -> bool:
 # ── 2C. Key serialization ──────────────────────────────────────────────────────
 def pub_to_bytes(pub: ECPoint) -> bytes:
     """Compressed 33-byte SEC format."""
+    if pub is None or pub.is_inf():
+        raise ValueError("Cannot serialize point at infinity")
     prefix = b'\x02' if pub.y % 2 == 0 else b'\x03'
     return prefix + pub.x.to_bytes(32, 'big')
 
@@ -376,8 +401,16 @@ def sig_to_hex(sig: Tuple[int,int]) -> str:
 
 
 def sig_from_hex(s: str) -> Tuple[int,int]:
+    if not isinstance(s, str):
+        raise TypeError("signature must be a JSON string")
     arr = json.loads(s)
-    return (arr[0], arr[1])
+    if not isinstance(arr, list) or len(arr) != 2:
+        raise ValueError("signature JSON must be a 2-element array")
+    r, s_val = arr
+    if (isinstance(r, bool) or isinstance(s_val, bool)
+            or not isinstance(r, int) or not isinstance(s_val, int)):
+        raise ValueError("signature components must be integers")
+    return (r, s_val)
 
 
 # ── 2D. Wallet address derivation ─────────────────────────────────────────────

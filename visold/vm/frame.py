@@ -275,7 +275,7 @@ class _VMFrame:
     _ALLOC_HARD_CAP:  int   = 64 * 1024 * 1024  # 64 MB absolute ceiling
     _SAFE_OFFSET_CAP: int   = _ALLOC_HARD_CAP    # FIXED: was 1<<32 (4 GB) — see above
 
-    def _mem_expand(self, offset: int, size: int) -> int:
+    def _mem_expand(self, offset: int, size: int, extra_gas: int = 0) -> int:
         """Expand memory to cover [offset, offset+size) and return gas cost.
 
         SC-FIX-MEM-1 (2^32 inflation fix):
@@ -304,21 +304,21 @@ class _VMFrame:
         size   = size   & self._UINT256_MAX_MEM
 
         if size == 0:
+            if extra_gas > 0:
+                self._use_gas(extra_gas)
             return 0
 
-        # Step 2 (SC-FIX-MEM-1): pre-allocation range guard.
-        # Reject before touching any Python allocation.  An offset or size
-        # above _ALLOC_HARD_CAP is OOG by gas economics; enforce it here so
-        # the error message is deterministic and no giant bytearray.extend()
-        # is attempted.
-        if offset > self._ALLOC_HARD_CAP or size > self._ALLOC_HARD_CAP:
+        # Step 2 (SC-FIX-MEM-1 / BUG-073-003): pre-allocation range guard.
+        # Reject before touching any Python allocation.
+        max_mem = min(self._ALLOC_HARD_CAP, Config.VVM_MAX_MEMORY_BYTES)
+        if offset > max_mem or size > max_mem:
             import logging as _log
             _log.getLogger("VVM").debug(
                 "MEM_EXPAND OOG: offset=%d size=%d cap=%d",
-                offset, size, self._ALLOC_HARD_CAP)
+                offset, size, max_mem)
             raise RuntimeError(
                 f"Memory OOG: offset={offset} size={size} exceeds "
-                f"allocation cap {self._ALLOC_HARD_CAP}")
+                f"allocation cap {max_mem}")
 
         # Step 3: uint256 wrap-around detection.
         end = offset + size   # Python arbitrary precision — never overflows
@@ -332,18 +332,25 @@ class _VMFrame:
         old_words  = self._mem_words
 
         if new_words <= old_words:
+            if extra_gas > 0:
+                self._use_gas(extra_gas)
             return 0
 
         cost = _mem_expansion_cost(old_words, new_words)
 
-        # Step 5: hard-cap assertion (belt-and-suspenders; step 2 fires first).
+        # Step 5: hard-cap assertion (Config.VVM_MAX_MEMORY_BYTES; BUG-073-003).
         new_bytes = new_words * 32
-        if new_bytes > self._ALLOC_HARD_CAP:
+        if new_bytes > max_mem:
             raise RuntimeError(
                 f"Memory hard cap exceeded: {new_bytes} bytes "
-                f"(offset={offset}, size={size})")
+                f"(offset={offset}, size={size}, cap={max_mem})")
 
-        # Step 6: safe allocation.
+        # Step 6: charge memory expansion gas (+ any bundled copy gas) BEFORE
+        # allocating Python bytearray memory so OOG allocates 0 bytes.
+        total_gas = cost + (extra_gas if extra_gas > 0 else 0)
+        self._use_gas(total_gas)
+
+        # Step 7: safe allocation.
         if getattr(self, '_MEM_DEBUG', False):
             import logging as _log
             _log.getLogger("VVM").debug(
@@ -358,28 +365,24 @@ class _VMFrame:
     _MEM_DEBUG: bool = False
 
     def mload(self, offset: int) -> int:
-        cost = self._mem_expand(offset, 32)
-        self._use_gas(cost)
+        self._mem_expand(offset, 32)
         safe_off = min(offset & self._UINT256_MAX_MEM, self._SAFE_OFFSET_CAP)
         return int.from_bytes(self.memory[safe_off:safe_off + 32], 'big')
 
     def mstore(self, offset: int, value: int):
-        cost = self._mem_expand(offset, 32)
-        self._use_gas(cost)
+        self._mem_expand(offset, 32)
         safe_off = min(offset & self._UINT256_MAX_MEM, self._SAFE_OFFSET_CAP)
         self.memory[safe_off:safe_off + 32] = (value & self.UINT256_MAX).to_bytes(32, 'big')
 
     def mstore8(self, offset: int, value: int):
-        cost = self._mem_expand(offset, 1)
-        self._use_gas(cost)
+        self._mem_expand(offset, 1)
         safe_off = min(offset & self._UINT256_MAX_MEM, self._SAFE_OFFSET_CAP)
         self.memory[safe_off] = value & 0xFF
 
     def mslice(self, offset: int, size: int) -> bytes:
         if (size & self._UINT256_MAX_MEM) == 0:
             return b""
-        cost = self._mem_expand(offset, size)
-        self._use_gas(cost)
+        self._mem_expand(offset, size)
         safe_off  = min(offset & self._UINT256_MAX_MEM, self._SAFE_OFFSET_CAP)
         safe_size = min(size   & self._UINT256_MAX_MEM, self._SAFE_OFFSET_CAP)
         return bytes(self.memory[safe_off:safe_off + safe_size])
@@ -389,7 +392,9 @@ class _VMFrame:
         if amount < 0:
             return
         if self.gas_remaining < amount:
-            raise RuntimeError(f"Out of gas (need {amount}, have {self.gas_remaining})")
+            avail = self.gas_remaining
+            self.gas_remaining = 0
+            raise RuntimeError(f"Out of gas (need {amount}, have {avail})")
         self.gas_remaining -= amount
 
     # ── Storage helpers ───────────────────────────────────────────────────────

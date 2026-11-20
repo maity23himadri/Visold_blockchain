@@ -545,6 +545,9 @@ class _RocksBlockStore:
                             "rocksdict binding cannot apply per-write "
                             "WriteOptions; refusing an unconfigured PGX write"
                         ) from exc
+                    if sync and hasattr(self._db, "flush_wal"):
+                        self._db.flush_wal(True)
+                    return
                 else:
                     if sync:
                         raise RuntimeError(
@@ -616,7 +619,12 @@ class _RocksBlockStore:
             batch.delete((cf, key))
     def get_block_by_hash(self, bhash):
         v = self._get(_CF_BLOCKS, _k_blockhash(bhash))
-        return self.get_block(int.from_bytes(v, "big")) if v else None
+        if not v:
+            return None
+        blk = self.get_block(int.from_bytes(v, "big"))
+        if blk is None or str(blk.get("block_hash", "")) != str(bhash):
+            return None
+        return blk
     def delete_block(self, batch, height, bhash):
         cf = self._cf_handle[_CF_BLOCKS] if self._impl == "rocksdict" else self._cf[_CF_BLOCKS]
         batch.delete((cf, _k_block(height)))

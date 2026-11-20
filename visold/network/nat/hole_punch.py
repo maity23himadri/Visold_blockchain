@@ -31,7 +31,7 @@ from typing import Optional
 
 from visold.kernel.config import Config
 from visold.kernel.logging_setup import log
-from visold.kernel.netutil import _is_ipv6_address
+from visold.kernel.netutil import _is_ipv6_address, _normalize_ip
 
 
 class UDPHolePuncher:
@@ -69,6 +69,25 @@ class UDPHolePuncher:
     def is_claimed(self) -> bool:
         return self._claimed
 
+    @staticmethod
+    def _target_af(remote_ip: str = "") -> int:
+        if remote_ip and _is_ipv6_address(remote_ip):
+            return socket.AF_INET6
+        if remote_ip:
+            try:
+                socket.inet_aton(remote_ip)
+                return socket.AF_INET
+            except OSError:
+                try:
+                    infos = socket.getaddrinfo(
+                        remote_ip, None, socket.AF_UNSPEC, socket.SOCK_DGRAM
+                    )
+                    if infos:
+                        return infos[0][0]
+                except Exception:
+                    pass
+        return socket.AF_INET
+
     def stun_bind(self, remote_ip: str = "") -> Optional[socket.socket]:
         """
         AUDIT-FIX-23: bind (or return the already-bound) local socket so a
@@ -83,6 +102,13 @@ class UDPHolePuncher:
         with self._lock:
             if self._claimed:
                 return None
+            needed_af = self._target_af(remote_ip)
+            if self._sock is not None and self._sock.family != needed_af:
+                try:
+                    self._sock.close()
+                except Exception:
+                    pass
+                self._sock = None
             if self._sock is None:
                 try:
                     self._sock = self._make_sock(remote_ip)
@@ -106,12 +132,8 @@ class UDPHolePuncher:
         # A bare IPv6 address (contains ':') requires AF_INET6 and must bind
         # to '::' instead of '0.0.0.0' — using AF_INET for an IPv6 remote
         # causes EINVAL on sendto.
-        if remote_ip and _is_ipv6_address(remote_ip):
-            af       = socket.AF_INET6
-            bind_any = "::"
-        else:
-            af       = socket.AF_INET
-            bind_any = "0.0.0.0"  # nosec B104 – intentional bind-any for ICE NAT traversal
+        af       = self._target_af(remote_ip)
+        bind_any = "::" if af == socket.AF_INET6 else "0.0.0.0"  # nosec B104 – intentional bind-any for ICE NAT traversal
         s = socket.socket(af, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -152,6 +174,13 @@ class UDPHolePuncher:
         with self._lock:
             if self._claimed:
                 return None
+            needed_af = self._target_af(remote_ip)
+            if self._sock is not None and self._sock.family != needed_af:
+                try:
+                    self._sock.close()
+                except Exception:
+                    pass
+                self._sock = None
             if self._sock is not None:
                 sock = self._sock
             else:
@@ -188,13 +217,17 @@ class UDPHolePuncher:
                     except Exception:
                         break
 
-                    if addr[0] != remote_ip:
+                    if _normalize_ip(addr[0]) != _normalize_ip(remote_ip) or addr[1] != remote_port:
                         continue
 
-                    if data == probe:
-                        # Remote punched through; send ACK
+                    if (
+                        len(data) == len(self.PROBE_MAGIC) + 8
+                        and data[:len(self.PROBE_MAGIC)] == self.PROBE_MAGIC
+                    ):
+                        # Remote punched through; echo ACK with remote's nonce
+                        remote_nonce = data[len(self.PROBE_MAGIC):]
                         try:
-                            sock.sendto(self.ACK_MAGIC + nonce, (remote_ip, remote_port))
+                            sock.sendto(self.ACK_MAGIC + remote_nonce, (remote_ip, remote_port))
                         except Exception:
                             pass
                         log.info(f"ICE: UDP hole punch SUCCESS (remote probe) "
@@ -203,7 +236,7 @@ class UDPHolePuncher:
                         self._claimed = True
                         return sock
 
-                    if data[:len(self.ACK_MAGIC)] == self.ACK_MAGIC:
+                    if data == self.ACK_MAGIC + nonce:
                         log.info(f"ICE: UDP hole punch SUCCESS (ACK received) "
                                  f"→ {remote_ip}:{remote_port}")
                         sock.settimeout(None)

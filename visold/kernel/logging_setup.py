@@ -29,7 +29,7 @@ import os
 import queue
 from datetime import datetime
 
-from visold.kernel.notifications import _notify_buf, _notify_buf_lock
+from visold.kernel.notifications import _notify_buf, _notify_buf_lock, _sanitize_notif_text
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,7 +97,7 @@ class _QueueHandler(logging.Handler):
             # waiting for the main thread to call _flush_log_queue().
             if record.levelno >= logging.INFO:
                 ts    = datetime.now().strftime('%H:%M:%S')
-                short = record.getMessage()[:72]
+                short = _sanitize_notif_text(record.getMessage(), max_len=72)
                 # Severity tag embedded so _fmt_notif() can colour-code it
                 if record.levelno >= logging.ERROR:
                     sev = 'ERR'

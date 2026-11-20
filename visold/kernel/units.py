@@ -23,6 +23,8 @@ Defines: to_satoshi, from_satoshi, gas_fee_to_sat, bft_threshold_met, conservati
 Origin: visold_vsd_.py L4900, L4907-4973
 """
 
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
+import math
 from typing import TYPE_CHECKING
 
 from visold.kernel.config import Config
@@ -41,27 +43,107 @@ VSD_GLOBAL_MARKET = "VSD_GLOBAL_MARKET"
 # These helpers convert at the human-readable boundary (CLI / RPC display).
 # ─────────────────────────────────────────────────────────────────────────────
 def to_satoshi(vsd_amount) -> int:
-    """Convert a VSD float or string to integer satoshi units (round half-even)."""
-    return int(round(float(vsd_amount) * Config.SATOSHI_PER_VSD))
+    """Convert a VSD int, float, Decimal, or numeric string to integer satoshi (round half-even)."""
+    if isinstance(vsd_amount, bool):
+        raise TypeError("vsd_amount must not be bool")
+    if isinstance(vsd_amount, Decimal):
+        dec = vsd_amount
+    elif isinstance(vsd_amount, int):
+        dec = Decimal(vsd_amount)
+    elif isinstance(vsd_amount, float):
+        if not math.isfinite(vsd_amount):
+            raise ValueError(f"vsd_amount must be finite, got {vsd_amount!r}")
+        dec = Decimal(str(vsd_amount))
+    elif isinstance(vsd_amount, str):
+        raw = vsd_amount.strip()
+        if not raw:
+            raise ValueError("vsd_amount string must not be empty")
+        try:
+            dec = Decimal(raw)
+        except InvalidOperation as exc:
+            raise ValueError(f"invalid vsd_amount string: {vsd_amount!r}") from exc
+    else:
+        raise TypeError(
+            f"vsd_amount must be int, float, Decimal, or str, got {type(vsd_amount).__name__}"
+        )
+
+    if not dec.is_finite():
+        raise ValueError(f"vsd_amount must be finite, got {vsd_amount!r}")
+
+    scaled = dec * Decimal(Config.SATOSHI_PER_VSD)
+    return int(scaled.to_integral_value(rounding=ROUND_HALF_EVEN))
 
 
 def from_satoshi(satoshi: int) -> float:
-    """Convert integer satoshi to a human-readable VSD float for display only."""
+    """Convert integer satoshi to a human-readable VSD float for display only.
+
+    Note: IEEE-754 float64 loses 1-satoshi precision at >= 2^53 satoshi.
+    Use from_satoshi_decimal() or from_satoshi_str() for lossless round-tripping.
+    """
+    if isinstance(satoshi, bool) or not isinstance(satoshi, int):
+        raise TypeError(f"satoshi must be an int, got {type(satoshi).__name__}")
     return satoshi / Config.SATOSHI_PER_VSD
 
 
-def gas_fee_to_sat(gas_units: int, gas_price: float) -> int:
-    """Deterministic gas fee in satoshi: gas_units × gas_price × SATOSHI_PER_VSD.
+def from_satoshi_decimal(satoshi: int) -> Decimal:
+    """Losslessly convert integer satoshi to an exact Decimal VSD amount."""
+    if isinstance(satoshi, bool) or not isinstance(satoshi, int):
+        raise TypeError(f"satoshi must be an int, got {type(satoshi).__name__}")
+    return Decimal(satoshi) / Decimal(Config.SATOSHI_PER_VSD)
 
-    F-01 COMPLETION: Computing gas_fee as round(gas * price, 8) in float, then
-    converting to satoshi, introduces two rounding steps that can diverge across
-    platforms.  Instead, convert gas_price to satoshi-per-gas *first* (a single
-    float→int conversion), then multiply in pure integer arithmetic.
 
-    gas_price is VSD-per-gas (e.g. 0.00000001 = 1 sat/gas).
-    Result: gas_units × round(gas_price × SATOSHI_PER_VSD) — one rounding, rest int.
+def from_satoshi_str(satoshi: int) -> str:
+    """Losslessly format integer satoshi as an exact 8-decimal VSD string."""
+    return f"{from_satoshi_decimal(satoshi):.8f}"
+
+
+def gas_fee_to_sat(gas_units: int, gas_price) -> int:
+    """Deterministic gas fee in satoshi: gas_units × to_satoshi(gas_price).
+
+    Validates that gas_units is a non-negative int (not bool) and gas_price
+    converts to a non-negative integer satoshi-per-gas value. Positive
+    gas_price values below 0.5 sat/gas (<= 5e-9 VSD/gas) are clamped up to
+    1 sat/gas so a positive gas price with positive gas_units never silently
+    truncates to zero fee.
     """
-    price_sat_per_gas = int(round(gas_price * Config.SATOSHI_PER_VSD))
+    if isinstance(gas_units, bool) or not isinstance(gas_units, int):
+        raise TypeError(f"gas_units must be an int, got {type(gas_units).__name__}")
+    if gas_units < 0:
+        raise ValueError(f"gas_units must be non-negative, got {gas_units}")
+    if isinstance(gas_price, bool):
+        raise TypeError("gas_price must not be bool")
+
+    if isinstance(gas_price, Decimal):
+        dec_price = gas_price
+    elif isinstance(gas_price, int):
+        dec_price = Decimal(gas_price)
+    elif isinstance(gas_price, float):
+        if not math.isfinite(gas_price):
+            raise ValueError(f"gas_price must be finite, got {gas_price!r}")
+        dec_price = Decimal(str(gas_price))
+    elif isinstance(gas_price, str):
+        raw = gas_price.strip()
+        if not raw:
+            raise ValueError("gas_price string must not be empty")
+        try:
+            dec_price = Decimal(raw)
+        except InvalidOperation as exc:
+            raise ValueError(f"invalid gas_price string: {gas_price!r}") from exc
+    else:
+        raise TypeError(
+            f"gas_price must be int, float, Decimal, or str, got {type(gas_price).__name__}"
+        )
+
+    if not dec_price.is_finite():
+        raise ValueError(f"gas_price must be finite, got {gas_price!r}")
+    if dec_price < 0:
+        raise ValueError(f"gas_price must be non-negative, got {gas_price!r}")
+    if gas_units == 0 or dec_price == 0:
+        return 0
+
+    price_sat_per_gas = to_satoshi(dec_price)
+    if price_sat_per_gas <= 0:
+        price_sat_per_gas = 1
     return gas_units * price_sat_per_gas
 
 

@@ -129,7 +129,11 @@ class ParallelBlockDownloader:
 
         total_chunks = manifest.get("total_chunks", 0)
         chunk_hashes = manifest.get("chunk_hashes", [])
-        if total_chunks == 0 or len(chunk_hashes) != total_chunks:
+        if (isinstance(total_chunks, bool)
+                or not isinstance(total_chunks, int)
+                or not isinstance(chunk_hashes, list)
+                or total_chunks <= 0
+                or len(chunk_hashes) != total_chunks):
             return None
 
         log.info(f"[ParallelBlock] Downloading {self._block_hash[:16]} "
@@ -144,9 +148,11 @@ class ParallelBlockDownloader:
         for i in range(total_chunks):
             work_queue.put(i)
 
-        completed  = threading.Event()
-        failed     = threading.Event()
-        done_count = [0]
+        completed      = threading.Event()
+        failed         = threading.Event()
+        done_or_failed = threading.Event()
+        done_count     = [0]
+        active_workers = [0]
 
         # 4. Worker Thread Definition
         def _worker(wp: 'PeerConnection'):
@@ -187,36 +193,28 @@ class ParallelBlockDownloader:
                             chunk_retries[chunk_idx] += 1
                             if chunk_retries[chunk_idx] >= self.MAX_RETRIES:
                                 failed.set()
+                                done_or_failed.set()
                         work_queue.put(chunk_idx)
                         work_queue.task_done()
-                        # AUDIT-FIX-26: this used to `continue`, silently
-                        # contradicting the comment below — a slow peer
-                        # stayed in rotation and kept drawing OTHER chunks
-                        # from the shared queue, timing out on those too
-                        # and burning their MAX_RETRIES budget for a
-                        # problem that was actually about this peer, not
-                        # those chunks. `break` retires this worker so a
-                        # healthier peer can take over the rest.
                         break  # Peer is too slow; exit this worker so others take over
 
-                    # AUDIT-FIX-26: verify the response actually answers
-                    # THIS request, not a late/stale response to a PRIOR
-                    # chunk request on this same peer — wq is one shared
-                    # queue for this worker's whole lifetime, so replies
-                    # can arrive out of order relative to what was most
-                    # recently requested. The hash check further below
-                    # already stops wrong bytes from being accepted, but
-                    # without this a stale reply still burned a retry on
-                    # whatever chunk was actually being awaited, for a
-                    # problem that was really cross-talk, not a fetch
-                    # failure.
-                    if (resp.get("type") != MSG_BLOCK_CHUNK_DATA or 
-                        resp.get("block_hash") != self._block_hash or 
+                    if (not isinstance(resp, dict) or
+                        resp.get("type") != MSG_BLOCK_CHUNK_DATA or
+                        resp.get("block_hash") != self._block_hash or
                         resp.get("chunk_index") != chunk_idx or
                         "error" in resp):
+                        log.warning(
+                            f"[ParallelBlock] Error/mismatched chunk {chunk_idx} "
+                            f"from {wp.peer_id[:8]}: {resp.get('error', 'mismatch') if isinstance(resp, dict) else 'invalid'}"
+                        )
+                        with chunk_map_lock:
+                            chunk_retries[chunk_idx] += 1
+                            if chunk_retries[chunk_idx] >= self.MAX_RETRIES:
+                                failed.set()
+                                done_or_failed.set()
                         work_queue.put(chunk_idx)
                         work_queue.task_done()
-                        continue
+                        break  # Retire failing/mismatched peer so healthy peers take over
 
                     # Decode and verify
                     try:
@@ -231,25 +229,34 @@ class ParallelBlockDownloader:
                             chunk_retries[chunk_idx] += 1
                             if chunk_retries[chunk_idx] >= self.MAX_RETRIES:
                                 failed.set()
+                                done_or_failed.set()
                         work_queue.put(chunk_idx)
                         work_queue.task_done()
                         continue
 
                     # Commit chunk to store
                     with chunk_map_lock:
-                        chunk_store[chunk_idx] = raw_chunk
-                        done_count[0] += 1
-                        if done_count[0] == total_chunks:
-                            completed.set()
+                        if chunk_store[chunk_idx] is None:
+                            chunk_store[chunk_idx] = raw_chunk
+                            done_count[0] += 1
+                            if done_count[0] == total_chunks:
+                                completed.set()
+                                done_or_failed.set()
 
                     work_queue.task_done()
             except Exception as e:
                 log.debug(f"[ParallelBlock] Worker {wp.peer_id[:8]} error: {e}")
             finally:
                 wp._block_chunk_queue = None
+                with chunk_map_lock:
+                    active_workers[0] -= 1
+                    if active_workers[0] <= 0 and not completed.is_set():
+                        failed.set()
+                        done_or_failed.set()
 
         # 5. Spawn parallel workers
         active_peers = candidate_peers[:self.MAX_PARALLEL_PEERS]
+        active_workers[0] = len(active_peers)
         threads = []
         for p in active_peers:
             t = threading.Thread(
@@ -261,9 +268,9 @@ class ParallelBlockDownloader:
             threads.append(t)
             t.start()
 
-        # 6. Await completion with fallback timeout
+        # 6. Await completion, failure, or all-worker exit
         max_wait = (self.CHUNK_TIMEOUT * total_chunks / max(1, len(active_peers))) + 30
-        completed.wait(timeout=max_wait)
+        done_or_failed.wait(timeout=max_wait)
 
         if failed.is_set() or not completed.is_set():
             log.warning(f"[ParallelBlock] Download failed or timed out for {self._block_hash[:16]}")
@@ -278,11 +285,20 @@ class ParallelBlockDownloader:
             
             # Block lives in visold.ledger.block (was: sys.modules[__name__].Block)
             block = Block.from_dict(block_dict)
-            
-            if block.block_hash != self._block_hash:
+
+            if (block.block_hash != self._block_hash
+                    or block.compute_hash() != self._block_hash):
                 log.warning(f"[ParallelBlock] Reassembled block hash mismatch!")
                 return None
-                
+
+            ok_integrity, integrity_reason = block.integrity_check()
+            if not ok_integrity:
+                log.warning(
+                    f"[ParallelBlock] Reassembled block integrity check failed: "
+                    f"{integrity_reason}"
+                )
+                return None
+
             log.info(f"[ParallelBlock] Successfully rebuilt {self._block_hash[:16]}")
             return block
         except Exception as e:

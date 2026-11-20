@@ -175,10 +175,22 @@ def verify_bootstrap_header_chain(
             for k in _HEADER_KEYS:
                 if k not in d:
                     return False, f"bootstrap header {h} missing {k}", [], None
-            diff = float(d["difficulty"])
-            ts = int(d["timestamp"])
+            for int_k in ("version", "protocol_version", "index", "timestamp", "nonce"):
+                v = d[int_k]
+                if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+                    return False, f"bootstrap header {h} has invalid {int_k}", [], None
+            if d["version"] < 1:
+                return False, f"bootstrap header {h} has invalid version", [], None
+            raw_diff = d["difficulty"]
+            if not isinstance(raw_diff, (int, float)) or isinstance(raw_diff, bool):
+                return False, f"bootstrap header {h} has invalid difficulty type", [], None
+            diff = float(raw_diff)
+            ts = d["timestamp"]
             if not math.isfinite(diff) or diff < 0:
                 return False, f"bootstrap header {h} has invalid difficulty", [], None
+            for str_k in ("prev_hash", "miner_address", "merkle_root", "state_root", "block_hash", "vrf_proof", "vrf_output"):
+                if not isinstance(d[str_k], str):
+                    return False, f"bootstrap header {h} has invalid {str_k} type", [], None
             if h > 0 and str(d.get("prev_hash", "")) != prev_hash:
                 return False, f"bootstrap prev_hash mismatch at height {h}", [], None
             computed = hash_obj(_canonical_header_dict(d))

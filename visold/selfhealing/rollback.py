@@ -237,8 +237,11 @@ class GovernanceRollbackVote:
         "approve" signature cannot be reinterpreted as "reject" or vice
         versa.
         """
-        if self._closed:
-            return "closed"
+        with self._lock:
+            if self._closed:
+                return "closed"
+            if self.is_expired:
+                return "expired"
 
         message = f"VSD-SHBS-VOTE|{self.proposal_id}|{approve}".encode()
         ok, reason = _verify_shbs_validator_signature(
@@ -247,6 +250,10 @@ class GovernanceRollbackVote:
             return reason
 
         with self._lock:
+            if self._closed:
+                return "closed"
+            if self.is_expired:
+                return "expired"
             if validator_addr in self._votes:
                 return "already_voted"
             self._votes[validator_addr] = approve
@@ -271,16 +278,31 @@ class GovernanceRollbackVote:
                     "auto_approve": False,
                     "error": "validator_set_unavailable"}
 
-        if n_validators == 0:
+        if len(validators) == 0:
             # No validators — auto-approve (solo node scenario)
             return {"reached": True, "fast_track": True,
                     "approve_count": 0, "reject_count": 0,
                     "required": 0, "total_validators": 0,
                     "auto_approve": True}
 
+        if n_validators == 0:
+            # All validators in the snapshot are slashed — fail closed
+            return {"reached": False, "fast_track": False,
+                    "approve_count": 0, "reject_count": 0,
+                    "required": 0, "total_validators": 0,
+                    "auto_approve": False}
+
+        active_addrs = {v.get("address") for v in active_validators if v.get("address")}
+
         with self._lock:
-            approve = sum(1 for v in self._votes.values() if v)
-            reject  = sum(1 for v in self._votes.values() if not v)
+            approve = sum(
+                1 for addr, v in self._votes.items()
+                if addr in active_addrs and v
+            )
+            reject = sum(
+                1 for addr, v in self._votes.items()
+                if addr in active_addrs and not v
+            )
             required = math.ceil(n_validators * self.QUORUM_FRACTION)
             fast_track_req = n_validators  # all validators
 
@@ -295,7 +317,8 @@ class GovernanceRollbackVote:
         }
 
     def close(self):
-        self._closed = True
+        with self._lock:
+            self._closed = True
 
 
 class RollbackExecutor:

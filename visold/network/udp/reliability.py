@@ -156,6 +156,7 @@ class _UDPReassembler:
         # (group_end_off, xor_bytes).
         self.fec_syms: dict = {}
         self.last_off: Optional[int]  = None    # frag_off of the fragment with _F_LAST
+        self.fec_recovered_last: bool = False   # True if last_off was recovered via FEC (may have trailing 0x00 pad)
         self.ts        = time.monotonic()
 
     def add_data(self, frag_off: int, is_last: bool, payload: bytes) -> bool:
@@ -259,6 +260,8 @@ class _UDPReassembler:
         if entry is None:
             return False   # haven't received this group's FEC symbol yet
         group_end, fec_sym = entry
+        if miss_off > group_end or group_end > self.last_off:
+            return False
 
         # XOR the group's FEC symbol against every OTHER fragment in that
         # same group only — never fragments from a different group.
@@ -270,7 +273,9 @@ class _UDPReassembler:
             if frag is None:
                 return False   # group member missing too — can't recover safely
             acc = _xor_bytes(acc, frag)
-        self.frags[miss_off] = acc.rstrip(b'\x00') if miss_off == self.last_off else acc
+        self.frags[miss_off] = acc
+        if miss_off == self.last_off:
+            self.fec_recovered_last = True
         return True
 
     def reassemble(self) -> bytes:
